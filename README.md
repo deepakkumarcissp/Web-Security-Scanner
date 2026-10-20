@@ -180,7 +180,7 @@ python -m pip install pytest httpx
 pytest -q
 ```
 
-The feature branch has been checked with Python compilation, the automated test suite, and a frontend JavaScript syntax check. A running end-to-end OWASP ZAP scan still needs to be verified against an actual local ZAP service.
+The feature branch has been checked with Python compilation and the automated test suite. The GitHub Actions workflow runs those same Python checks on Ubuntu/Python 3.11; it does not prove a clean Kali install, browser-based end-to-end behavior, or live external scanner integrations. Before merging or announcing a release, follow the [Public-Release Verification Checklist](RELEASE_CHECKLIST.md). A running end-to-end OWASP ZAP scan still needs to be verified against an actual local ZAP service.
 
 ## Safety model
 
