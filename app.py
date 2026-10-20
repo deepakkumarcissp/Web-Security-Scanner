@@ -113,6 +113,31 @@ class AssetDiscoveryRequest(BaseModel):
     max_results: int = Field(default=50, ge=1, le=100)
 
 
+def require_in_scope_asset(target: str) -> dict:
+    """Require an exact hostname/port match to an explicitly In Scope inventory asset."""
+    parsed = urlparse(target)
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    try:
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    except ValueError as exc:
+        raise HTTPException(400, "Target URL has an invalid port.") from exc
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM assets WHERE scope_status='in_scope'").fetchall()
+    for row in rows:
+        registered = urlparse(row["target"])
+        registered_host = (registered.hostname or "").lower().rstrip(".")
+        try:
+            registered_port = registered.port or (443 if registered.scheme.lower() == "https" else 80)
+        except ValueError:
+            continue
+        if hostname == registered_host and port == registered_port:
+            return dict(row)
+    raise HTTPException(
+        403,
+        "Target is not approved for scanning. Register it in Asset Inventory and explicitly set its scope to In Scope first.",
+    )
+
+
 def validate_target(raw: str) -> str:
     raw = raw.strip()
     if not raw.lower().startswith(("http://", "https://")):
@@ -422,6 +447,12 @@ def scheduler_loop() -> None:
                     except ValueError:
                         continue
                     if due <= current:
+                        try:
+                            require_in_scope_asset(schedule["target"])
+                        except HTTPException:
+                            # Scope may have changed since scheduling; fail closed and pause the schedule.
+                            conn.execute("UPDATE schedules SET enabled=0 WHERE id=?", (schedule["id"],))
+                            continue
                         start_scan(schedule["target"], schedule["profile"])
                         delta = timedelta(days=1 if schedule["frequency"] == "daily" else 7)
                         conn.execute(
@@ -618,6 +649,7 @@ def create_scan(request: ScanRequest):
     if not request.authorized:
         raise HTTPException(400, "Confirm you are authorized to test this target.")
     target = validate_target(request.target)
+    require_in_scope_asset(target)
     scan_id = start_scan(target, request.profile)
     return {
         "id": scan_id, "status": "running",
@@ -692,6 +724,7 @@ def create_schedule(request: ScheduleRequest):
     if not request.authorized:
         raise HTTPException(400, "Confirm you are authorized to test this target.")
     target = validate_target(request.target)
+    require_in_scope_asset(target)
     delta = timedelta(days=1 if request.frequency == "daily" else 7)
     if request.run_at:
         try:

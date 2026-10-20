@@ -48,12 +48,18 @@ def test_schedule_requires_authorization():
 
 
 def test_schedule_accepts_future_time_and_can_be_deleted():
+    from uuid import uuid4
+    target = f"https://schedule-{uuid4().hex}.example"
+    registered = client.post("/api/assets", json={
+        "target": target, "authorized": True, "scope_status": "in_scope",
+    })
+    assert registered.status_code == 200
     run_at = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
     response = client.post(
         "/api/schedules",
         json={
             "name": "test schedule",
-            "target": "http://127.0.0.1:1003",
+            "target": target,
             "profile": "quick",
             "frequency": "daily",
             "run_at": run_at,
@@ -288,3 +294,42 @@ def test_passive_discovery_ui_warns_about_external_lookup_and_review_only():
     assert "Passive Discovery" in response.text
     assert "contacts crt.sh, not the target" in response.text
     assert "discoverSubdomains" in response.text
+
+
+
+def test_scan_and_schedule_require_explicit_in_scope_inventory_asset(monkeypatch):
+    from uuid import uuid4
+    target = f"https://scope-gate-{uuid4().hex}.example"
+    unregistered_scan = client.post("/api/scans", json={"target": target, "profile": "quick", "authorized": True})
+    assert unregistered_scan.status_code == 403
+    unregistered_schedule = client.post("/api/schedules", json={
+        "name": "blocked", "target": target, "profile": "quick", "frequency": "daily", "authorized": True,
+    })
+    assert unregistered_schedule.status_code == 403
+    asset = client.post("/api/assets", json={"target": target, "authorized": True}).json()
+    needs_review = client.post("/api/scans", json={"target": target, "profile": "quick", "authorized": True})
+    assert needs_review.status_code == 403
+    client.patch(f"/api/assets/{asset['id']}/scope", json={"scope_status": "out_of_scope", "authorized": True})
+    out_of_scope = client.post("/api/scans", json={"target": target, "profile": "quick", "authorized": True})
+    assert out_of_scope.status_code == 403
+    client.patch(f"/api/assets/{asset['id']}/scope", json={"scope_status": "in_scope", "authorized": True})
+    monkeypatch.setattr(app, "start_scan", lambda target, profile: 12345)
+    approved = client.post("/api/scans", json={"target": target, "profile": "quick", "authorized": True})
+    assert approved.status_code == 200 and approved.json()["id"] == 12345
+
+
+def test_discovered_candidate_cannot_be_scanned_until_human_approves_it(monkeypatch):
+    from uuid import uuid4
+    root_domain = f"approval-{uuid4().hex}.example"
+    root = client.post("/api/assets", json={"target": f"https://{root_domain}", "authorized": True, "scope_status": "in_scope"}).json()
+    monkeypatch.setattr(app, "query_certificate_transparency", lambda domain, limit: [f"api.{domain}"])
+    found = client.post(f"/api/assets/{root['id']}/discover", json={"authorized": True}).json()
+    candidate = next(a for a in client.get("/api/assets").json() if a["target"] == f"https://api.{root_domain}")
+    blocked = client.post("/api/scans", json={"target": candidate["target"], "profile": "quick", "authorized": True})
+    assert blocked.status_code == 403
+    assert found["scans_started"] == 0
+    approved = client.patch(f"/api/assets/{candidate['id']}/scope", json={"scope_status": "in_scope", "authorized": True})
+    assert approved.status_code == 200
+    monkeypatch.setattr(app, "start_scan", lambda target, profile: 23456)
+    allowed = client.post("/api/scans", json={"target": candidate["target"], "profile": "quick", "authorized": True})
+    assert allowed.status_code == 200
