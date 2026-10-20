@@ -65,6 +65,17 @@ def init_db() -> None:
                 next_run TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS assets(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target TEXT NOT NULL UNIQUE,
+                asset_type TEXT NOT NULL,
+                scope_status TEXT NOT NULL DEFAULT 'needs_review'
+                    CHECK(scope_status IN ('in_scope','out_of_scope','needs_review')),
+                discovery_source TEXT NOT NULL DEFAULT 'manual',
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                notes TEXT NOT NULL DEFAULT ''
+            );
             """
         )
 
@@ -84,9 +95,22 @@ class ScheduleRequest(ScanRequest):
     run_at: str | None = None
 
 
+class AssetRequest(BaseModel):
+    target: str = Field(min_length=8, max_length=2048)
+    authorized: bool = False
+    scope_status: str = Field(default="needs_review", pattern="^(in_scope|out_of_scope|needs_review)$")
+    notes: str = Field(default="", max_length=1000)
+
+
+class AssetScopeUpdate(BaseModel):
+    authorized: bool = False
+    scope_status: str = Field(pattern="^(in_scope|out_of_scope|needs_review)$")
+    notes: str | None = Field(default=None, max_length=1000)
+
+
 def validate_target(raw: str) -> str:
     raw = raw.strip()
-    if not raw.startswith(("http://", "https://")):
+    if not raw.lower().startswith(("http://", "https://")):
         raise HTTPException(400, "Target must start with http:// or https://")
     parsed = urlparse(raw)
     if not parsed.hostname or parsed.username or parsed.password:
@@ -436,6 +460,69 @@ def dashboard():
             "scans": scans, "severity": counts, "total_findings": total,
             "targets": targets, "high_findings": high_findings, "total_scans": total_scans,
         }
+
+
+@app.get("/api/assets")
+def list_assets():
+    with connect() as conn:
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM assets ORDER BY last_seen DESC, id DESC"
+        )]
+
+
+@app.post("/api/assets")
+def create_asset(request: AssetRequest):
+    if not request.authorized:
+        raise HTTPException(400, "Confirm you are authorized to inventory this asset.")
+    target = validate_target(request.target)
+    parsed = urlparse(target)
+    hostname = (parsed.hostname or "").lower()
+    # Canonicalize host casing and remove the default port; preserve non-root paths.
+    port = parsed.port
+    netloc = hostname
+    if ":" in hostname and not hostname.startswith("["):
+        netloc = f"[{hostname}]"
+    if port and not ((parsed.scheme.lower() == "http" and port == 80) or
+                     (parsed.scheme.lower() == "https" and port == 443)):
+        netloc = f"{netloc}:{port}"
+    normalized = parsed.scheme.lower() + "://" + netloc + (parsed.path.rstrip("/") or "")
+    if parsed.query:
+        normalized += "?" + parsed.query
+    if parsed.fragment:
+        normalized += "#" + parsed.fragment
+    timestamp = now()
+    asset_type = "ip_address" if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", hostname) else "web_url"
+    with connect() as conn:
+        existing = conn.execute("SELECT * FROM assets WHERE target=?", (normalized,)).fetchone()
+        if existing:
+            conn.execute("UPDATE assets SET last_seen=?, notes=? WHERE id=?",
+                         (timestamp, request.notes, existing["id"]))
+            row = conn.execute("SELECT * FROM assets WHERE id=?", (existing["id"],)).fetchone()
+            return {**dict(row), "created": False}
+        cursor = conn.execute(
+            """INSERT INTO assets(target,asset_type,scope_status,discovery_source,first_seen,last_seen,notes)
+               VALUES(?,?,?,?,?,?,?)""",
+            (normalized, asset_type, request.scope_status, "manual", timestamp, timestamp, request.notes),
+        )
+        row = conn.execute("SELECT * FROM assets WHERE id=?", (cursor.lastrowid,)).fetchone()
+        return {**dict(row), "created": True}
+
+
+@app.patch("/api/assets/{asset_id}/scope")
+def update_asset_scope(asset_id: int, request: AssetScopeUpdate):
+    if not request.authorized:
+        raise HTTPException(400, "Confirm you are authorized to change asset scope.")
+    with connect() as conn:
+        existing = conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+        if not existing:
+            raise HTTPException(404, "Asset not found")
+        if request.notes is None:
+            conn.execute("UPDATE assets SET scope_status=?,last_seen=? WHERE id=?",
+                         (request.scope_status, now(), asset_id))
+        else:
+            conn.execute("UPDATE assets SET scope_status=?,notes=?,last_seen=? WHERE id=?",
+                         (request.scope_status, request.notes, now(), asset_id))
+        return dict(conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone())
 
 
 @app.post("/api/scans")
