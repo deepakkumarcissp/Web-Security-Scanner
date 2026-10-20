@@ -165,24 +165,26 @@ def test_asset_inventory_requires_explicit_authorization():
 
 
 def test_asset_inventory_normalizes_and_deduplicates_target():
+    from uuid import uuid4
+    hostname = f"inventory-{uuid4().hex}.example"
     first = client.post("/api/assets", json={
-        "target": "HTTPS://Inventory-Normalization-Unique.example:443/", "authorized": True,
+        "target": f"HTTPS://{hostname.upper()}:443/", "authorized": True,
         "scope_status": "in_scope", "notes": "approved root",
     })
     assert first.status_code == 200
     first_payload = first.json()
-    assert first_payload["target"] == "https://inventory-normalization-unique.example"
+    assert first_payload["target"] == f"https://{hostname}"
     assert first_payload["scope_status"] == "in_scope"
     assert first_payload["created"] is True
 
     second = client.post("/api/assets", json={
-        "target": "https://inventory-normalization-unique.example/", "authorized": True,
+        "target": f"https://{hostname}/", "authorized": True,
     })
     assert second.status_code == 200
     assert second.json()["id"] == first_payload["id"]
     assert second.json()["created"] is False
     assert len([asset for asset in client.get("/api/assets").json()
-                if asset["target"] == "https://inventory-normalization-unique.example"]) == 1
+                if asset["target"] == f"https://{hostname}"]) == 1
 
 
 def test_new_assets_default_to_needs_review_and_do_not_start_scan():
@@ -212,3 +214,13 @@ def test_asset_scope_change_requires_authorization_and_valid_asset():
         "scope_status": "in_scope", "authorized": True,
     })
     assert missing.status_code == 404
+
+
+def test_asset_inventory_ui_is_wired_to_scope_api():
+    response = client.get("/")
+    assert response.status_code == 200
+    assert 'data-page="assets"' in response.text
+    assert 'id="assetRows"' in response.text
+    assert 'id="assetForm"' in response.text
+    assert "loadAssets()" in response.text
+    assert "New assets default to Needs Review" in response.text
