@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, HTTPException, Request as FastAPIRequest
@@ -103,6 +103,56 @@ def add_finding(conn, scan_id, target, severity, title, url, evidence, remediati
         (scan_id, target, severity, title, url, evidence, remediation, confidence, now()),
     )
 
+
+
+def perform_zap_passive_check(target: str) -> list[tuple]:
+    """Ask a locally running ZAP instance to fetch only the exact authorized URL, then read passive alerts."""
+    api_root = "http://127.0.0.1:8080"
+    api_key = os.environ.get("ZAP_API_KEY", "")
+    def zap_get(path: str, params: dict) -> dict:
+        query = dict(params)
+        if api_key:
+            query["apikey"] = api_key
+        req = Request(
+            api_root + path + "?" + urlencode(query),
+            headers={"Accept": "application/json", "User-Agent": "DKCISSP-WebSecurityScanner/0.1"},
+        )
+        with urlopen(req, timeout=4) as response:
+            return json.loads(response.read(1_000_000).decode("utf-8", "replace"))
+
+    try:
+        # No spider and no active scan: one exact-URL fetch only.
+        zap_get("/JSON/core/action/accessUrl/", {"url": target, "followRedirects": "false"})
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                pending = zap_get("/JSON/pscan/view/recordsToScan/", {}).get("recordsToScan", "0")
+                if int(pending) <= 0:
+                    break
+            except (ValueError, TypeError):
+                break
+            time.sleep(0.4)
+        payload = zap_get("/JSON/core/view/alerts/", {"baseurl": target, "start": "0", "count": "100"})
+        alerts = payload.get("alerts", [])
+    except Exception:
+        # ZAP is optional; the built-in passive checks must still complete.
+        return []
+
+    normalized = []
+    for alert in alerts:
+        risk = str(alert.get("risk", "Informational")).lower()
+        severity = {"high": "High", "medium": "Medium", "low": "Low", "informational": "Info"}.get(risk, "Info")
+        title = str(alert.get("alert", "OWASP ZAP passive alert"))[:240]
+        evidence_parts = [
+            str(alert.get("description", "")).strip(),
+            ("Evidence: " + str(alert.get("evidence", ""))).strip() if alert.get("evidence") else "",
+            ("Parameter: " + str(alert.get("param", ""))).strip() if alert.get("param") else "",
+        ]
+        evidence = " ".join(part for part in evidence_parts if part)[:1800] or "Reported by OWASP ZAP passive scanner."
+        remediation = str(alert.get("solution", "") or "Review the ZAP alert and validate its applicability.")[:1800]
+        confidence = str(alert.get("confidence", "Medium"))
+        normalized.append((severity, "OWASP ZAP: " + title, str(alert.get("url") or target), evidence, remediation, confidence))
+    return normalized
 
 def perform_scan(scan_id: int, target: str, profile: str) -> None:
     findings = []
@@ -210,6 +260,18 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                     "Page title resembles a directory index. Validate manually before treating as confirmed.",
                     "Disable directory listing or restrict access.", "Medium",
                 )
+
+        # If ZAP is configured locally, merge its passive-only alerts into the same finding store.
+        # This remains optional; absence of ZAP never blocks the built-in scan.
+        findings.extend(perform_zap_passive_check(target))
+        deduped = []
+        seen = set()
+        for item in findings:
+            key = (item[0], item[1], item[2])
+            if key not in seen:
+                seen.add(key)
+                deduped.append(item)
+        findings = deduped
 
         with connect() as conn:
             for item in findings:
