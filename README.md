@@ -113,9 +113,9 @@ bash ./run.sh
 
 Then open:
 
-**http://127.0.0.1:1004**
+**http://127.0.0.1:1005**
 
-The launcher creates/uses a Python virtual environment, installs project dependencies, and starts the web service on loopback port 1004. Invoke it with `bash ./run.sh`; the script is not required to have its executable bit set in a downloaded ZIP or fresh clone.
+The launcher creates/uses a Python virtual environment, installs project dependencies, and starts the web service on loopback port 1005. Invoke it with `bash ./run.sh`; the script is not required to have its executable bit set in a downloaded ZIP or fresh clone.
 
 ### Manual setup
 
@@ -123,7 +123,7 @@ The launcher creates/uses a Python virtual environment, installs project depende
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-uvicorn app:app --host 127.0.0.1 --port 1004
+uvicorn app:app --host 127.0.0.1 --port 1005
 ```
 
 Keep the terminal and application process running while using the dashboard and while scheduled scans are due.
@@ -131,7 +131,7 @@ Keep the terminal and application process running while using the dashboard and 
 ## First-run workflow
 
 1. Start the application on Kali Linux.
-2. Open the local dashboard at `http://127.0.0.1:1004`.
+2. Open the local dashboard at `http://127.0.0.1:1005`.
 3. Visit **Scanner Setup** and run the tool-status check.
 4. Install optional dependencies only when needed and only after reviewing the confirmation prompt.
 5. Use a target you own or are explicitly authorized to test. For initial validation, prefer a local training application such as OWASP Juice Shop.
@@ -150,7 +150,7 @@ The Schedules page supports daily and weekly recurrence and an optional first-ru
 Use **Reports & Export → Download findings.csv**, or run:
 
 ```bash
-curl -OJ http://127.0.0.1:1004/api/export/findings.csv
+curl -OJ http://127.0.0.1:1005/api/export/findings.csv
 ```
 
 The export includes scan ID, target, severity, finding title, affected URL, evidence, remediation, confidence, and discovery timestamp.
