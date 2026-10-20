@@ -151,7 +151,7 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
         assert "-disable-redirects" in command
         assert "-no-interactsh" in command
         assert "-jsonl-export" in command
-        assert kwargs["timeout"] == 90
+        assert kwargs["timeout"] == 30
         report_path = command[command.index("-jsonl-export") + 1]
         records = [
             {"template-id": "tls-test", "matched-at": "https://example.test/", "info": {"name": "Weak TLS setting", "severity": "high", "remediation": "Enable secure TLS."}},
@@ -178,10 +178,10 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
 def test_nuclei_timeout_is_reported(monkeypatch):
     import subprocess
     monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/nuclei")
-    monkeypatch.setattr(app.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("nuclei", 90)))
+    monkeypatch.setattr(app.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("nuclei", 30)))
     findings, status = app.perform_nuclei_check("https://example.test")
     assert findings == []
-    assert status == {"status": "timeout", "timeout_seconds": 90}
+    assert status == {"status": "timeout", "timeout_seconds": 30}
 
 
 def test_whatweb_reports_missing_binary(monkeypatch):

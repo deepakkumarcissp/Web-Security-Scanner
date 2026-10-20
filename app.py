@@ -328,7 +328,7 @@ def perform_testssl_check(target: str, timeout_seconds: int = 75) -> tuple[list[
 
 
 
-def perform_nuclei_check(target: str, timeout_seconds: int = 90) -> tuple[list[tuple], dict]:
+def perform_nuclei_check(target: str, timeout_seconds: int = 30) -> tuple[list[tuple], dict]:
     """Run a bounded Nuclei pass using conservative, non-OAST template categories."""
     binary = shutil.which(TOOL_CATALOG["nuclei"]["binary"])
     if not binary:
@@ -404,8 +404,9 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 90) -> tuple[list[t
             deduped.append(finding)
     return deduped, {"status": "completed" if result.returncode == 0 else "completed_with_warnings",
                      "return_code": result.returncode, "finding_count": len(deduped),
-                     "malformed_records": malformed, "template_tags": ["misconfig", "exposure", "ssl", "headers"],
-                     "rate_limit_per_second": 5, "concurrency": 2, "redirects_disabled": True,
+                     "malformed_records": malformed,
+                     "template_ids": ["http-missing-security-headers", "cookies-without-secure", "cookies-without-httponly"],
+                     "rate_limit_per_second": 3, "concurrency": 1, "redirects_disabled": True,
                      "interactsh_disabled": True}
 
 
