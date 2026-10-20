@@ -57,7 +57,7 @@ SQLite persistence
       +--> Scheduled scans (while the app process is running)
 ```
 
-The ZAP adapter does **not** launch a spider or active scan. The optional WhatWeb adapter runs only for Standard/Deep scans, uses aggression level 1, disables redirect following to prevent scope expansion, writes a temporary JSON report, and has a 30-second timeout. The optional `testssl.sh` adapter runs only for authorized HTTPS scans using the Standard or Deep profile, writes a temporary JSON report, and has a 75-second timeout. If the binary is missing, the target is HTTP, or the tool errors/times out, the scan summary records that status and built-in checks continue. The application must not imply that an external tool ran when it did not.
+The ZAP adapter does **not** launch a spider or active scan. The optional WhatWeb adapter runs only for Standard/Deep scans, uses aggression level 1, disables redirect following to prevent scope expansion, writes a temporary JSON report, and has a 30-second timeout. The optional `testssl.sh` adapter runs only for authorized HTTPS scans using the Standard or Deep profile, writes a temporary JSON report, and has a 75-second timeout. The optional Nuclei adapter runs for Standard/Deep profiles with selected `misconfig,exposure,ssl,headers` tags, explicit exclusion of `dos,intrusive,fuzz,headless,oast` tags, a 5 requests/second rate cap, concurrency 2, 5-second per-request timeout, no retries, redirects disabled, and OAST/Interactsh disabled. Its run is capped at 90 seconds and results are parsed from a temporary JSONL report. If a binary is missing or a tool errors/times out, the scan summary records that status and built-in checks continue. The application must not imply that an external tool ran when it did not.
 
 ## Current capabilities
 
@@ -84,9 +84,10 @@ The Scanner Setup page checks tools independently of scan results. Availability 
 | OWASP ZAP | Passive web alerts | Optional adapter implemented; setup diagnostics distinguish missing API, wrong service/port, authentication failure, and ready state |
 | `curl` | HTTP connectivity diagnostics | Detected/version checked by setup page |
 | WhatWeb | Technology fingerprinting | Invoked for Standard/Deep scans when installed; stealthy aggression level 1, no redirect following, bounded timeout, JSON findings normalization |
-| `testssl.sh` | TLS configuration assessment | Invoked for Standard/Deep HTTPS scans when installed; 75-second timeout and JSON report parsing; live external-tool behavior still needs end-to-end validation |
+| `testssl.sh` | TLS configuration assessment | Invoked for Standard/Deep HTTPS scans when installed; 75-second timeout and JSON report parsing; controlled local HTTPS execution validated |
+| Nuclei | Known exposure/misconfiguration template checks | Invoked for Standard/Deep scans; constrained tags, rate/concurrency caps, no redirects or OAST, 90-second timeout, JSONL parsing; controlled local execution validation in progress |
 
-**Important distinction:** `testssl.sh` is now wired into Standard/Deep HTTPS scan execution, but actual results depend on the installed version and target. The integration is covered by mocked tests; live testssl.sh behavior against a controlled TLS lab still needs end-to-end validation. Quick scans do not invoke testssl.sh or WhatWeb. WhatWeb runs only for Standard/Deep profiles at its low-aggression level and records detected technologies as informational findings, not as confirmed vulnerabilities. Live WhatWeb behavior still needs validation against a controlled local lab.
+**Important distinction:** testssl.sh completed against a temporary local HTTPS target; that validates invocation and report parsing, not every TLS scenario. Nuclei is restricted to the documented tag subset and bounded request/runtime settings; template coverage depends on the locally installed template set. Quick scans do not invoke these optional integrations. WhatWeb runs only for Standard/Deep profiles at low aggression and records detected technologies as informational findings, not as confirmed vulnerabilities. Live WhatWeb behavior still needs validation against a controlled local lab.
 
 ### Tool installation safety
 
@@ -228,10 +229,13 @@ The roadmap is staged so each integration is independently testable and the UI s
 
 - [ ] Add a dedicated HTTP/header integration with repeatable evidence
 - [x] Integrate WhatWeb as an optional technology-discovery module
-- [x] Integrate `testssl.sh` as an optional TLS assessment module\n- [ ] Validate `testssl.sh` end-to-end against a controlled local TLS target
+- [x] Integrate `testssl.sh` as an optional TLS assessment module
+- [x] Validate `testssl.sh` invocation and JSON report parsing against a controlled local TLS target
 - [ ] Make each integration report installed, version, execution, timeout, and error status distinctly
 - [x] Add mocked integration-level tests for testssl.sh and WhatWeb outputs
-- [ ] Validate WhatWeb and testssl.sh end-to-end against controlled local targets
+- [ ] Validate WhatWeb end-to-end against a controlled local target
+- [x] Add constrained Nuclei adapter with JSONL parsing and bounded execution
+- [ ] Validate Nuclei against a controlled local target and confirm template coverage
 - [ ] Connect scan profiles to clearly documented, real module sets
 
 ### Phase 3 — Scan operations and reporting

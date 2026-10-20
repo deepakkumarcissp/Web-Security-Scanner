@@ -129,6 +129,61 @@ def test_testssl_parses_findings_with_bounded_subprocess(monkeypatch):
 
 
 
+def test_nuclei_reports_missing_binary(monkeypatch):
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: None)
+    findings, status = app.perform_nuclei_check("https://example.test")
+    assert findings == []
+    assert status["status"] == "unavailable"
+
+
+def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/nuclei")
+
+    def fake_run(command, **kwargs):
+        assert command[0] == "/usr/bin/nuclei"
+        assert command[command.index("-tags") + 1] == "misconfig,exposure,ssl,headers"
+        assert command[command.index("-etags") + 1] == "dos,intrusive,fuzz,headless,oast"
+        assert command[command.index("-rl") + 1] == "5"
+        assert command[command.index("-c") + 1] == "2"
+        assert "-disable-redirects" in command
+        assert "-no-interactsh" in command
+        assert "-jsonl-export" in command
+        assert kwargs["timeout"] == 90
+        report_path = command[command.index("-jsonl-export") + 1]
+        records = [
+            {"template-id": "tls-test", "matched-at": "https://example.test/", "info": {"name": "Weak TLS setting", "severity": "high", "remediation": "Enable secure TLS."}},
+            {"template-id": "tls-test", "matched-at": "https://example.test/", "info": {"name": "Weak TLS setting", "severity": "high", "remediation": "Enable secure TLS."}},
+            {"template-id": "info-test", "matched-at": "https://example.test/", "info": {"name": "Banner info", "severity": "info"}},
+        ]
+        with open(report_path, "w", encoding="utf-8") as report_file:
+            report_file.write("not json\n")
+            for record in records:
+                report_file.write(json.dumps(record) + "\n")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    findings, status = app.perform_nuclei_check("https://example.test")
+    assert status["status"] == "completed"
+    assert status["finding_count"] == 2
+    assert status["malformed_records"] == 1
+    assert findings[0][0] == "High"
+    assert findings[0][1] == "Nuclei: Weak TLS setting"
+    assert "template-id" not in findings[0][3]
+    assert all("curl-command" not in str(item) for item in findings)
+
+
+def test_nuclei_timeout_is_reported(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/nuclei")
+    monkeypatch.setattr(app.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("nuclei", 90)))
+    findings, status = app.perform_nuclei_check("https://example.test")
+    assert findings == []
+    assert status == {"status": "timeout", "timeout_seconds": 90}
+
+
 def test_whatweb_reports_missing_binary(monkeypatch):
     monkeypatch.setattr(app.shutil, "which", lambda _binary: None)
     findings, status = app.perform_whatweb_check("https://example.test")
@@ -189,7 +244,7 @@ def test_tool_status_reports_allowlisted_integrations():
     assert response.status_code == 200
     payload = response.json()
     assert {tool["id"] for tool in payload["tools"]} == {
-        "curl", "zaproxy", "whatweb", "testssl"
+        "curl", "zaproxy", "whatweb", "testssl", "nuclei"
     }
     assert all("status" in tool and "installed" in tool for tool in payload["tools"])
 

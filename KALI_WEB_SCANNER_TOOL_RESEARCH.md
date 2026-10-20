@@ -27,7 +27,7 @@ This is an integration shortlist for DKCISSP, not a claim that every tool is ins
 
 1. Finish controlled local end-to-end validation of testssl.sh and WhatWeb.
 2. Make ZAP diagnostics reliable and verify its passive adapter against a real local ZAP instance.
-3. Add **Nuclei in a constrained, explicit profile** with a reviewed template subset, strict scope validation, conservative rate limits, timeouts, and JSONL parsing.
+3. **Implemented in the feature branch:** Nuclei is restricted to `misconfig,exposure,ssl,headers`, 5 requests/second, concurrency 2, no retries, redirects disabled, Interactsh/OAST disabled, 90-second total timeout, and JSONL parsing. The live controlled-target run and template coverage still need validation before treating it as release-ready.
 4. Add endpoint discovery (Katana/hakrawler) as a discovery-only inventory workflow, requiring scope approval before any follow-up scan.
 5. Evaluate Nikto or Wapiti based on controlled-lab accuracy and duplicate-finding rates.
 6. Defer sqlmap and generic fuzzers until scan lifecycle, cancellation, rate limiting, and production-safe controls exist.
