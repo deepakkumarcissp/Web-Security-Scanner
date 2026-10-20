@@ -57,7 +57,7 @@ SQLite persistence
       +--> Scheduled scans (while the app process is running)
 ```
 
-The current ZAP adapter does **not** launch a spider or active scan. If ZAP is missing or unavailable, built-in passive checks should still complete. The application must not imply that an external tool ran when it did not.
+The ZAP adapter does **not** launch a spider or active scan. The optional `testssl.sh` adapter runs only for authorized HTTPS scans using the Standard or Deep profile, writes a temporary JSON report, and has a 75-second timeout. If the binary is missing, the target is HTTP, or the tool errors/times out, the scan summary records that status and built-in checks continue. The application must not imply that an external tool ran when it did not.
 
 ## Current capabilities
 
@@ -84,9 +84,9 @@ The Scanner Setup page checks tools independently of scan results. Availability 
 | OWASP ZAP | Passive web alerts | Optional adapter implemented; requires a working local ZAP API |
 | `curl` | HTTP connectivity diagnostics | Detected/version checked by setup page |
 | WhatWeb | Technology fingerprinting | Detected/version checked; not yet invoked by scan profiles |
-| `testssl.sh` | TLS configuration assessment | Detected/version checked; not yet invoked by scan profiles |
+| `testssl.sh` | TLS configuration assessment | Invoked for Standard/Deep HTTPS scans when installed; 75-second timeout and JSON report parsing; live external-tool behavior still needs end-to-end validation |
 
-**Important distinction:** detecting an installed executable is not the same as integrating it into scan execution. The roadmap tracks the remaining adapters and validation separately. Quick, Standard, and Deep profiles must not be described as performing deeper external scans until those behaviors are implemented, tested, and documented.
+**Important distinction:** `testssl.sh` is now wired into Standard/Deep HTTPS scan execution, but actual results depend on the installed version and target. The integration is covered by mocked tests; live testssl.sh behavior against a controlled TLS lab still needs end-to-end validation. Quick scans do not invoke testssl.sh. WhatWeb remains detection-only.
 
 ### Tool installation safety
 
@@ -228,7 +228,7 @@ The roadmap is staged so each integration is independently testable and the UI s
 
 - [ ] Add a dedicated HTTP/header integration with repeatable evidence
 - [ ] Integrate WhatWeb as an optional technology-discovery module
-- [ ] Integrate `testssl.sh` as an optional TLS assessment module
+- [x] Integrate `testssl.sh` as an optional TLS assessment module\n- [ ] Validate `testssl.sh` end-to-end against a controlled local TLS target
 - [ ] Make each integration report installed, version, execution, timeout, and error status distinctly
 - [ ] Add integration-level tests using mocked tool outputs and local test targets
 - [ ] Connect scan profiles to clearly documented, real module sets
