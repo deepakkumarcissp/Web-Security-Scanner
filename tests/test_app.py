@@ -128,6 +128,53 @@ def test_testssl_parses_findings_with_bounded_subprocess(monkeypatch):
     assert findings[0][1] == "testssl.sh: TLS 1.0"
 
 
+
+def test_whatweb_reports_missing_binary(monkeypatch):
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: None)
+    findings, status = app.perform_whatweb_check("https://example.test")
+    assert findings == []
+    assert status["status"] == "unavailable"
+
+
+def test_whatweb_parses_technology_findings_with_bounded_subprocess(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/whatweb")
+
+    def fake_run(command, **kwargs):
+        assert command[0] == "/usr/bin/whatweb"
+        assert "--aggression=1" in command
+        assert "--follow-redirect=never" in command
+        assert "--log-json=" in next(arg for arg in command if arg.startswith("--log-json="))
+        assert kwargs["timeout"] == 30
+        report_path = next(arg.split("=", 1)[1] for arg in command if arg.startswith("--log-json="))
+        with open(report_path, "w", encoding="utf-8") as report_file:
+            json.dump([{"target": "https://example.test", "plugins": {
+                "WordPress": {"version": ["6.5"]},
+                "PHP": {"version": ["8.2"]},
+                "HTTPServer": {"string": ["nginx"]},
+            }}], report_file)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    findings, status = app.perform_whatweb_check("https://example.test")
+    assert status["status"] == "completed"
+    assert status["finding_count"] == 2
+    assert {finding[1] for finding in findings} == {
+        "WhatWeb technology detected: WordPress", "WhatWeb technology detected: PHP"
+    }
+    assert all(finding[0] == "Info" and finding[5] == "Low" for finding in findings)
+
+
+def test_whatweb_timeout_is_reported(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/whatweb")
+    monkeypatch.setattr(app.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("whatweb", 30)))
+    findings, status = app.perform_whatweb_check("https://example.test")
+    assert findings == []
+    assert status == {"status": "timeout", "timeout_seconds": 30}
+
 def test_dashboard_renders_with_schedule_and_report_navigation():
     response = client.get("/")
     assert response.status_code == 200

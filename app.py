@@ -284,6 +284,72 @@ def perform_testssl_check(target: str, timeout_seconds: int = 75) -> tuple[list[
                       "return_code": result.returncode, "finding_count": len(findings)}
 
 
+
+def perform_whatweb_check(target: str, timeout_seconds: int = 30) -> tuple[list[tuple], dict]:
+    """Run WhatWeb at its stealthy single-request aggression level and normalize its JSON output."""
+    binary = shutil.which(TOOL_CATALOG["whatweb"]["binary"])
+    if not binary:
+        return [], {"status": "unavailable", "reason": "WhatWeb is not installed"}
+
+    with tempfile.TemporaryDirectory(prefix="dkcissp-whatweb-") as temp_dir:
+        json_path = str(Path(temp_dir) / "results.json")
+        try:
+            result = subprocess.run(
+                [binary, "--quiet", "--no-errors", "--aggression=1", "--follow-redirect=never",
+                 "--max-redirects=3", "--log-json=" + json_path, target],
+                capture_output=True, text=True, timeout=timeout_seconds, check=False,
+                env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"},
+            )
+        except subprocess.TimeoutExpired:
+            return [], {"status": "timeout", "timeout_seconds": timeout_seconds}
+        except OSError as exc:
+            return [], {"status": "error", "reason": str(exc)[:300]}
+
+        if not os.path.isfile(json_path):
+            return [], {"status": "error", "return_code": result.returncode,
+                        "reason": "WhatWeb did not produce its JSON report"}
+        try:
+            with open(json_path, encoding="utf-8", errors="replace") as report_file:
+                report = json.load(report_file)
+        except (OSError, json.JSONDecodeError):
+            return [], {"status": "error", "return_code": result.returncode,
+                        "reason": "WhatWeb produced an unreadable JSON report"}
+
+    entries = report if isinstance(report, list) else [report] if isinstance(report, dict) else []
+    findings = []
+    seen_plugins = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        plugins = entry.get("plugins", {})
+        if not isinstance(plugins, dict):
+            continue
+        for plugin_name, plugin_data in plugins.items():
+            name = str(plugin_name).strip()[:160]
+            if not name or name.lower() in {"httpserver", "ip", "country", "title", "redirectlocation"}:
+                continue
+            version_values = []
+            if isinstance(plugin_data, dict):
+                versions = plugin_data.get("version", [])
+                if isinstance(versions, list):
+                    version_values = [str(value).strip()[:100] for value in versions if str(value).strip()]
+                elif versions:
+                    version_values = [str(versions).strip()[:100]]
+            evidence = "Technology/plugin detected: " + name
+            if version_values:
+                evidence += "; observed version: " + ", ".join(version_values[:3])
+            key = (name.lower(), tuple(version_values[:3]))
+            if key in seen_plugins:
+                continue
+            seen_plugins.add(key)
+            findings.append(("Info", "WhatWeb technology detected: " + name,
+                             str(entry.get("target") or target)[:1000], evidence[:1800],
+                             "Confirm whether this technology and version are expected; keep components patched and minimize unnecessary disclosure.",
+                             "Low"))
+
+    return findings, {"status": "completed" if result.returncode == 0 else "completed_with_warnings",
+                      "return_code": result.returncode, "finding_count": len(findings)}
+
 def perform_scan(scan_id: int, target: str, profile: str) -> None:
     findings = []
     try:
@@ -396,6 +462,10 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         # testssl.sh is an optional, bounded HTTPS check. It is invoked without a shell,
         # only for explicitly authorized scans, and its status is recorded in the scan summary.
         tls_status = {"status": "not_run", "reason": "TLS check not requested by profile"}
+        whatweb_status = {"status": "not_run", "reason": "Technology discovery not requested by profile"}
+        if profile in ("standard", "deep"):
+            whatweb_findings, whatweb_status = perform_whatweb_check(target)
+            findings.extend(whatweb_findings)
         if profile in ("standard", "deep"):
             if target.lower().startswith("https://"):
                 tls_findings, tls_status = perform_testssl_check(target)
@@ -422,8 +492,9 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                     "completed", now(),
                     json.dumps({
                         "http_status": status_code, "final_url": final_url,
-                        "checks": "passive HTTP/header checks plus optional testssl.sh and ZAP passive checks",
-                        "tls_check": tls_status, "finding_count": len(findings),
+                        "checks": "passive HTTP/header checks plus optional WhatWeb, testssl.sh, and ZAP passive checks",
+                        "tls_check": tls_status, "whatweb_check": whatweb_status,
+                        "finding_count": len(findings),
                     }),
                     scan_id,
                 ),
