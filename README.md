@@ -108,14 +108,14 @@ Never expose the local dashboard or its tool-installation endpoint to untrusted 
 From the repository directory:
 
 ```bash
-./run.sh
+bash ./run.sh
 ```
 
 Then open:
 
 **http://127.0.0.1:1004**
 
-The launcher creates/uses a Python virtual environment, installs project dependencies, and starts the web service on loopback port 1004.
+The launcher creates/uses a Python virtual environment, installs project dependencies, and starts the web service on loopback port 1004. Invoke it with `bash ./run.sh`; the script is not required to have its executable bit set in a downloaded ZIP or fresh clone.
 
 ### Manual setup
 
