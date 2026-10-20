@@ -407,3 +407,57 @@ def test_discovered_candidate_can_be_rejected_with_audit_state(monkeypatch):
     assert rejected.json()["notes"] == "Not owned by our organization"
     blocked = client.post("/api/scans", json={"target": candidate["target"], "profile": "quick", "authorized": True})
     assert blocked.status_code == 403
+
+
+
+def test_zap_diagnostics_reports_expected_version_without_exposing_api_key(monkeypatch):
+    import io
+    from urllib.request import Request
+    captured = {}
+    class Response(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *args): self.close()
+    def fake_urlopen(request, timeout=0):
+        captured["url"] = request.full_url if isinstance(request, Request) else str(request)
+        return Response(b'{"version":"2.15.0"}')
+    monkeypatch.setenv("DKCISSP_ZAP_API_URL", "http://127.0.0.1:8090")
+    monkeypatch.setenv("DKCISSP_ZAP_API_KEY", "secret-test-key")
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    result = app.diagnose_zap_api()
+    assert result["status"] == "ready"
+    assert result["version"] == "2.15.0"
+    assert result["endpoint"] == "http://127.0.0.1:8090"
+    assert "secret-test-key" not in str(result)
+    assert "secret-test-key" in captured["url"]
+
+
+def test_zap_diagnostics_distinguishes_unrelated_service(monkeypatch):
+    import io
+    class Response(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *args): self.close()
+    monkeypatch.delenv("DKCISSP_ZAP_API_KEY", raising=False)
+    monkeypatch.delenv("ZAP_API_KEY", raising=False)
+    monkeypatch.setenv("DKCISSP_ZAP_API_URL", "http://127.0.0.1:8091")
+    monkeypatch.setattr(app, "urlopen", lambda *args, **kwargs: Response(b'{"service":"not-zap"}'))
+    result = app.diagnose_zap_api()
+    assert result["status"] == "api_mismatch"
+    assert "another service" in result["message"]
+
+
+def test_zap_diagnostics_handles_auth_failure_without_secret_leak(monkeypatch):
+    from urllib.error import HTTPError
+    monkeypatch.setenv("DKCISSP_ZAP_API_URL", "http://127.0.0.1:8092")
+    monkeypatch.setenv("DKCISSP_ZAP_API_KEY", "top-secret")
+    def denied(*args, **kwargs):
+        raise HTTPError("http://127.0.0.1:8092", 403, "Forbidden", {}, None)
+    monkeypatch.setattr(app, "urlopen", denied)
+    result = app.diagnose_zap_api()
+    assert result["status"] == "auth_failed"
+    assert "top-secret" not in str(result)
+
+
+def test_zap_diagnostics_rejects_invalid_endpoint(monkeypatch):
+    monkeypatch.setenv("DKCISSP_ZAP_API_URL", "http://user:password@127.0.0.1:8080")
+    result = app.diagnose_zap_api()
+    assert result["status"] == "configuration_error"

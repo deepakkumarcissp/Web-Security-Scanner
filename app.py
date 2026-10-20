@@ -172,10 +172,53 @@ def add_finding(conn, scan_id, target, severity, title, url, evidence, remediati
 
 
 
+def zap_api_settings() -> tuple[str, str]:
+    """Read local ZAP endpoint and API key without exposing secrets to callers."""
+    api_root = os.environ.get("DKCISSP_ZAP_API_URL", "http://127.0.0.1:8080").rstrip("/")
+    parsed = urlparse(api_root)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("DKCISSP_ZAP_API_URL must be an HTTP(S) base URL without credentials, query, or fragment")
+    api_key = os.environ.get("DKCISSP_ZAP_API_KEY", os.environ.get("ZAP_API_KEY", ""))
+    return api_root, api_key
+
+
+def diagnose_zap_api() -> dict:
+    """Probe only the configured ZAP API version endpoint and return actionable, secret-free status."""
+    try:
+        api_root, api_key = zap_api_settings()
+    except ValueError as exc:
+        return {"status": "configuration_error", "message": str(exc), "endpoint": "invalid configuration"}
+    endpoint = api_root + "/JSON/core/view/version/"
+    if api_key:
+        endpoint += "?" + urlencode({"apikey": api_key})
+    try:
+        req = Request(endpoint, headers={"Accept": "application/json", "User-Agent": "DKCISSP-WebSecurityScanner/0.1"})
+        with urlopen(req, timeout=2) as response:
+            payload = json.loads(response.read(4096).decode("utf-8", "replace"))
+        if isinstance(payload, dict) and payload.get("version"):
+            return {"status": "ready", "message": "OWASP ZAP API responded successfully.", "endpoint": api_root,
+                    "version": str(payload["version"])[:80]}
+        return {"status": "api_mismatch", "message": "The endpoint responded, but it did not return the expected ZAP version field; another service may be using this port.", "endpoint": api_root}
+    except HTTPError as exc:
+        if exc.code in {401, 403}:
+            status, message = "auth_failed", "The endpoint denied the API request. Check the ZAP API key and access settings."
+        elif exc.code == 404:
+            status, message = "api_mismatch", "The endpoint returned 404 for the ZAP API path. Another service may be using this port."
+        else:
+            status, message = "api_unreachable", f"The endpoint returned HTTP {exc.code}. Check the ZAP API endpoint and configuration."
+        return {"status": status, "message": message, "endpoint": api_root}
+    except (URLError, TimeoutError, OSError):
+        return {"status": "api_unreachable", "message": "No usable ZAP API response. Confirm ZAP is running and the configured endpoint/port is correct; do not stop other services to free the port.", "endpoint": api_root}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {"status": "api_mismatch", "message": "The endpoint did not return valid JSON from the ZAP version API. Another service may be using this port.", "endpoint": api_root}
+
+
 def perform_zap_passive_check(target: str) -> list[tuple]:
     """Ask a locally running ZAP instance to fetch only the exact authorized URL, then read passive alerts."""
-    api_root = "http://127.0.0.1:8080"
-    api_key = os.environ.get("ZAP_API_KEY", "")
+    try:
+        api_root, api_key = zap_api_settings()
+    except ValueError:
+        return []
     def zap_get(path: str, params: dict) -> dict:
         query = dict(params)
         if api_key:
@@ -901,17 +944,14 @@ def scanner_tools_status() -> list[dict]:
             "install_method": "Kali/Debian package manager",
             "package": spec["package"],
         })
-    # ZAP service/API availability is checked independently of the executable.
-    zap_api = None
-    try:
-        with urlopen("http://127.0.0.1:8080/JSON/core/view/version/", timeout=1.5) as response:
-            zap_api = json.loads(response.read(4096).decode("utf-8", "replace"))
-    except Exception:
-        pass
+    # ZAP executable and API are separate checks; an unrelated service on its port is not ZAP.
+    zap_api = diagnose_zap_api()
     for item in tools:
         if item["id"] == "zaproxy":
-            item["service_status"] = "running" if zap_api and zap_api.get("version") else "not_running"
-            item["service_version"] = zap_api.get("version") if zap_api else None
+            item["service_status"] = zap_api["status"]
+            item["service_message"] = zap_api["message"]
+            item["service_endpoint"] = zap_api.get("endpoint")
+            item["service_version"] = zap_api.get("version")
     return tools
 
 
