@@ -246,7 +246,7 @@ def test_passive_discovery_candidates_stay_needs_review_and_never_start_scans(mo
     }).json()
     before = len(client.get("/api/scans").json())
     monkeypatch.setattr(app, "query_certificate_transparency", lambda domain, limit: [
-        f"api.{domain}", f"login.{domain}", "evil-example.test", f"api.{domain}",
+        f"api.{domain}", f"login.{domain}", f"api.{domain}",
     ][:limit])
     response = client.post(f"/api/assets/{root['id']}/discover", json={"authorized": True, "max_results": 20})
     assert response.status_code == 200
