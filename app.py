@@ -57,6 +57,10 @@ def init_db() -> None:
                 affected_url TEXT NOT NULL, evidence TEXT NOT NULL,
                 remediation TEXT NOT NULL, confidence TEXT NOT NULL,
                 discovered_at TEXT NOT NULL,
+                lifecycle_status TEXT NOT NULL DEFAULT 'open'
+                    CHECK(lifecycle_status IN ('open','accepted','remediated','false_positive','retest_required')),
+                lifecycle_notes TEXT NOT NULL DEFAULT '',
+                lifecycle_updated_at TEXT,
                 FOREIGN KEY(scan_id) REFERENCES scans(id)
             );
             CREATE TABLE IF NOT EXISTS schedules(
@@ -82,6 +86,13 @@ def init_db() -> None:
             );
             """
         )
+        finding_columns = {row["name"] for row in conn.execute("PRAGMA table_info(findings)")}
+        if "lifecycle_status" not in finding_columns:
+            conn.execute("ALTER TABLE findings ADD COLUMN lifecycle_status TEXT NOT NULL DEFAULT 'open'")
+        if "lifecycle_notes" not in finding_columns:
+            conn.execute("ALTER TABLE findings ADD COLUMN lifecycle_notes TEXT NOT NULL DEFAULT ''")
+        if "lifecycle_updated_at" not in finding_columns:
+            conn.execute("ALTER TABLE findings ADD COLUMN lifecycle_updated_at TEXT")
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(assets)")}
         if "approval_reference" not in columns:
             conn.execute("ALTER TABLE assets ADD COLUMN approval_reference TEXT NOT NULL DEFAULT ''")
@@ -123,6 +134,11 @@ class AssetScopeUpdate(BaseModel):
 class AssetDiscoveryRequest(BaseModel):
     authorized: bool = False
     max_results: int = Field(default=50, ge=1, le=100)
+
+
+class FindingLifecycleUpdate(BaseModel):
+    status: str = Field(pattern="^(open|accepted|remediated|false_positive|retest_required)$")
+    notes: str = Field(default="", max_length=2000)
 
 
 def require_in_scope_asset(target: str) -> dict:
@@ -899,6 +915,20 @@ def scan_detail(scan_id: int):
         return {"scan": dict(scan), "findings": findings}
 
 
+@app.patch("/api/findings/{finding_id}/lifecycle")
+def update_finding_lifecycle(finding_id: int, request: FindingLifecycleUpdate):
+    with connect() as conn:
+        row = conn.execute("SELECT id FROM findings WHERE id=?", (finding_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Finding not found")
+        conn.execute(
+            "UPDATE findings SET lifecycle_status=?,lifecycle_notes=?,lifecycle_updated_at=? WHERE id=?",
+            (request.status, request.notes.strip(), now(), finding_id),
+        )
+        updated = conn.execute("SELECT * FROM findings WHERE id=?", (finding_id,)).fetchone()
+        return dict(updated)
+
+
 @app.get("/api/findings")
 def list_findings(severity: str | None = None):
     with connect() as conn:
@@ -924,6 +954,7 @@ def export_findings():
     fields = [
         "id", "scan_id", "target", "severity", "title", "affected_url",
         "evidence", "remediation", "confidence", "discovered_at",
+        "lifecycle_status", "lifecycle_notes", "lifecycle_updated_at",
     ]
     output = io.StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=fields)

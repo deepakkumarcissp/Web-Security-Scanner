@@ -73,12 +73,40 @@ def test_schedule_accepts_future_time_and_can_be_deleted():
     assert client.delete(f"/api/schedules/{payload['id']}").status_code == 200
 
 
+def test_finding_lifecycle_update_and_not_found():
+    from uuid import uuid4
+    with app.connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+            (f"http://lifecycle-{uuid4().hex}.example", "quick", "completed", app.now()),
+        )
+        scan_id = cur.lastrowid
+        cur = conn.execute(
+            """INSERT INTO findings
+            (scan_id,target,severity,title,affected_url,evidence,remediation,confidence,discovered_at)
+            VALUES(?,?,?,?,?,?,?,?,?)""",
+            (scan_id, f"http://lifecycle-{uuid4().hex}.example", "Low", "Test finding", "http://example.test", "evidence", "fix", "Medium", app.now()),
+        )
+        finding_id = cur.lastrowid
+    response = client.patch(f"/api/findings/{finding_id}/lifecycle", json={"status":"retest_required", "notes":"Fix deployed; retest needed"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["lifecycle_status"] == "retest_required"
+    assert payload["lifecycle_notes"] == "Fix deployed; retest needed"
+    assert payload["lifecycle_updated_at"]
+    invalid = client.patch(f"/api/findings/{finding_id}/lifecycle", json={"status":"invented", "notes":""})
+    assert invalid.status_code == 422
+    missing = client.patch("/api/findings/999999999/lifecycle", json={"status":"open", "notes":""})
+    assert missing.status_code == 404
+
+
 def test_csv_export_has_expected_fields():
     response = client.get("/api/export/findings.csv")
     assert response.status_code == 200
     assert "text/csv" in response.headers["content-type"]
     assert "severity" in response.text
     assert "remediation" in response.text
+    assert "lifecycle_status" in response.text
 
 
 def test_csv_cell_neutralizes_spreadsheet_formulas():

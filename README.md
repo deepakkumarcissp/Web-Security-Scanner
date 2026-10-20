@@ -69,6 +69,7 @@ The ZAP adapter does **not** launch a spider or active scan. The optional WhatWe
 - Target authorization confirmation before scan and schedule creation
 - Finding normalization with severity, affected URL, evidence, confidence, and remediation
 - SQLite-backed scan and finding history
+- Finding lifecycle tracking: open, accepted, remediated, false positive, and retest required, with notes and update timestamps
 - Daily and weekly recurring schedules
 - CSV findings export
 - JSON API for dashboard and scan workflows
@@ -166,7 +167,8 @@ The current API includes the following main routes:
 - `POST /api/tools/install/{tool_id}` — explicitly approved install for allow-listed tools
 - `POST /api/scans` — create a scan
 - `GET /api/scans` and `GET /api/scans/{id}` — scan history/details
-- `GET /api/findings` — findings
+- `GET /api/findings` — findings, including lifecycle status and notes
+- `PATCH /api/findings/{finding_id}/lifecycle` — update a finding lifecycle status and notes
 - `GET /api/export/findings.csv` — CSV export
 - `GET /api/schedules` and `POST /api/schedules` — list/create schedules
 - `PATCH /api/schedules/{id}` — pause/resume a schedule
@@ -244,7 +246,7 @@ The roadmap is staged so each integration is independently testable and the UI s
 - [ ] Safe cancellation and consistent timeout handling
 - [ ] Stronger scheduler execution and restart/reboot behavior
 - [ ] HTML report alongside CSV
-- [ ] Finding lifecycle: accepted, remediated, false positive, and retest required
+- [x] Finding lifecycle: open, accepted, remediated, false positive, and retest required, with notes and timestamps
 - [ ] Retest comparisons and measurable risk reduction
 - [ ] Better scan logs and exportable diagnostic bundles
 
