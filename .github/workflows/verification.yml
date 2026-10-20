@@ -1,0 +1,42 @@
+name: Project verification
+
+on:
+  push:
+    branches: ["main", "feature/**"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python-tests:
+    name: Python compile and test suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies and test tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest httpx
+
+      - name: Compile application and tests
+        run: python -m py_compile app.py tests/test_app.py
+
+      - name: Run automated tests
+        run: pytest -q
+
+      - name: Report verification boundary
+        if: always()
+        run: |
+          echo "This workflow validates Python compilation and automated tests on Ubuntu/Python 3.11."
+          echo "It does not prove a clean Kali install, browser-based end-to-end behavior, or live external scanner integrations."
