@@ -75,6 +75,14 @@ def test_csv_export_has_expected_fields():
     assert "remediation" in response.text
 
 
+def test_csv_cell_neutralizes_spreadsheet_formulas():
+    assert app.safe_csv_cell("=1+1") == "'=1+1"
+    assert app.safe_csv_cell("  @SUM(A1:A2)") == "'  @SUM(A1:A2)"
+    assert app.safe_csv_cell("-2") == "'-2"
+    assert app.safe_csv_cell("ordinary finding text") == "ordinary finding text"
+    assert app.safe_csv_cell(123) == 123
+
+
 def test_dashboard_renders_with_schedule_and_report_navigation():
     response = client.get("/")
     assert response.status_code == 200
