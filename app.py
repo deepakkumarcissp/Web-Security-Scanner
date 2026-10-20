@@ -12,6 +12,7 @@ import sqlite3
 import ssl
 import threading
 import time
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -154,6 +155,69 @@ def perform_zap_passive_check(target: str) -> list[tuple]:
         normalized.append((severity, "OWASP ZAP: " + title, str(alert.get("url") or target), evidence, remediation, confidence))
     return normalized
 
+def perform_testssl_check(target: str, timeout_seconds: int = 75) -> tuple[list[tuple], dict]:
+    """Run a bounded testssl.sh fast assessment for an authorized HTTPS target."""
+    if not target.lower().startswith("https://"):
+        return [], {"status": "skipped", "reason": "TLS assessment requires an HTTPS target"}
+    binary = shutil.which(TOOL_CATALOG["testssl"]["binary"])
+    if not binary:
+        return [], {"status": "unavailable", "reason": "testssl.sh is not installed"}
+
+    findings: list[tuple] = []
+    with tempfile.TemporaryDirectory(prefix="dkcissp-testssl-") as temp_dir:
+        json_path = str(Path(temp_dir) / "results.json")
+        try:
+            result = subprocess.run(
+                [binary, "--quiet", "--fast", "--jsonfile-pretty", json_path, target],
+                capture_output=True, text=True, timeout=timeout_seconds, check=False,
+                env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"},
+            )
+        except subprocess.TimeoutExpired:
+            return [], {"status": "timeout", "timeout_seconds": timeout_seconds}
+        except OSError as exc:
+            return [], {"status": "error", "reason": str(exc)[:300]}
+
+        if not os.path.isfile(json_path):
+            # testssl can return a non-zero code for target/network errors; do not
+            # misrepresent raw console text as validated security findings.
+            return [], {"status": "error", "return_code": result.returncode,
+                        "reason": "testssl.sh did not produce its JSON report"}
+        try:
+            with open(json_path, encoding="utf-8", errors="replace") as report_file:
+                report = json.load(report_file)
+        except (OSError, json.JSONDecodeError):
+            return [], {"status": "error", "return_code": result.returncode,
+                        "reason": "testssl.sh produced an unreadable JSON report"}
+
+    entries = report if isinstance(report, list) else report.get("scanResult", []) if isinstance(report, dict) else []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        severity_raw = str(entry.get("severity", "")).strip().lower()
+        finding_text = str(entry.get("finding", "")).strip()
+        test_id = str(entry.get("id", "TLS check")).strip()
+        if not finding_text:
+            continue
+        if severity_raw in {"critical", "high"}:
+            severity = "High"
+        elif severity_raw in {"medium", "warning"}:
+            severity = "Medium"
+        elif severity_raw in {"low"}:
+            severity = "Low"
+        elif severity_raw in {"info", "informational", "ok", "best practice"}:
+            continue
+        else:
+            # Avoid converting unknown/OK result categories into findings.
+            continue
+        title = ("testssl.sh: " + test_id)[:240]
+        evidence = finding_text[:1800]
+        remediation = str(entry.get("cve", "") or "Review the TLS result and configure supported protocols and cipher suites according to your security policy.")[:1800]
+        findings.append((severity, title, target, evidence, remediation, "Medium"))
+
+    return findings, {"status": "completed" if result.returncode == 0 else "completed_with_warnings",
+                      "return_code": result.returncode, "finding_count": len(findings)}
+
+
 def perform_scan(scan_id: int, target: str, profile: str) -> None:
     findings = []
     try:
@@ -263,6 +327,13 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
 
         # If ZAP is configured locally, merge its passive-only alerts into the same finding store.
         # This remains optional; absence of ZAP never blocks the built-in scan.
+        # testssl.sh is an optional, bounded HTTPS check. It is invoked without a shell,
+        # only for explicitly authorized scans, and its status is recorded in the scan summary.
+        tls_status = {"status": "not_run", "reason": "TLS check not requested by profile"}
+        if profile in ("standard", "deep") and target.lower().startswith("https://"):
+            tls_findings, tls_status = perform_testssl_check(target)
+            findings.extend(tls_findings)
+
         findings.extend(perform_zap_passive_check(target))
         deduped = []
         seen = set()
@@ -282,7 +353,7 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                     "completed", now(),
                     json.dumps({
                         "http_status": status_code, "final_url": final_url,
-                        "checks": "passive HTTP/header checks", "finding_count": len(findings),
+                        "checks": "passive HTTP/header checks plus optional testssl.sh and ZAP passive checks",\n                        "tls_check": tls_status, "finding_count": len(findings),
                     }),
                     scan_id,
                 ),
@@ -371,7 +442,7 @@ def create_scan(request: ScanRequest):
     scan_id = start_scan(target, request.profile)
     return {
         "id": scan_id, "status": "running",
-        "message": "Low-impact passive HTTP and security-header checks started.",
+        "message": "Low-impact HTTP/header checks started; standard/deep HTTPS scans also run testssl.sh when installed, with a bounded timeout. Local ZAP passive alerts are optional.",
     }
 
 
