@@ -330,9 +330,12 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         # testssl.sh is an optional, bounded HTTPS check. It is invoked without a shell,
         # only for explicitly authorized scans, and its status is recorded in the scan summary.
         tls_status = {"status": "not_run", "reason": "TLS check not requested by profile"}
-        if profile in ("standard", "deep") and target.lower().startswith("https://"):
-            tls_findings, tls_status = perform_testssl_check(target)
-            findings.extend(tls_findings)
+        if profile in ("standard", "deep"):
+            if target.lower().startswith("https://"):
+                tls_findings, tls_status = perform_testssl_check(target)
+                findings.extend(tls_findings)
+            else:
+                tls_status = {"status": "skipped", "reason": "TLS assessment requires an HTTPS target"}
 
         findings.extend(perform_zap_passive_check(target))
         deduped = []
