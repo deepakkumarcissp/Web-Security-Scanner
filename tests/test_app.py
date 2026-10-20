@@ -154,3 +154,73 @@ def test_tool_setup_page_is_separate_from_risk_dashboard():
     assert 'data-page="toolsetup"' in response.text
     assert 'id="toolCards"' in response.text
     assert "v0.1 MVP" not in response.text
+
+
+def test_asset_inventory_requires_explicit_authorization():
+    response = client.post("/api/assets", json={
+        "target": "https://Example.com", "authorized": False,
+    })
+    assert response.status_code == 400
+    assert "authorized" in response.json()["detail"].lower()
+
+
+def test_asset_inventory_normalizes_and_deduplicates_target():
+    from uuid import uuid4
+    hostname = f"inventory-{uuid4().hex}.example"
+    first = client.post("/api/assets", json={
+        "target": f"HTTPS://{hostname.upper()}:443/", "authorized": True,
+        "scope_status": "in_scope", "notes": "approved root",
+    })
+    assert first.status_code == 200
+    first_payload = first.json()
+    assert first_payload["target"] == f"https://{hostname}"
+    assert first_payload["scope_status"] == "in_scope"
+    assert first_payload["created"] is True
+
+    second = client.post("/api/assets", json={
+        "target": f"https://{hostname}/", "authorized": True,
+    })
+    assert second.status_code == 200
+    assert second.json()["id"] == first_payload["id"]
+    assert second.json()["created"] is False
+    assert len([asset for asset in client.get("/api/assets").json()
+                if asset["target"] == f"https://{hostname}"]) == 1
+
+
+def test_new_assets_default_to_needs_review_and_do_not_start_scan():
+    before = len(client.get("/api/scans").json())
+    response = client.post("/api/assets", json={
+        "target": "https://review-me.example", "authorized": True,
+    })
+    assert response.status_code == 200
+    assert response.json()["scope_status"] == "needs_review"
+    assert len(client.get("/api/scans").json()) == before
+
+
+def test_asset_scope_change_requires_authorization_and_valid_asset():
+    asset = client.post("/api/assets", json={
+        "target": "https://scope-change.example", "authorized": True,
+    }).json()
+    denied = client.patch(f"/api/assets/{asset['id']}/scope", json={
+        "scope_status": "in_scope", "authorized": False,
+    })
+    assert denied.status_code == 400
+    changed = client.patch(f"/api/assets/{asset['id']}/scope", json={
+        "scope_status": "in_scope", "authorized": True,
+    })
+    assert changed.status_code == 200
+    assert changed.json()["scope_status"] == "in_scope"
+    missing = client.patch("/api/assets/999999/scope", json={
+        "scope_status": "in_scope", "authorized": True,
+    })
+    assert missing.status_code == 404
+
+
+def test_asset_inventory_ui_is_wired_to_scope_api():
+    response = client.get("/")
+    assert response.status_code == 200
+    assert 'data-page="assets"' in response.text
+    assert 'id="assetRows"' in response.text
+    assert 'id="assetForm"' in response.text
+    assert "loadAssets()" in response.text
+    assert "New assets default to Needs Review" in response.text
