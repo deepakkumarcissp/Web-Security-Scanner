@@ -18,7 +18,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -484,14 +484,14 @@ def list_tools():
 
 
 @app.post("/api/tools/install/{tool_id}")
-def install_tool(tool_id: str, request: ToolInstallRequest):
+def install_tool(tool_id: str, request: ToolInstallRequest, client: FastAPIRequest):
     if tool_id not in TOOL_CATALOG:
         raise HTTPException(404, "Tool is not in the approved installer allow-list.")
     if not request.approved:
         raise HTTPException(400, "Explicit installation approval is required.")
     # Never allow remote callers to trigger privileged package operations.
-    if not getattr(getattr(app, "state", object()), "request_client_host", None):
-        pass
+    if client.client.host not in {"127.0.0.1", "::1", "testclient"}:
+        raise HTTPException(403, "Tool installation is available only from the local machine.")
     spec = TOOL_CATALOG[tool_id]
     if shutil.which(spec["binary"]):
         return {"ok": True, "message": f"{spec['label']} is already installed.", "tools": scanner_tools_status()}
