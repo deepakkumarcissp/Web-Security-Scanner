@@ -328,6 +328,88 @@ def perform_testssl_check(target: str, timeout_seconds: int = 75) -> tuple[list[
 
 
 
+def perform_nuclei_check(target: str, timeout_seconds: int = 30) -> tuple[list[tuple], dict]:
+    """Run a bounded Nuclei pass using conservative, non-OAST template categories."""
+    binary = shutil.which(TOOL_CATALOG["nuclei"]["binary"])
+    if not binary:
+        return [], {"status": "unavailable", "reason": "Nuclei is not installed"}
+
+    findings: list[tuple] = []
+    with tempfile.TemporaryDirectory(prefix="dkcissp-nuclei-") as temp_dir:
+        jsonl_path = str(Path(temp_dir) / "results.jsonl")
+        command = [
+            binary, "-target", target,
+            "-id", "http-missing-security-headers,cookies-without-secure,cookies-without-httponly",
+            "-pt", "http",
+            "-severity", "info,low,medium,high,critical",
+            "-rl", "3", "-c", "1", "-timeout", "3", "-retries", "0",
+            "-duc", "-disable-redirects", "-no-interactsh", "-silent",
+            "-jsonl-export", jsonl_path,
+        ]
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, timeout=timeout_seconds,
+                check=False, env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"},
+            )
+        except subprocess.TimeoutExpired:
+            return [], {"status": "timeout", "timeout_seconds": timeout_seconds}
+        except OSError as exc:
+            return [], {"status": "error", "reason": str(exc)[:300]}
+
+        if not os.path.isfile(jsonl_path):
+            return [], {"status": "error", "return_code": result.returncode,
+                        "reason": "Nuclei did not produce its JSONL report"}
+        malformed = 0
+        with open(jsonl_path, encoding="utf-8", errors="replace") as report_file:
+            for line in report_file:
+                if not line.strip():
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    malformed += 1
+                    continue
+                if not isinstance(item, dict):
+                    malformed += 1
+                    continue
+                info = item.get("info") if isinstance(item.get("info"), dict) else {}
+                severity_raw = str(info.get("severity", "")).strip().lower()
+                severity_map = {"critical": "Critical", "high": "High", "medium": "Medium", "low": "Low", "info": "Info"}
+                severity = severity_map.get(severity_raw)
+                if not severity:
+                    continue
+                title = str(info.get("name") or item.get("template-id") or "Nuclei finding")[:240]
+                template_id = str(item.get("template-id") or "unknown-template")[:160]
+                matched_at = str(item.get("matched-at") or item.get("host") or target)[:2048]
+                extracted = item.get("extracted-results")
+                matcher = str(item.get("matcher-name") or "")[:160]
+                evidence_parts = [f"Template: {template_id}"]
+                if matcher:
+                    evidence_parts.append(f"Matcher: {matcher}")
+                if isinstance(extracted, list) and extracted:
+                    evidence_parts.append("Extracted: " + ", ".join(str(x)[:200] for x in extracted[:5]))
+                curl_command = str(item.get("curl-command") or "")
+                if curl_command:
+                    evidence_parts.append("Request details omitted from stored evidence for safety.")
+                remediation = str(info.get("remediation") or "Review the template evidence, validate applicability, and apply the vendor-recommended fix.")[:1800]
+                findings.append((severity, "Nuclei: " + title, matched_at, "; ".join(evidence_parts)[:1800], remediation, "Medium"))
+
+    # Keep a stable, deterministic set of results even if templates emit duplicates.
+    deduped = []
+    seen = set()
+    for finding in findings:
+        key = (finding[0], finding[1], finding[2])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(finding)
+    return deduped, {"status": "completed" if result.returncode == 0 else "completed_with_warnings",
+                     "return_code": result.returncode, "finding_count": len(deduped),
+                     "malformed_records": malformed,
+                     "template_ids": ["http-missing-security-headers", "cookies-without-secure", "cookies-without-httponly"],
+                     "rate_limit_per_second": 3, "concurrency": 1, "redirects_disabled": True,
+                     "interactsh_disabled": True}
+
+
 def perform_whatweb_check(target: str, timeout_seconds: int = 30) -> tuple[list[tuple], dict]:
     """Run WhatWeb at its stealthy single-request aggression level and normalize its JSON output."""
     binary = shutil.which(TOOL_CATALOG["whatweb"]["binary"])
@@ -506,6 +588,10 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         # only for explicitly authorized scans, and its status is recorded in the scan summary.
         tls_status = {"status": "not_run", "reason": "TLS check not requested by profile"}
         whatweb_status = {"status": "not_run", "reason": "Technology discovery not requested by profile"}
+        nuclei_status = {"status": "not_run", "reason": "Nuclei checks are enabled for standard/deep profiles only"}
+        if profile in ("standard", "deep"):
+            nuclei_findings, nuclei_status = perform_nuclei_check(target)
+            findings.extend(nuclei_findings)
         if profile in ("standard", "deep"):
             whatweb_findings, whatweb_status = perform_whatweb_check(target)
             findings.extend(whatweb_findings)
@@ -537,7 +623,7 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                         "http_status": status_code, "final_url": final_url,
                         "checks": "passive HTTP/header checks plus optional WhatWeb, testssl.sh, and ZAP passive checks",
                         "tls_check": tls_status, "whatweb_check": whatweb_status,
-                        "finding_count": len(findings),
+                        "nuclei_check": nuclei_status, "finding_count": len(findings),
                     }),
                     scan_id,
                 ),
@@ -916,6 +1002,7 @@ TOOL_CATALOG = {
     "zaproxy": {"label": "OWASP ZAP", "binary": "zaproxy", "package": "zaproxy", "version_args": ["-version"], "purpose": "Web crawler and passive security scanner"},
     "whatweb": {"label": "WhatWeb", "binary": "whatweb", "package": "whatweb", "version_args": ["--version"], "purpose": "Technology fingerprinting"},
     "testssl": {"label": "testssl.sh", "binary": "testssl.sh", "package": "testssl.sh", "version_args": ["--version"], "purpose": "TLS and HTTPS configuration assessment"},
+    "nuclei": {"label": "Nuclei", "binary": "nuclei", "package": "nuclei", "version_args": ["-version"], "purpose": "Template-based checks for known exposures and misconfigurations"},
 }
 
 
