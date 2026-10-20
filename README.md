@@ -81,7 +81,7 @@ The Scanner Setup page checks tools independently of scan results. Availability 
 | Tool | Intended role | Current integration status |
 |---|---|---|
 | Built-in passive checks | HTTP response and security-header checks | Used by scan execution |
-| OWASP ZAP | Passive web alerts | Optional adapter implemented; requires a working local ZAP API |
+| OWASP ZAP | Passive web alerts | Optional adapter implemented; setup diagnostics distinguish missing API, wrong service/port, authentication failure, and ready state |
 | `curl` | HTTP connectivity diagnostics | Detected/version checked by setup page |
 | WhatWeb | Technology fingerprinting | Invoked for Standard/Deep scans when installed; stealthy aggression level 1, no redirect following, bounded timeout, JSON findings normalization |
 | `testssl.sh` | TLS configuration assessment | Invoked for Standard/Deep HTTPS scans when installed; 75-second timeout and JSON report parsing; live external-tool behavior still needs end-to-end validation |
@@ -180,7 +180,7 @@ python -m pip install pytest httpx
 pytest -q
 ```
 
-The GitHub Actions workflow runs Python compilation and the automated test suite on Ubuntu/Python 3.11. CSV exports neutralize untrusted cell values that spreadsheet applications could interpret as formulas. CI does not prove a clean Kali install, browser-based end-to-end behavior, or live external scanner integrations. Before merging or announcing a release, follow the [Public-Release Verification Checklist](RELEASE_CHECKLIST.md). A running end-to-end OWASP ZAP scan still needs to be verified against an actual local ZAP service.
+The GitHub Actions workflow runs Python compilation and the automated test suite on Ubuntu/Python 3.11. CSV exports neutralize untrusted cell values that spreadsheet applications could interpret as formulas. CI does not prove a clean Kali install, browser-based end-to-end behavior, or live external scanner integrations. Before merging or announcing a release, follow the [Public-Release Verification Checklist](RELEASE_CHECKLIST.md). A running end-to-end OWASP ZAP scan still needs to be verified against an actual local ZAP service. Configure the API endpoint with `DKCISSP_ZAP_API_URL` (defaults to `http://127.0.0.1:8080`) and optionally set `DKCISSP_ZAP_API_KEY`; the key is never included in diagnostic response fields. A listening port alone is not proof that ZAP is running.
 
 ## Safety model
 
@@ -222,7 +222,7 @@ The roadmap is staged so each integration is independently testable and the UI s
 - [x] Explicit-confirmation package installation flow
 - [x] Optional OWASP ZAP passive-alert adapter
 - [ ] Verify ZAP adapter against a running local ZAP service
-- [ ] Improve ZAP service setup guidance and actionable diagnostics
+- [x] Improve ZAP service setup guidance and actionable diagnostics
 
 ### Phase 2 — Safe, modular scanner integrations
 
