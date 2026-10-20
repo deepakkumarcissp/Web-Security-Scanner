@@ -353,7 +353,8 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                     "completed", now(),
                     json.dumps({
                         "http_status": status_code, "final_url": final_url,
-                        "checks": "passive HTTP/header checks plus optional testssl.sh and ZAP passive checks",\n                        "tls_check": tls_status, "finding_count": len(findings),
+                        "checks": "passive HTTP/header checks plus optional testssl.sh and ZAP passive checks",
+                        "tls_check": tls_status, "finding_count": len(findings),
                     }),
                     scan_id,
                 ),
