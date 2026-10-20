@@ -81,3 +81,29 @@ def test_dashboard_renders_with_schedule_and_report_navigation():
     assert "Web Security Scanner" in response.text
     assert "Schedules" in response.text
     assert "Download findings.csv" in response.text
+
+
+
+def test_tool_status_reports_allowlisted_integrations():
+    response = client.get("/api/tools")
+    assert response.status_code == 200
+    payload = response.json()
+    assert {tool["id"] for tool in payload["tools"]} == {
+        "curl", "zaproxy", "whatweb", "testssl"
+    }
+    assert all("status" in tool and "installed" in tool for tool in payload["tools"])
+
+
+def test_tool_install_requires_approval_and_allowlisted_id():
+    denied = client.post("/api/tools/install/zaproxy", json={"approved": False})
+    assert denied.status_code == 400
+    unknown = client.post("/api/tools/install/not-allowlisted", json={"approved": True})
+    assert unknown.status_code == 404
+
+
+def test_tool_setup_page_is_separate_from_risk_dashboard():
+    response = client.get("/")
+    assert response.status_code == 200
+    assert 'data-page="toolsetup"' in response.text
+    assert 'id="toolCards"' in response.text
+    assert "v0.1 MVP" not in response.text
