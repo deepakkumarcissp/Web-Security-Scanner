@@ -74,10 +74,21 @@ def init_db() -> None:
                 discovery_source TEXT NOT NULL DEFAULT 'manual',
                 first_seen TEXT NOT NULL,
                 last_seen TEXT NOT NULL,
-                notes TEXT NOT NULL DEFAULT ''
+                notes TEXT NOT NULL DEFAULT '',
+                approval_reference TEXT NOT NULL DEFAULT '',
+                reviewed_at TEXT,
+                review_decision TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(review_decision IN ('pending','approved','rejected','not_required'))
             );
             """
         )
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(assets)")}
+        if "approval_reference" not in columns:
+            conn.execute("ALTER TABLE assets ADD COLUMN approval_reference TEXT NOT NULL DEFAULT ''")
+        if "reviewed_at" not in columns:
+            conn.execute("ALTER TABLE assets ADD COLUMN reviewed_at TEXT")
+        if "review_decision" not in columns:
+            conn.execute("ALTER TABLE assets ADD COLUMN review_decision TEXT NOT NULL DEFAULT 'pending'")
 
 
 init_db()
@@ -106,6 +117,7 @@ class AssetScopeUpdate(BaseModel):
     authorized: bool = False
     scope_status: str = Field(pattern="^(in_scope|out_of_scope|needs_review)$")
     notes: str | None = Field(default=None, max_length=1000)
+    approval_reference: str | None = Field(default=None, max_length=200)
 
 
 class AssetDiscoveryRequest(BaseModel):
@@ -535,10 +547,12 @@ def create_asset(request: AssetRequest):
                          (timestamp, request.notes, existing["id"]))
             row = conn.execute("SELECT * FROM assets WHERE id=?", (existing["id"],)).fetchone()
             return {**dict(row), "created": False}
+        initial_decision = "approved" if request.scope_status == "in_scope" else ("rejected" if request.scope_status == "out_of_scope" else "pending")
         cursor = conn.execute(
-            """INSERT INTO assets(target,asset_type,scope_status,discovery_source,first_seen,last_seen,notes)
-               VALUES(?,?,?,?,?,?,?)""",
-            (normalized, asset_type, request.scope_status, "manual", timestamp, timestamp, request.notes),
+            """INSERT INTO assets(target,asset_type,scope_status,discovery_source,first_seen,last_seen,notes,reviewed_at,review_decision)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (normalized, asset_type, request.scope_status, "manual", timestamp, timestamp, request.notes,
+             timestamp if initial_decision in {"approved", "rejected"} else None, initial_decision),
         )
         row = conn.execute("SELECT * FROM assets WHERE id=?", (cursor.lastrowid,)).fetchone()
         return {**dict(row), "created": True}
@@ -552,12 +566,17 @@ def update_asset_scope(asset_id: int, request: AssetScopeUpdate):
         existing = conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
         if not existing:
             raise HTTPException(404, "Asset not found")
-        if request.notes is None:
-            conn.execute("UPDATE assets SET scope_status=?,last_seen=? WHERE id=?",
-                         (request.scope_status, now(), asset_id))
-        else:
-            conn.execute("UPDATE assets SET scope_status=?,notes=?,last_seen=? WHERE id=?",
-                         (request.scope_status, request.notes, now(), asset_id))
+        discovered = existing["discovery_source"] != "manual"
+        approval_reference = (request.approval_reference or "").strip()
+        if discovered and request.scope_status == "in_scope" and not approval_reference:
+            raise HTTPException(400, "Discovered candidates require an approval or change-ticket reference before entering In Scope.")
+        timestamp = now()
+        decision = "approved" if request.scope_status == "in_scope" else ("rejected" if request.scope_status == "out_of_scope" else "pending")
+        reviewed_at = timestamp if decision in {"approved", "rejected"} else None
+        notes = existing["notes"] if request.notes is None else request.notes
+        conn.execute("""UPDATE assets SET scope_status=?,notes=?,approval_reference=?,reviewed_at=?,
+            review_decision=?,last_seen=? WHERE id=?""",
+            (request.scope_status, notes, approval_reference if decision == "approved" else "", reviewed_at, decision, timestamp, asset_id))
         return dict(conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone())
 
 

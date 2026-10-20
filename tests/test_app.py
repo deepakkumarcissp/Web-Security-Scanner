@@ -328,8 +328,35 @@ def test_discovered_candidate_cannot_be_scanned_until_human_approves_it(monkeypa
     blocked = client.post("/api/scans", json={"target": candidate["target"], "profile": "quick", "authorized": True})
     assert blocked.status_code == 403
     assert found["scans_started"] == 0
-    approved = client.patch(f"/api/assets/{candidate['id']}/scope", json={"scope_status": "in_scope", "authorized": True})
+    missing_reference = client.patch(f"/api/assets/{candidate['id']}/scope", json={"scope_status": "in_scope", "authorized": True})
+    assert missing_reference.status_code == 400
+    assert "reference" in missing_reference.json()["detail"].lower()
+    approved = client.patch(f"/api/assets/{candidate['id']}/scope", json={
+        "scope_status": "in_scope", "authorized": True, "approval_reference": "CHG-12345",
+    })
     assert approved.status_code == 200
+    assert approved.json()["approval_reference"] == "CHG-12345"
+    assert approved.json()["review_decision"] == "approved"
+    assert approved.json()["reviewed_at"]
     monkeypatch.setattr(app, "start_scan", lambda target, profile: 23456)
     allowed = client.post("/api/scans", json={"target": candidate["target"], "profile": "quick", "authorized": True})
     assert allowed.status_code == 200
+
+
+def test_discovered_candidate_can_be_rejected_with_audit_state(monkeypatch):
+    from uuid import uuid4
+    root_domain = f"reject-{uuid4().hex}.example"
+    root = client.post("/api/assets", json={"target": f"https://{root_domain}", "authorized": True, "scope_status": "in_scope"}).json()
+    monkeypatch.setattr(app, "query_certificate_transparency", lambda domain, limit: [f"api.{domain}"])
+    client.post(f"/api/assets/{root['id']}/discover", json={"authorized": True})
+    candidate = next(a for a in client.get("/api/assets").json() if a["target"] == f"https://api.{root_domain}")
+    rejected = client.patch(f"/api/assets/{candidate['id']}/scope", json={
+        "scope_status": "out_of_scope", "authorized": True, "notes": "Not owned by our organization",
+    })
+    assert rejected.status_code == 200
+    assert rejected.json()["scope_status"] == "out_of_scope"
+    assert rejected.json()["review_decision"] == "rejected"
+    assert rejected.json()["reviewed_at"]
+    assert rejected.json()["notes"] == "Not owned by our organization"
+    blocked = client.post("/api/scans", json={"target": candidate["target"], "profile": "quick", "authorized": True})
+    assert blocked.status_code == 403
