@@ -408,6 +408,16 @@ def list_findings(severity: str | None = None):
         return [dict(row) for row in conn.execute("SELECT * FROM findings ORDER BY id DESC")]
 
 
+def safe_csv_cell(value):
+    """Prevent spreadsheet apps from interpreting untrusted finding text as formulas."""
+    if not isinstance(value, str):
+        return value
+    significant = value.lstrip(" \\t\\r\\n")
+    if significant.startswith(("=", "+", "-", "@", "\\t", "\\r")):
+        return "'" + value
+    return value
+
+
 @app.get("/api/export/findings.csv")
 def export_findings():
     fields = [
@@ -419,7 +429,7 @@ def export_findings():
     writer.writeheader()
     with connect() as conn:
         for row in conn.execute("SELECT " + ",".join(fields) + " FROM findings ORDER BY id DESC"):
-            writer.writerow(dict(row))
+            writer.writerow({key: safe_csv_cell(value) for key, value in dict(row).items()})
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv; charset=utf-8",
