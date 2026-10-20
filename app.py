@@ -108,6 +108,11 @@ class AssetScopeUpdate(BaseModel):
     notes: str | None = Field(default=None, max_length=1000)
 
 
+class AssetDiscoveryRequest(BaseModel):
+    authorized: bool = False
+    max_results: int = Field(default=50, ge=1, le=100)
+
+
 def validate_target(raw: str) -> str:
     raw = raw.strip()
     if not raw.lower().startswith(("http://", "https://")):
@@ -523,6 +528,89 @@ def update_asset_scope(asset_id: int, request: AssetScopeUpdate):
             conn.execute("UPDATE assets SET scope_status=?,notes=?,last_seen=? WHERE id=?",
                          (request.scope_status, request.notes, now(), asset_id))
         return dict(conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone())
+
+
+
+def valid_dns_name(hostname: str) -> bool:
+    if len(hostname) > 253 or not hostname or hostname.endswith("."):
+        return False
+    labels = hostname.split(".")
+    return all(1 <= len(label) <= 63 and
+               re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+               for label in labels)
+
+
+def query_certificate_transparency(root_domain: str, max_results: int) -> list[str]:
+    """Fetch a bounded certificate-transparency result set; never probes discovered hosts."""
+    endpoint = "https://crt.sh/?" + urlencode({"q": "%25." + root_domain, "output": "json"})
+    req = Request(endpoint, headers={
+        "Accept": "application/json",
+        "User-Agent": "DKCISSP-WebSecurityScanner/0.1 (passive authorized inventory)",
+    })
+    with urlopen(req, timeout=12) as response:
+        payload = response.read(1_000_001)
+    if len(payload) > 1_000_000:
+        raise HTTPException(502, "Certificate-transparency response exceeded the 1 MB safety limit.")
+    try:
+        records = json.loads(payload.decode("utf-8", "replace"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(502, "Certificate-transparency service returned invalid JSON.")
+    if not isinstance(records, list):
+        raise HTTPException(502, "Certificate-transparency service returned an unexpected response.")
+    candidates = set()
+    suffix = "." + root_domain
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for raw_name in str(record.get("name_value", "") or record.get("common_name", "")).splitlines():
+            hostname = raw_name.strip().lower().rstrip(".")
+            if hostname.startswith("*."):
+                hostname = hostname[2:]
+            if hostname == root_domain or hostname.endswith(suffix):
+                if valid_dns_name(hostname):
+                    candidates.add(hostname)
+    return sorted(name for name in candidates if name != root_domain)[:max_results]
+
+
+@app.post("/api/assets/{asset_id}/discover")
+def discover_subdomains(asset_id: int, request: AssetDiscoveryRequest):
+    if not request.authorized:
+        raise HTTPException(400, "Confirm you are authorized to discover subdomains for this asset.")
+    with connect() as conn:
+        root = conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+    if not root:
+        raise HTTPException(404, "Root asset not found")
+    if root["scope_status"] != "in_scope":
+        raise HTTPException(400, "Only an explicitly approved In Scope root asset can be used for discovery.")
+    parsed = urlparse(root["target"])
+    root_domain = (parsed.hostname or "").lower().rstrip(".")
+    if not valid_dns_name(root_domain) or "." not in root_domain:
+        raise HTTPException(400, "Passive subdomain discovery requires a fully qualified DNS root, not an IP address or local hostname.")
+    try:
+        candidates = query_certificate_transparency(root_domain, request.max_results)
+    except HTTPException:
+        raise
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        raise HTTPException(502, "Passive discovery could not reach the certificate-transparency service.") from exc
+    timestamp = now()
+    created = 0
+    with connect() as conn:
+        for hostname in candidates:
+            target = "https://" + hostname
+            exists = conn.execute("SELECT id FROM assets WHERE target=?", (target,)).fetchone()
+            if exists:
+                conn.execute("UPDATE assets SET last_seen=? WHERE id=?", (timestamp, exists["id"]))
+                continue
+            conn.execute(
+                """INSERT INTO assets(target,asset_type,scope_status,discovery_source,first_seen,last_seen,notes)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (target, "subdomain", "needs_review", "crt.sh", timestamp, timestamp,
+                 "Passive certificate-transparency candidate; verify ownership and scope before scanning."),
+            )
+            created += 1
+    return {"root_asset_id": asset_id, "source": "crt.sh", "candidates_found": len(candidates),
+            "new_assets_added": created, "scope_status": "needs_review",
+            "scans_started": 0, "message": "Candidates were added for review only; no hosts were contacted or scanned."}
 
 
 @app.post("/api/scans")

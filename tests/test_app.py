@@ -224,3 +224,67 @@ def test_asset_inventory_ui_is_wired_to_scope_api():
     assert 'id="assetForm"' in response.text
     assert "loadAssets()" in response.text
     assert "New assets default to Needs Review" in response.text
+
+
+
+def test_passive_discovery_requires_authorization_and_in_scope_root(monkeypatch):
+    calls = []
+    monkeypatch.setattr(app, "query_certificate_transparency", lambda root, limit: calls.append((root, limit)) or [])
+    asset = client.post("/api/assets", json={"target": "https://discover-auth.example", "authorized": True}).json()
+    denied = client.post(f"/api/assets/{asset['id']}/discover", json={"authorized": False})
+    assert denied.status_code == 400
+    not_in_scope = client.post(f"/api/assets/{asset['id']}/discover", json={"authorized": True})
+    assert not_in_scope.status_code == 400
+    assert calls == []
+
+
+def test_passive_discovery_candidates_stay_needs_review_and_never_start_scans(monkeypatch):
+    from uuid import uuid4
+    root_domain = f"discovery-{uuid4().hex}.example"
+    root = client.post("/api/assets", json={
+        "target": f"https://{root_domain}", "authorized": True, "scope_status": "in_scope",
+    }).json()
+    before = len(client.get("/api/scans").json())
+    monkeypatch.setattr(app, "query_certificate_transparency", lambda domain, limit: [
+        f"api.{domain}", f"login.{domain}", f"api.{domain}",
+    ][:limit])
+    response = client.post(f"/api/assets/{root['id']}/discover", json={"authorized": True, "max_results": 20})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["new_assets_added"] == 2
+    assert payload["scans_started"] == 0
+    rows = client.get("/api/assets").json()
+    discovered = [a for a in rows if a["discovery_source"] == "crt.sh" and root_domain in a["target"]]
+    assert len(discovered) == 2
+    assert all(a["scope_status"] == "needs_review" for a in discovered)
+    assert all(a["asset_type"] == "subdomain" for a in discovered)
+    assert len(client.get("/api/scans").json()) == before
+
+
+def test_certificate_transparency_parser_only_keeps_valid_subdomains(monkeypatch):
+    import json
+    from io import BytesIO
+    records = [
+        {"name_value": "api.parser-example.test\nlogin.parser-example.test\n*.wild.parser-example.test"},
+        {"name_value": "parser-example.test\nevil-parser-example.test\nhttps://bad.parser-example.test"},
+    ]
+    class FakeResponse(BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *args): self.close()
+    captured = {}
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        return FakeResponse(json.dumps(records).encode())
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    names = app.query_certificate_transparency("parser-example.test", 10)
+    assert names == ["api.parser-example.test", "login.parser-example.test", "wild.parser-example.test"]
+    assert "crt.sh" in captured["url"] and captured["timeout"] == 12
+
+
+def test_passive_discovery_ui_warns_about_external_lookup_and_review_only():
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "Passive Discovery" in response.text
+    assert "contacts crt.sh, not the target" in response.text
+    assert "discoverSubdomains" in response.text
