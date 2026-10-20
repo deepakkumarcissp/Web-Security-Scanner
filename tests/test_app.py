@@ -166,23 +166,23 @@ def test_asset_inventory_requires_explicit_authorization():
 
 def test_asset_inventory_normalizes_and_deduplicates_target():
     first = client.post("/api/assets", json={
-        "target": "HTTPS://Example.COM:443/", "authorized": True,
+        "target": "HTTPS://Inventory-Normalization-Unique.example:443/", "authorized": True,
         "scope_status": "in_scope", "notes": "approved root",
     })
     assert first.status_code == 200
     first_payload = first.json()
-    assert first_payload["target"] == "https://example.com"
+    assert first_payload["target"] == "https://inventory-normalization-unique.example"
     assert first_payload["scope_status"] == "in_scope"
     assert first_payload["created"] is True
 
     second = client.post("/api/assets", json={
-        "target": "https://example.com/", "authorized": True,
+        "target": "https://inventory-normalization-unique.example/", "authorized": True,
     })
     assert second.status_code == 200
     assert second.json()["id"] == first_payload["id"]
     assert second.json()["created"] is False
     assert len([asset for asset in client.get("/api/assets").json()
-                if asset["target"] == "https://example.com"]) == 1
+                if asset["target"] == "https://inventory-normalization-unique.example"]) == 1
 
 
 def test_new_assets_default_to_needs_review_and_do_not_start_scan():
