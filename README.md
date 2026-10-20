@@ -13,7 +13,7 @@ A community-first, local-first web application security scanner designed to help
 - **Interface:** browser dashboard, bound to localhost by default
 - **Backend:** Python + FastAPI
 - **Storage:** SQLite
-- **Reports:** CSV findings export
+- **Reports:** CSV findings export with spreadsheet-formula injection mitigation
 - **Current scan behavior:** built-in passive HTTP/response-header checks, with an optional OWASP ZAP passive-alert adapter when a local ZAP API is running
 - **Scope:** only scan systems you own or have explicit authorization to assess
 
@@ -180,7 +180,7 @@ python -m pip install pytest httpx
 pytest -q
 ```
 
-The feature branch has been checked with Python compilation and the automated test suite. The GitHub Actions workflow runs those same Python checks on Ubuntu/Python 3.11; it does not prove a clean Kali install, browser-based end-to-end behavior, or live external scanner integrations. Before merging or announcing a release, follow the [Public-Release Verification Checklist](RELEASE_CHECKLIST.md). A running end-to-end OWASP ZAP scan still needs to be verified against an actual local ZAP service.
+The GitHub Actions workflow runs Python compilation and the automated test suite on Ubuntu/Python 3.11. CSV exports neutralize untrusted cell values that spreadsheet applications could interpret as formulas. CI does not prove a clean Kali install, browser-based end-to-end behavior, or live external scanner integrations. Before merging or announcing a release, follow the [Public-Release Verification Checklist](RELEASE_CHECKLIST.md). A running end-to-end OWASP ZAP scan still needs to be verified against an actual local ZAP service.
 
 ## Safety model
 
