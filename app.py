@@ -339,10 +339,10 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 90) -> tuple[list[t
         jsonl_path = str(Path(temp_dir) / "results.jsonl")
         command = [
             binary, "-target", target,
-            "-tags", "misconfig,exposure,ssl,headers",
-            "-etags", "dos,intrusive,fuzz,headless,oast",
+            "-id", "http-missing-security-headers,cookies-without-secure,cookies-without-httponly",
+            "-pt", "http",
             "-severity", "info,low,medium,high,critical",
-            "-rl", "5", "-c", "2", "-timeout", "5", "-retries", "0",
+            "-rl", "3", "-c", "1", "-timeout", "3", "-retries", "0",
             "-duc", "-disable-redirects", "-no-interactsh", "-silent",
             "-jsonl-export", jsonl_path,
         ]

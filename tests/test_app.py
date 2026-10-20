@@ -144,10 +144,10 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
 
     def fake_run(command, **kwargs):
         assert command[0] == "/usr/bin/nuclei"
-        assert command[command.index("-tags") + 1] == "misconfig,exposure,ssl,headers"
-        assert command[command.index("-etags") + 1] == "dos,intrusive,fuzz,headless,oast"
-        assert command[command.index("-rl") + 1] == "5"
-        assert command[command.index("-c") + 1] == "2"
+        assert command[command.index("-id") + 1] == "http-missing-security-headers,cookies-without-secure,cookies-without-httponly"
+        assert command[command.index("-pt") + 1] == "http"
+        assert command[command.index("-rl") + 1] == "3"
+        assert command[command.index("-c") + 1] == "1"
         assert "-disable-redirects" in command
         assert "-no-interactsh" in command
         assert "-jsonl-export" in command
