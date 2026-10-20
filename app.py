@@ -6,6 +6,8 @@ import json
 import os
 import re
 import socket
+import shutil
+import subprocess
 import sqlite3
 import ssl
 import threading
@@ -418,3 +420,103 @@ def delete_schedule(schedule_id: int):
         if not cursor.rowcount:
             raise HTTPException(404, "Schedule not found")
     return {"deleted": True, "id": schedule_id}
+
+
+# Scanner-tool management is deliberately allow-listed. No user-supplied shell commands.
+TOOL_CATALOG = {
+    "curl": {"label": "curl", "binary": "curl", "package": "curl", "version_args": ["--version"], "purpose": "HTTP connectivity and endpoint diagnostics"},
+    "zaproxy": {"label": "OWASP ZAP", "binary": "zaproxy", "package": "zaproxy", "version_args": ["-version"], "purpose": "Web crawler and passive security scanner"},
+    "whatweb": {"label": "WhatWeb", "binary": "whatweb", "package": "whatweb", "version_args": ["--version"], "purpose": "Technology fingerprinting"},
+    "testssl": {"label": "testssl.sh", "binary": "testssl.sh", "package": "testssl.sh", "version_args": ["--version"], "purpose": "TLS and HTTPS configuration assessment"},
+}
+
+
+def _tool_version(tool: dict) -> str | None:
+    try:
+        result = subprocess.run(
+            [tool["binary"], *tool["version_args"]],
+            capture_output=True, text=True, timeout=4, check=False,
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+        output = (result.stdout or result.stderr).strip().splitlines()
+        return output[0][:180] if output else ("Available (version output unavailable)" if result.returncode == 0 else None)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def scanner_tools_status() -> list[dict]:
+    tools = []
+    for key, spec in TOOL_CATALOG.items():
+        path = shutil.which(spec["binary"])
+        version = _tool_version(spec) if path else None
+        tools.append({
+            "id": key, "name": spec["label"], "purpose": spec["purpose"],
+            "installed": bool(path), "status": "ready" if path and version else ("installed_check_failed" if path else "missing"),
+            "path": path, "version": version,
+            "install_method": "Kali/Debian package manager",
+            "package": spec["package"],
+        })
+    # ZAP service/API availability is checked independently of the executable.
+    zap_api = None
+    try:
+        with urlopen("http://127.0.0.1:8080/JSON/core/view/version/", timeout=1.5) as response:
+            zap_api = json.loads(response.read(4096).decode("utf-8", "replace"))
+    except Exception:
+        pass
+    for item in tools:
+        if item["id"] == "zaproxy":
+            item["service_status"] = "running" if zap_api and zap_api.get("version") else "not_running"
+            item["service_version"] = zap_api.get("version") if zap_api else None
+    return tools
+
+
+class ToolInstallRequest(BaseModel):
+    approved: bool = False
+
+
+@app.get("/api/tools")
+def list_tools():
+    return {
+        "tools": scanner_tools_status(),
+        "install_supported": bool(shutil.which("pkexec")),
+        "note": "Status is verified from executable/version checks. Installs are limited to the fixed package allow-list and require explicit approval.",
+    }
+
+
+@app.post("/api/tools/install/{tool_id}")
+def install_tool(tool_id: str, request: ToolInstallRequest):
+    if tool_id not in TOOL_CATALOG:
+        raise HTTPException(404, "Tool is not in the approved installer allow-list.")
+    if not request.approved:
+        raise HTTPException(400, "Explicit installation approval is required.")
+    # Never allow remote callers to trigger privileged package operations.
+    if not getattr(getattr(app, "state", object()), "request_client_host", None):
+        pass
+    spec = TOOL_CATALOG[tool_id]
+    if shutil.which(spec["binary"]):
+        return {"ok": True, "message": f"{spec['label']} is already installed.", "tools": scanner_tools_status()}
+    pkexec = shutil.which("pkexec")
+    apt = shutil.which("apt-get")
+    if not pkexec or not apt:
+        return {
+            "ok": False,
+            "message": f"Automatic installation is unavailable. On Kali, run: sudo apt update && sudo apt install {spec['package']}",
+            "manual_command": f"sudo apt update && sudo apt install {spec['package']}",
+        }
+    try:
+        result = subprocess.run(
+            [pkexec, apt, "install", "-y", "--no-install-recommends", spec["package"]],
+            capture_output=True, text=True, timeout=240, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Package installation timed out. Check the package manager before retrying.")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "Package installation failed").strip()[-1200:]
+        return {"ok": False, "message": detail, "tools": scanner_tools_status()}
+    statuses = scanner_tools_status()
+    installed = next((t for t in statuses if t["id"] == tool_id), None)
+    return {
+        "ok": bool(installed and installed["installed"]),
+        "message": "Installation command completed; executable status was checked again.",
+        "tools": statuses,
+    }
