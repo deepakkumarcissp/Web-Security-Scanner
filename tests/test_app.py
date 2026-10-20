@@ -83,6 +83,45 @@ def test_csv_cell_neutralizes_spreadsheet_formulas():
     assert app.safe_csv_cell(123) == 123
 
 
+def test_testssl_skips_http_targets():
+    findings, status = app.perform_testssl_check("http://example.test")
+    assert findings == []
+    assert status["status"] == "skipped"
+
+
+def test_testssl_reports_missing_binary(monkeypatch):
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: None)
+    findings, status = app.perform_testssl_check("https://example.test")
+    assert findings == []
+    assert status["status"] == "unavailable"
+
+
+def test_testssl_parses_findings_with_bounded_subprocess(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/testssl.sh")
+
+    def fake_run(command, **kwargs):
+        assert command[0] == "/usr/bin/testssl.sh"
+        assert "--jsonfile-pretty" in command
+        assert kwargs["timeout"] == 75
+        report_path = command[command.index("--jsonfile-pretty") + 1]
+        with open(report_path, "w", encoding="utf-8") as report_file:
+            json.dump([
+                {"id": "TLS 1.0", "severity": "HIGH", "finding": "offered"},
+                {"id": "TLS 1.3", "severity": "OK", "finding": "offered"},
+            ], report_file)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    findings, status = app.perform_testssl_check("https://example.test")
+    assert status["status"] == "completed"
+    assert status["finding_count"] == 1
+    assert findings[0][0] == "High"
+    assert findings[0][1] == "testssl.sh: TLS 1.0"
+
+
 def test_dashboard_renders_with_schedule_and_report_navigation():
     response = client.get("/")
     assert response.status_code == 200
