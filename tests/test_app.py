@@ -311,6 +311,7 @@ def test_dashboard_renders_with_schedule_and_report_navigation():
     assert "Web Security Scanner" in response.text
     assert "Schedules" in response.text
     assert "Download findings.csv" in response.text
+    assert "Assessment depth" in response.text
 
 
 
@@ -491,10 +492,13 @@ def test_passive_discovery_ui_warns_about_external_lookup_and_review_only():
 def test_one_off_assessment_needs_no_inventory_but_respects_reviewed_scope(monkeypatch):
     from uuid import uuid4
     target = f"https://simple-flow-{uuid4().hex}.example"
-    monkeypatch.setattr(app, "start_scan", lambda target, profile: 12345)
-    allowed = client.post("/api/scans", json={"target": target, "authorized": True})
+    started = []
+    monkeypatch.setattr(app, "start_scan", lambda target, profile: started.append((target, profile)) or 12345)
+    allowed = client.post("/api/scans", json={"target": target, "profile": "deep", "authorized": True})
     assert allowed.status_code == 200 and allowed.json()["id"] == 12345
     assert allowed.json()["status"] == "running"
+    assert allowed.json()["profile"] == "deep"
+    assert started == [(target, "deep")]
     unregistered_schedule = client.post("/api/schedules", json={
         "name": "blocked", "target": target, "profile": "quick", "frequency": "daily", "authorized": True,
     })
