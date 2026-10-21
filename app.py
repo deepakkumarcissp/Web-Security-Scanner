@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import html
 import json
 import os
 import re
@@ -1582,6 +1583,59 @@ def export_findings():
         iter([output.getvalue()]),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="dkcissp-findings.csv"'},
+    )
+
+
+@app.get("/api/export/findings.html", response_class=HTMLResponse)
+def export_findings_html():
+    fields = [
+        "id", "scan_id", "target", "severity", "title", "affected_url",
+        "evidence", "remediation", "confidence", "discovered_at",
+        "lifecycle_status", "lifecycle_notes", "lifecycle_updated_at",
+    ]
+    with connect() as conn:
+        findings = [dict(row) for row in conn.execute(
+            "SELECT " + ",".join(fields) + " FROM findings ORDER BY id DESC"
+        )]
+    esc = lambda value: html.escape("" if value is None else str(value), quote=True)
+    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "informational": 4}
+    counts = {}
+    for finding in findings:
+        severity = str(finding.get("severity", "Unknown"))
+        counts[severity] = counts.get(severity, 0) + 1
+    summary_cards = "".join(
+        f'<div class="metric"><span>{esc(label)}</span><strong>{count}</strong></div>'
+        for label, count in [("Total findings", len(findings))] + sorted(counts.items(), key=lambda item: severity_order.get(item[0].lower(), 5))
+    )
+    if findings:
+        rows = []
+        for finding in findings:
+            rows.append("<tr>" + "".join(
+                f"<td>{esc(finding.get(key, ''))}</td>" for key in fields
+            ) + "</tr>")
+        table = "<div class=\"table-wrap\"><table><thead><tr>" + "".join(
+            f"<th>{esc(field.replace('_', ' ').title())}</th>" for field in fields
+        ) + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
+    else:
+        table = '<p class="empty">No findings have been recorded yet.</p>'
+    generated = esc(now())
+    document = f'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DKCISSP Web Security Scanner — Findings Report</title>
+<style>
+:root{{color-scheme:light;--navy:#10213b;--red:#c6283d;--line:#dbe2ea;--muted:#5b6878}}
+*{{box-sizing:border-box}}body{{margin:0;background:#f4f6f9;color:#172033;font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}}
+main{{max-width:1500px;margin:32px auto;padding:0 20px}}header{{background:var(--navy);color:white;padding:28px;border-radius:14px}}
+.brand{{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#d9e3f2}}h1{{margin:8px 0;font-size:28px}}.meta{{color:#d9e3f2}}
+.metrics{{display:flex;flex-wrap:wrap;gap:12px;margin:18px 0}}.metric{{background:white;border:1px solid var(--line);border-radius:10px;padding:14px 18px;min-width:140px;display:grid;gap:4px}}.metric span{{color:var(--muted);font-size:12px}}.metric strong{{font-size:24px;color:var(--navy)}}
+.table-wrap{{overflow:auto;background:white;border:1px solid var(--line);border-radius:10px}}table{{border-collapse:collapse;width:100%;min-width:1200px}}th,td{{text-align:left;vertical-align:top;padding:10px;border-bottom:1px solid var(--line);max-width:380px;overflow-wrap:anywhere}}th{{background:#eaf0f7;color:var(--navy);position:sticky;top:0}}tr:last-child td{{border-bottom:0}}.empty{{background:white;padding:24px;border-radius:10px;color:var(--muted)}}footer{{color:var(--muted);margin:18px 0}}.actions{{display:flex;justify-content:flex-end;margin:14px 0}}button{{background:var(--red);color:white;border:0;border-radius:8px;padding:10px 16px;font-weight:600;cursor:pointer}}@media print{{body{{background:white}}main{{max-width:none;margin:0;padding:0}}header{{border-radius:0;print-color-adjust:exact;-webkit-print-color-adjust:exact}}.actions{{display:none}}.table-wrap{{overflow:visible}}table{{min-width:0;font-size:9px}}th,td{{padding:5px;max-width:none}}th{{position:static}}}}
+</style></head><body><main><header><div class="brand">DKCISSP — Where Security Becomes Simple</div><h1>Website Security Findings Report</h1><div class="meta">Generated {generated} · {len(findings)} finding(s)</div></header>
+<section class="metrics" aria-label="Finding summary">{summary_cards}</section><div class="actions"><button onclick="window.print()">Print / Save as PDF</button></div><h2>Findings and remediation</h2>{table}
+<footer>Assessment signals require validation in context. A finding is not, by itself, proof of exploitability. Handle this report as potentially sensitive security information.</footer></main></body></html>'''
+    return HTMLResponse(
+        document,
+        headers={"Content-Disposition": 'attachment; filename="dkcissp-findings-report.html"',
+                 "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"},
     )
 
 
