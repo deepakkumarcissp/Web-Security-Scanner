@@ -15,6 +15,7 @@ import time
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urlencode, urljoin, urldefrag
 from html.parser import HTMLParser
@@ -513,7 +514,7 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
         # or payload-driven fuzzing in this bounded default profile.
         if re.search(r"(?im)^\s*method\s*:\s*['\"]?(POST|PUT|PATCH|DELETE|OPTIONS)\b", text):
             continue
-        if re.search(r"(?m)^(payloads|attack|raw)\s*:", text):
+        if re.search(r"(?m)^\s*(payloads|attack|raw)\s*:", text):
             continue
         id_match = re.search(r"(?m)^id\s*:\s*['\"]?([^\s'\"]+)", text)
         tags_match = re.search(r"(?m)^\s*tags\s*:\s*([^\n]+)", text)
@@ -561,12 +562,13 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
     }
 
 
-def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[str] | None = None) -> tuple[list[tuple], dict]:
-    """Run bounded Nuclei checks on the supplied target and optional same-origin discovered URLs."""
+def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[str] | None = None,
+                         max_templates: int = 30) -> tuple[list[tuple], dict]:
+    """Run bounded Nuclei checks and retain valid partial results if the runtime limit is reached."""
     binary = shutil.which(TOOL_CATALOG["nuclei"]["binary"])
     if not binary:
         return [], {"status": "unavailable", "reason": "Nuclei is not installed"}
-    selected_templates, selection_status = select_nuclei_templates()
+    selected_templates, selection_status = select_nuclei_templates(max_templates=max(1, min(max_templates, 60)))
     if not selected_templates:
         return [], {"status": "unavailable", "reason": selection_status.get("reason", "No templates passed the safety filter"),
                     "template_selection": selection_status}
@@ -599,25 +601,29 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
             "-templates", templates_path,
             "-pt", "http",
             "-severity", "info,low,medium,high,critical,unknown",
-            "-rl", "3", "-c", "1", "-timeout", "5", "-retries", "0",
+            "-rl", "5", "-c", "3", "-timeout", "4", "-retries", "0",
             "-duc", "-disable-redirects", "-no-interactsh", "-silent",
             "-jsonl-export", jsonl_path,
         ]
+        timed_out = False
         try:
             result = subprocess.run(
                 command, capture_output=True, text=True, timeout=timeout_seconds,
                 check=False, env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"},
             )
         except subprocess.TimeoutExpired:
-            return [], {"status": "timeout", "timeout_seconds": timeout_seconds,
-                        "template_selection": selection_status, "rate_limit_per_second": 3,
-                        "concurrency": 1, "redirects_disabled": True, "interactsh_disabled": True}
+            timed_out = True
+            result = SimpleNamespace(returncode=124)
         except OSError as exc:
             return [], {"status": "error", "reason": str(exc)[:300], "template_selection": selection_status}
 
-        if not os.path.isfile(jsonl_path):
-            return [], {"status": "error", "return_code": result.returncode,
-                        "reason": "Nuclei did not produce its JSONL report", "template_selection": selection_status}
+        if not os.path.isfile(jsonl_path) or os.path.getsize(jsonl_path) == 0:
+            return [], {"status": "timeout" if timed_out else "error", "return_code": result.returncode,
+                        "timeout_seconds": timeout_seconds if timed_out else None,
+                        "reason": "Nuclei reached its time limit before producing findings" if timed_out else "Nuclei did not produce its JSONL report",
+                        "template_selection": selection_status, "target_count": len(safe_targets),
+                        "rate_limit_per_second": 5, "concurrency": 3,
+                        "redirects_disabled": True, "interactsh_disabled": True}
         malformed = 0
         with open(jsonl_path, encoding="utf-8", errors="replace") as report_file:
             for line in report_file:
@@ -659,11 +665,14 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
         if key not in seen:
             seen.add(key)
             deduped.append(finding)
-    return deduped, {"status": "completed" if result.returncode == 0 else "completed_with_warnings",
+    status = ("partial_timeout" if timed_out and deduped else "timeout" if timed_out else
+              "completed" if result.returncode == 0 else "completed_with_warnings")
+    return deduped, {"status": status,
                      "return_code": result.returncode, "finding_count": len(deduped),
+                     "partial_results_retained": bool(timed_out and deduped),
                      "malformed_records": malformed, "template_selection": selection_status,
                      "target_count": len(safe_targets), "target_limit": 12,
-                     "rate_limit_per_second": 3, "concurrency": 1, "redirects_disabled": True,
+                     "rate_limit_per_second": 5, "concurrency": 3, "redirects_disabled": True,
                      "interactsh_disabled": True, "timeout_seconds": timeout_seconds}
 
 
@@ -987,12 +996,23 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         nuclei_status = {"status": "not_run", "reason": "Nuclei checks are enabled for standard/deep profiles only"}
         nikto_status = {"status": "not_run", "reason": "Nikto server checks are enabled for the Deep profile only"}
         if profile in ("standard", "deep"):
-            tool_status["Nuclei"] = {"status": "running", "detail": "Running the bounded safe HTTP template set"}
-            update_scan_progress(scan_id, 35, "Running Nuclei safe checks", tool_status)
             nuclei_targets = discovery_status.get("urls", [target]) if profile in ("standard", "deep") else [target]
-            nuclei_findings, nuclei_status = perform_nuclei_check(target, targets=nuclei_targets)
+            nuclei_template_cap = 60 if profile == "deep" else 30
+            nuclei_timeout = 150 if profile == "deep" else 75
+            tool_status["Nuclei"] = {"status": "running", "detail": f"Running up to {nuclei_template_cap} safe templates across {len(nuclei_targets[:12])} same-origin URL(s); 5 requests/second maximum"}
+            update_scan_progress(scan_id, 35, "Running Nuclei safe checks", tool_status)
+            nuclei_findings, nuclei_status = perform_nuclei_check(target, timeout_seconds=nuclei_timeout,
+                                                                  targets=nuclei_targets, max_templates=nuclei_template_cap)
             findings.extend(nuclei_findings)
-            tool_status["Nuclei"] = {"status": nuclei_status.get("status", "completed"), "detail": f"{nuclei_status.get('finding_count', len(nuclei_findings))} finding(s) across {nuclei_status.get('target_count', 1)} same-origin URL(s); {nuclei_status.get('reason', 'check finished')}"}
+            nuclei_state = nuclei_status.get("status", "completed")
+            nuclei_detail = f"{nuclei_status.get('finding_count', len(nuclei_findings))} finding(s) across {nuclei_status.get('target_count', len(nuclei_targets))} same-origin URL(s)"
+            if nuclei_state == "partial_timeout":
+                nuclei_detail += "; time limit reached, partial findings retained"
+            elif nuclei_state == "timeout":
+                nuclei_detail += "; time limit reached before a report was produced"
+            elif nuclei_status.get("reason"):
+                nuclei_detail += "; " + str(nuclei_status["reason"])
+            tool_status["Nuclei"] = {"status": nuclei_state, "detail": nuclei_detail}
         if profile == "deep":
             tool_status["Nikto"] = {"status": "running", "detail": "Checking common web-server exposures with a bounded request rate and runtime"}
             update_scan_progress(scan_id, 48, "Checking web-server exposures with Nikto", tool_status)
