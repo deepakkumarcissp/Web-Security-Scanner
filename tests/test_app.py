@@ -109,6 +109,42 @@ def test_csv_export_has_expected_fields():
     assert "lifecycle_status" in response.text
 
 
+def test_html_findings_report_has_download_headers_and_summary():
+    response = client.get("/api/export/findings.html")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert 'filename="dkcissp-findings-report.html"' in response.headers["content-disposition"]
+    assert "Website Security Findings Report" in response.text
+    assert "Total findings" in response.text
+    assert "Print / Save as PDF" in response.text
+    assert "Content-Security-Policy" in response.headers
+
+
+def test_html_findings_report_escapes_untrusted_finding_content():
+    from uuid import uuid4
+    marker = f"report-{uuid4().hex}"
+    with app.connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+            (f"http://{marker}.example", "quick", "completed", app.now()),
+        )
+        scan_id = cur.lastrowid
+        conn.execute(
+            """INSERT INTO findings
+            (scan_id,target,severity,title,affected_url,evidence,remediation,confidence,discovered_at)
+            VALUES(?,?,?,?,?,?,?,?,?)""",
+            (scan_id, f"http://{marker}.example", "High", '<script>alert("x")</script>',
+             f"http://{marker}.example/?q=<svg>", '<img src=x onerror=alert(1)>',
+             'Use <strong>parameterized</strong> output', "High", app.now()),
+        )
+    response = client.get("/api/export/findings.html")
+    assert response.status_code == 200
+    assert "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;" in response.text
+    assert "&lt;img src=x onerror=alert(1)&gt;" in response.text
+    assert '<script>alert("x")</script>' not in response.text
+    assert "<img src=x onerror=alert(1)>" not in response.text
+
+
 def test_csv_cell_neutralizes_spreadsheet_formulas():
     assert app.safe_csv_cell("=1+1") == "'=1+1"
     assert app.safe_csv_cell("  @SUM(A1:A2)") == "'  @SUM(A1:A2)"

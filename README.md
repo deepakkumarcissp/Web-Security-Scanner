@@ -82,6 +82,7 @@ Standard/Deep scans now discover up to 12 same-origin URLs, with a maximum link 
 - Finding lifecycle tracking: open, accepted, remediated, false positive, and retest required, with notes and update timestamps
 - Daily and weekly recurring schedules
 - CSV findings export
+- Printable HTML findings report with severity summary and a browser Print / Save as PDF option
 - JSON API for dashboard and scan workflows
 - Tests for core application behavior and tool-installation guards
 
@@ -160,9 +161,11 @@ The Schedules page supports daily and weekly recurrence and an optional first-ru
 
 **The application process must remain running for scheduled scans to execute.** The current MVP does not yet guarantee execution across reboots or provide a production-grade background worker/service. Do not treat the scheduler as a durable enterprise job service yet.
 
-## CSV reporting
+## Reports and exports
 
-Use **Reports & Export → Download findings.csv**, or run:
+Use **Reports & Export** to download either a spreadsheet-friendly CSV or a printable HTML findings report. Open the HTML report and select **Print / Save as PDF** to create a PDF copy. The HTML report escapes untrusted finding content and includes severity counts, evidence, remediation, confidence, and lifecycle details.
+
+For CSV, use **Reports & Export → Download findings.csv**, or run:
 
 ```bash
 curl -OJ http://127.0.0.1:1005/api/export/findings.csv
@@ -183,6 +186,7 @@ The current API includes the following main routes:
 - `GET /api/findings` — findings, including lifecycle status and notes
 - `PATCH /api/findings/{finding_id}/lifecycle` — update a finding lifecycle status and notes
 - `GET /api/export/findings.csv` — CSV export
+- `GET /api/export/findings.html` — printable HTML findings report
 - `GET /api/schedules` and `POST /api/schedules` — list/create schedules
 - `PATCH /api/schedules/{id}` — pause/resume a schedule
 - `DELETE /api/schedules/{id}` — delete a schedule
@@ -258,7 +262,7 @@ The roadmap is staged so each integration is independently testable and the UI s
 - [ ] Live scan progress and useful per-module status
 - [ ] Safe cancellation and consistent timeout handling
 - [ ] Stronger scheduler execution and restart/reboot behavior
-- [ ] HTML report alongside CSV
+- [x] HTML report alongside CSV
 - [x] Finding lifecycle: open, accepted, remediated, false positive, and retest required, with notes and timestamps
 - [ ] Retest comparisons and measurable risk reduction
 - [ ] Better scan logs and exportable diagnostic bundles
