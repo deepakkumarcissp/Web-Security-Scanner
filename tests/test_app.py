@@ -427,25 +427,41 @@ def test_passive_discovery_ui_warns_about_external_lookup_and_review_only():
 
 
 
-def test_scan_and_schedule_require_explicit_in_scope_inventory_asset(monkeypatch):
+def test_one_off_assessment_needs_no_inventory_but_respects_reviewed_scope(monkeypatch):
     from uuid import uuid4
-    target = f"https://scope-gate-{uuid4().hex}.example"
-    unregistered_scan = client.post("/api/scans", json={"target": target, "profile": "quick", "authorized": True})
-    assert unregistered_scan.status_code == 403
+    target = f"https://simple-flow-{uuid4().hex}.example"
+    monkeypatch.setattr(app, "start_scan", lambda target, profile: 12345)
+    allowed = client.post("/api/scans", json={"target": target, "authorized": True})
+    assert allowed.status_code == 200 and allowed.json()["id"] == 12345
+    assert allowed.json()["status"] == "running"
     unregistered_schedule = client.post("/api/schedules", json={
         "name": "blocked", "target": target, "profile": "quick", "frequency": "daily", "authorized": True,
     })
     assert unregistered_schedule.status_code == 403
-    asset = client.post("/api/assets", json={"target": target, "authorized": True}).json()
-    needs_review = client.post("/api/scans", json={"target": target, "profile": "quick", "authorized": True})
+    reviewed_target = f"https://needs-review-{uuid4().hex}.example"
+    asset = client.post("/api/assets", json={"target": reviewed_target, "authorized": True}).json()
+    needs_review = client.post("/api/scans", json={"target": reviewed_target, "authorized": True})
     assert needs_review.status_code == 403
     client.patch(f"/api/assets/{asset['id']}/scope", json={"scope_status": "out_of_scope", "authorized": True})
-    out_of_scope = client.post("/api/scans", json={"target": target, "profile": "quick", "authorized": True})
+    out_of_scope = client.post("/api/scans", json={"target": reviewed_target, "authorized": True})
     assert out_of_scope.status_code == 403
-    client.patch(f"/api/assets/{asset['id']}/scope", json={"scope_status": "in_scope", "authorized": True})
-    monkeypatch.setattr(app, "start_scan", lambda target, profile: 12345)
-    approved = client.post("/api/scans", json={"target": target, "profile": "quick", "authorized": True})
-    assert approved.status_code == 200 and approved.json()["id"] == 12345
+
+
+def test_scan_progress_fields_are_available_to_the_dashboard(monkeypatch):
+    from uuid import uuid4
+    target = f"https://progress-{uuid4().hex}.example"
+    monkeypatch.setattr(app, "start_scan", lambda target, profile: 45678)
+    response = client.post("/api/scans", json={"target": target, "authorized": True})
+    assert response.status_code == 200
+    # The full progress fields are populated by the worker and exposed on scan detail.
+    with app.connect() as conn:
+        conn.execute("INSERT INTO scans(target,profile,status,created_at,progress,current_stage,tool_status) VALUES(?,?,?,?,?,?,?)",
+                     (target, "standard", "running", app.now(), 35, "Running Nuclei safe checks", '{"Nuclei":{"status":"running"}}'))
+        scan_id = conn.execute("SELECT MAX(id) FROM scans").fetchone()[0]
+    detail = client.get(f"/api/scans/{scan_id}").json()["scan"]
+    assert detail["progress"] == 35
+    assert detail["current_stage"] == "Running Nuclei safe checks"
+    assert '"Nuclei"' in detail["tool_status"]
 
 
 def test_discovered_candidate_cannot_be_scanned_until_human_approves_it(monkeypatch):

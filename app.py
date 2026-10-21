@@ -49,7 +49,10 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS scans(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 target TEXT NOT NULL, profile TEXT NOT NULL, status TEXT NOT NULL,
-                created_at TEXT NOT NULL, finished_at TEXT, summary TEXT
+                created_at TEXT NOT NULL, finished_at TEXT, summary TEXT,
+                progress INTEGER NOT NULL DEFAULT 0,
+                current_stage TEXT NOT NULL DEFAULT 'Queued',
+                tool_status TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE IF NOT EXISTS findings(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL,
@@ -86,6 +89,13 @@ def init_db() -> None:
             );
             """
         )
+        scan_columns = {row["name"] for row in conn.execute("PRAGMA table_info(scans)")}
+        if "progress" not in scan_columns:
+            conn.execute("ALTER TABLE scans ADD COLUMN progress INTEGER NOT NULL DEFAULT 0")
+        if "current_stage" not in scan_columns:
+            conn.execute("ALTER TABLE scans ADD COLUMN current_stage TEXT NOT NULL DEFAULT 'Queued'")
+        if "tool_status" not in scan_columns:
+            conn.execute("ALTER TABLE scans ADD COLUMN tool_status TEXT NOT NULL DEFAULT '{}'")
         finding_columns = {row["name"] for row in conn.execute("PRAGMA table_info(findings)")}
         if "lifecycle_status" not in finding_columns:
             conn.execute("ALTER TABLE findings ADD COLUMN lifecycle_status TEXT NOT NULL DEFAULT 'open'")
@@ -491,8 +501,26 @@ def perform_whatweb_check(target: str, timeout_seconds: int = 30) -> tuple[list[
     return findings, {"status": "completed" if result.returncode == 0 else "completed_with_warnings",
                       "return_code": result.returncode, "finding_count": len(findings)}
 
+def update_scan_progress(scan_id: int, progress: int, stage: str, tools: dict | None = None) -> None:
+    """Persist truthful scan-stage progress so the UI can survive refreshes."""
+    with connect() as conn:
+        if tools is None:
+            conn.execute("UPDATE scans SET progress=?,current_stage=? WHERE id=?", (progress, stage, scan_id))
+        else:
+            conn.execute("UPDATE scans SET progress=?,current_stage=?,tool_status=? WHERE id=?",
+                         (progress, stage, json.dumps(tools), scan_id))
+
+
 def perform_scan(scan_id: int, target: str, profile: str) -> None:
     findings = []
+    tool_status = {
+        "Built-in HTTP & headers": {"status": "running", "detail": "Requesting the supplied URL and inspecting response headers"},
+        "Nuclei": {"status": "queued", "detail": "Waiting for built-in checks"},
+        "WhatWeb": {"status": "queued", "detail": "Waiting for built-in checks"},
+        "TLS (testssl.sh)": {"status": "queued", "detail": "Waiting for built-in checks"},
+        "OWASP ZAP passive": {"status": "queued", "detail": "Optional local integration"},
+    }
+    update_scan_progress(scan_id, 5, "Connecting to website", tool_status)
     try:
         req = Request(
             target,
@@ -521,6 +549,9 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                     ("failed", now(), json.dumps({"error": str(exc)}), scan_id),
                 )
             return
+
+        tool_status["Built-in HTTP & headers"] = {"status": "completed", "detail": f"HTTP {status_code}; response headers and sampled HTML inspected"}
+        update_scan_progress(scan_id, 20, "Checking HTTP response, headers and cookies", tool_status)
 
         def finding(severity, title, evidence, remediation, confidence="High"):
             findings.append((severity, title, final_url, evidence, remediation, confidence))
@@ -606,19 +637,37 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         whatweb_status = {"status": "not_run", "reason": "Technology discovery not requested by profile"}
         nuclei_status = {"status": "not_run", "reason": "Nuclei checks are enabled for standard/deep profiles only"}
         if profile in ("standard", "deep"):
+            tool_status["Nuclei"] = {"status": "running", "detail": "Running the bounded safe HTTP template set"}
+            update_scan_progress(scan_id, 35, "Running Nuclei safe checks", tool_status)
             nuclei_findings, nuclei_status = perform_nuclei_check(target)
             findings.extend(nuclei_findings)
+            tool_status["Nuclei"] = {"status": nuclei_status.get("status", "completed"), "detail": f"{nuclei_status.get('finding_count', len(nuclei_findings))} finding(s); {nuclei_status.get('reason', 'check finished')}"}
         if profile in ("standard", "deep"):
+            tool_status["WhatWeb"] = {"status": "running", "detail": "Fingerprinting technologies from the supplied URL"}
+            update_scan_progress(scan_id, 55, "Identifying website technologies", tool_status)
             whatweb_findings, whatweb_status = perform_whatweb_check(target)
             findings.extend(whatweb_findings)
+            tool_status["WhatWeb"] = {"status": whatweb_status.get("status", "completed"), "detail": f"{whatweb_status.get('finding_count', len(whatweb_findings))} technology signal(s); {whatweb_status.get('reason', 'check finished')}"}
         if profile in ("standard", "deep"):
             if target.lower().startswith("https://"):
+                tool_status["TLS (testssl.sh)"] = {"status": "running", "detail": "Checking TLS configuration with a bounded runtime"}
+                update_scan_progress(scan_id, 70, "Assessing TLS configuration", tool_status)
                 tls_findings, tls_status = perform_testssl_check(target)
                 findings.extend(tls_findings)
+                tool_status["TLS (testssl.sh)"] = {"status": tls_status.get("status", "completed"), "detail": f"{tls_status.get('finding_count', len(tls_findings))} finding(s); {tls_status.get('reason', 'check finished')}"}
             else:
                 tls_status = {"status": "skipped", "reason": "TLS assessment requires an HTTPS target"}
+                tool_status["TLS (testssl.sh)"] = {"status": "skipped", "detail": "The supplied URL uses HTTP, not HTTPS"}
+        else:
+            tool_status["Nuclei"] = {"status": "skipped", "detail": "Not selected for this profile"}
+            tool_status["WhatWeb"] = {"status": "skipped", "detail": "Not selected for this profile"}
+            tool_status["TLS (testssl.sh)"] = {"status": "skipped", "detail": "Not selected for this profile"}
 
+        tool_status["OWASP ZAP passive"] = {"status": "running", "detail": "Checking the configured local ZAP passive integration"}
+        update_scan_progress(scan_id, 88, "Checking optional OWASP ZAP passive alerts", tool_status)
         findings.extend(perform_zap_passive_check(target))
+        tool_status["OWASP ZAP passive"] = {"status": "completed", "detail": "Optional passive check finished; see scan summary for integration availability"}
+        update_scan_progress(scan_id, 95, "Combining and deduplicating findings", tool_status)
         deduped = []
         seen = set()
         for item in findings:
@@ -632,7 +681,7 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             for item in findings:
                 add_finding(conn, scan_id, target, *item)
             conn.execute(
-                "UPDATE scans SET status=?,finished_at=?,summary=? WHERE id=?",
+                "UPDATE scans SET status=?,finished_at=?,summary=?,progress=100,current_stage=?,tool_status=? WHERE id=?",
                 (
                     "completed", now(),
                     json.dumps({
@@ -641,22 +690,22 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                         "tls_check": tls_status, "whatweb_check": whatweb_status,
                         "nuclei_check": nuclei_status, "finding_count": len(findings),
                     }),
-                    scan_id,
+                    "Assessment complete", json.dumps(tool_status), scan_id,
                 ),
             )
     except Exception as exc:
         with connect() as conn:
             conn.execute(
-                "UPDATE scans SET status=?,finished_at=?,summary=? WHERE id=?",
-                ("failed", now(), json.dumps({"error": str(exc)}), scan_id),
+                "UPDATE scans SET status=?,finished_at=?,summary=?,current_stage=?,tool_status=? WHERE id=?",
+                ("failed", now(), json.dumps({"error": str(exc)}), "Assessment failed", json.dumps(tool_status), scan_id),
             )
 
 
 def start_scan(target: str, profile: str) -> int:
     with connect() as conn:
         cursor = conn.execute(
-            "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
-            (target, profile, "running", now()),
+            "INSERT INTO scans(target,profile,status,created_at,progress,current_stage,tool_status) VALUES(?,?,?,?,?,?,?)",
+            (target, profile, "running", now(), 1, "Queued", json.dumps({})),
         )
         scan_id = cursor.lastrowid
     threading.Thread(target=perform_scan, args=(scan_id, target, profile), daemon=True).start()
@@ -884,8 +933,20 @@ def create_scan(request: ScanRequest):
     if not request.authorized:
         raise HTTPException(400, "Confirm you are authorized to test this target.")
     target = validate_target(request.target)
-    require_in_scope_asset(target)
-    scan_id = start_scan(target, request.profile)
+    # Simple one-URL workflow: explicit authorization is enough for a newly entered target.
+    # If the target already exists in inventory, respect any review or out-of-scope decision.
+    parsed = urlparse(target)
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    with connect() as conn:
+        assets = conn.execute("SELECT * FROM assets").fetchall()
+    for asset in assets:
+        registered = urlparse(asset["target"])
+        registered_host = (registered.hostname or "").lower().rstrip(".")
+        registered_port = registered.port or (443 if registered.scheme.lower() == "https" else 80)
+        if hostname == registered_host and port == registered_port and asset["scope_status"] != "in_scope":
+            raise HTTPException(403, "This target is marked " + asset["scope_status"].replace("_", " ") + " in Asset Inventory. Review its scope before scanning.")
+    scan_id = start_scan(target, "standard")
     return {
         "id": scan_id, "status": "running",
         "message": "Low-impact HTTP/header checks started; standard/deep HTTPS scans also run testssl.sh when installed, with a bounded timeout. Local ZAP passive alerts are optional.",
