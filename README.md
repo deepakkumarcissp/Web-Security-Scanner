@@ -80,6 +80,7 @@ Standard/Deep scans now discover up to 12 same-origin URLs, with a maximum link 
 - Finding normalization with severity, affected URL, evidence, confidence, and remediation
 - SQLite-backed scan and finding history
 - Finding lifecycle tracking: open, accepted, remediated, false positive, and retest required, with notes and update timestamps
+- Retest comparison API and Scan History action: new, persistent, and no-longer-detected findings, severity shifts, and heuristic risk-point delta
 - Daily and weekly recurring schedules
 - CSV findings export
 - Printable HTML findings report with severity summary and a browser Print / Save as PDF option
@@ -160,6 +161,12 @@ Keep the terminal and application process running while using the dashboard and 
 The Schedules page supports daily and weekly recurrence and an optional first-run date/time. Browser-selected time is sent as an ISO timestamp and stored in UTC.
 
 **The application process must remain running for scheduled scans to execute.** The current MVP does not yet guarantee execution across reboots or provide a production-grade background worker/service. Do not treat the scheduler as a durable enterprise job service yet.
+
+## Retest comparison and risk trend
+
+After a completed scan, open **Scan History → Compare**. The scanner compares it with the latest earlier completed scan for the same normalized target and profile, then summarizes new findings, findings that persisted, findings not detected in the later scan, severity changes, and a simple risk-point delta. The endpoint `GET /api/scans/{scan_id}/comparison` also accepts an optional `baseline_id` query parameter for an explicit same-target baseline.
+
+Risk points are a transparent prioritization heuristic (Critical 10, High 8, Medium 4, Low 1, Informational 0), not CVSS, a probability estimate, or a formal business-risk measure. Matching uses normalized finding title and URL path; query strings are ignored. Renamed detections can be misclassified, and an issue absent from a retest is **not proof** that it was fixed. Compare the same profile after remediation and validate important results manually. If no prior scan exists, the API explains that a second scan is needed.
 
 ## Reports and exports
 
@@ -264,7 +271,7 @@ The roadmap is staged so each integration is independently testable and the UI s
 - [ ] Stronger scheduler execution and restart/reboot behavior
 - [x] HTML report alongside CSV
 - [x] Finding lifecycle: open, accepted, remediated, false positive, and retest required, with notes and timestamps
-- [ ] Retest comparisons and measurable risk reduction
+- [x] Retest comparisons and heuristic risk-point change (not a formal risk or CVSS score)
 - [ ] Better scan logs and exportable diagnostic bundles
 
 ### Phase 4 — Validation lab and security hardening

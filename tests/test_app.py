@@ -100,6 +100,71 @@ def test_finding_lifecycle_update_and_not_found():
     assert missing.status_code == 404
 
 
+def _create_completed_scan(target, profile, findings):
+    from uuid import uuid4
+    with app.connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO scans(target,profile,status,created_at,finished_at) VALUES(?,?,?,?,?)",
+            (target, profile, "completed", app.now(), app.now()),
+        )
+        scan_id = cur.lastrowid
+        for severity, title, url in findings:
+            conn.execute(
+                """INSERT INTO findings
+                (scan_id,target,severity,title,affected_url,evidence,remediation,confidence,discovered_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (scan_id, target, severity, title, url, "controlled test evidence", "controlled test remediation", "Medium", app.now()),
+            )
+    return scan_id
+
+
+def test_scan_comparison_reports_new_resolved_persistent_and_risk_change():
+    target = "https://compare-fixture.example/"
+    baseline_id = _create_completed_scan(target, "standard", [
+        ("High", "Missing security header", target, ),
+        ("Medium", "Old exposed endpoint", target + "old"),
+        ("Low", "Cookie attribute note", target + "login?source=old"),
+    ])
+    current_id = _create_completed_scan(target, "standard", [
+        ("Medium", "Missing security header", target + "?cache=2"),
+        ("High", "New unsafe endpoint", target + "new"),
+        ("Low", "Cookie attribute note", target + "login?source=new"),
+    ])
+    response = client.get(f"/api/scans/{current_id}/comparison")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["baseline"]["scan_id"] == baseline_id
+    assert data["summary"]["new"] == 1
+    assert data["summary"]["resolved"] == 1
+    assert data["summary"]["persistent"] == 2
+    assert data["summary"]["severity_decreased"] == 1
+    assert data["summary"]["risk_points_before"] == 13
+    assert data["summary"]["risk_points_after"] == 13
+    assert data["summary"]["risk_reduction_percent"] == 0
+    assert data["limitations"]
+
+
+def test_scan_comparison_requires_same_target_and_completed_scans():
+    first = _create_completed_scan("https://compare-one.example/", "quick", [])
+    second = _create_completed_scan("https://compare-two.example/", "quick", [])
+    response = client.get(f"/api/scans/{second}/comparison?baseline_id={first}")
+    assert response.status_code == 400
+    with app.connect() as conn:
+        cur = conn.execute("INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+                           ("https://compare-pending.example/", "quick", "running", app.now()))
+        pending_id = cur.lastrowid
+    assert client.get(f"/api/scans/{pending_id}/comparison").status_code == 409
+
+
+def test_scan_comparison_without_baseline_returns_clear_message():
+    scan_id = _create_completed_scan("https://compare-no-baseline.example/", "deep", [])
+    response = client.get(f"/api/scans/{scan_id}/comparison")
+    assert response.status_code == 200
+    assert response.json()["baseline"] is None
+    assert "No earlier completed scan" in response.json()["message"]
+    assert response.json()["summary"]["risk_reduction_percent"] is None
+
+
 def test_csv_export_has_expected_fields():
     response = client.get("/api/export/findings.csv")
     assert response.status_code == 200
