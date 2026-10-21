@@ -356,56 +356,101 @@ def diagnose_zap_api() -> dict:
         return {"status": "api_mismatch", "message": "The endpoint did not return valid JSON from the ZAP version API. Another service may be using this port.", "endpoint": api_root}
 
 
-def perform_zap_passive_check(target: str) -> list[tuple]:
-    """Ask a locally running ZAP instance to fetch only the exact authorized URL, then read passive alerts."""
+def perform_zap_passive_check(target: str, targets: list[str] | None = None) -> tuple[list[tuple], dict]:
+    """Fetch only same-origin URLs in local ZAP and return passive alerts plus truthful status."""
+    diagnostic = diagnose_zap_api()
+    if diagnostic.get("status") != "ready":
+        return [], {"status": diagnostic.get("status", "api_unavailable"),
+                    "reason": diagnostic.get("message", "OWASP ZAP API is not ready"),
+                    "endpoint": diagnostic.get("endpoint")}
     try:
         api_root, api_key = zap_api_settings()
-    except ValueError:
-        return []
+    except ValueError as exc:
+        return [], {"status": "configuration_error", "reason": str(exc)[:300]}
+
+    root = urlparse(target)
+    root_port = root.port or (443 if root.scheme == "https" else 80)
+    safe_targets = []
+    for candidate in (targets or [target])[:12]:
+        parsed = urlparse(candidate)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if (parsed.scheme == root.scheme and parsed.hostname and root.hostname and
+                parsed.hostname.lower().rstrip(".") == root.hostname.lower().rstrip(".") and
+                port == root_port and parsed.scheme in {"http", "https"} and candidate not in safe_targets):
+            safe_targets.append(candidate)
+    if target not in safe_targets:
+        safe_targets.insert(0, target)
+    safe_targets = safe_targets[:12]
+
     def zap_get(path: str, params: dict) -> dict:
         query = dict(params)
         if api_key:
             query["apikey"] = api_key
-        req = Request(
-            api_root + path + "?" + urlencode(query),
-            headers={"Accept": "application/json", "User-Agent": "DKCISSP-WebSecurityScanner/0.1"},
-        )
+        req = Request(api_root + path + "?" + urlencode(query),
+                      headers={"Accept": "application/json", "User-Agent": "DKCISSP-WebSecurityScanner/0.1"})
         with urlopen(req, timeout=4) as response:
             return json.loads(response.read(1_000_000).decode("utf-8", "replace"))
 
-    try:
-        # No spider and no active scan: one exact-URL fetch only.
-        zap_get("/JSON/core/action/accessUrl/", {"url": target, "followRedirects": "false"})
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            try:
-                pending = zap_get("/JSON/pscan/view/recordsToScan/", {}).get("recordsToScan", "0")
-                if int(pending) <= 0:
-                    break
-            except (ValueError, TypeError):
+    scanned = []
+    failures = []
+    for page_url in safe_targets:
+        try:
+            zap_get("/JSON/core/action/accessUrl/", {"url": page_url, "followRedirects": "false"})
+            scanned.append(page_url)
+        except Exception as exc:
+            failures.append(f"{page_url}: {str(exc)[:120]}")
+    if not scanned:
+        return [], {"status": "error", "reason": "ZAP could not fetch any approved same-origin URL",
+                    "urls_requested": len(safe_targets), "urls_scanned": 0, "errors": failures[:3]}
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            pending = zap_get("/JSON/pscan/view/recordsToScan/", {}).get("recordsToScan", "0")
+            if int(pending) <= 0:
                 break
-            time.sleep(0.4)
-        payload = zap_get("/JSON/core/view/alerts/", {"baseurl": target, "start": "0", "count": "100"})
-        alerts = payload.get("alerts", [])
-    except Exception:
-        # ZAP is optional; the built-in passive checks must still complete.
-        return []
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError, TypeError, json.JSONDecodeError):
+            failures.append("Could not confirm passive-scan queue status")
+            break
+        time.sleep(0.4)
+
+    # Filter alerts to the exact scheme/host/port origin, not a broad host prefix.
+    origin = f"{root.scheme}://{root.netloc}/"
+    try:
+        payload = zap_get("/JSON/core/view/alerts/", {"baseurl": origin, "start": "0", "count": "100"})
+        alerts = payload.get("alerts", []) if isinstance(payload, dict) else []
+    except Exception as exc:
+        return [], {"status": "completed_with_warnings", "reason": "ZAP fetched approved URLs but could not retrieve alerts",
+                    "urls_requested": len(safe_targets), "urls_scanned": len(scanned), "errors": [str(exc)[:200]]}
 
     normalized = []
     for alert in alerts:
+        if not isinstance(alert, dict):
+            continue
+        alert_url = str(alert.get("url") or target)
+        parsed_alert = urlparse(alert_url)
+        alert_port = parsed_alert.port or (443 if parsed_alert.scheme == "https" else 80)
+        if (parsed_alert.scheme != root.scheme or not parsed_alert.hostname or
+                parsed_alert.hostname.lower().rstrip(".") != (root.hostname or "").lower().rstrip(".") or
+                alert_port != root_port):
+            continue
         risk = str(alert.get("risk", "Informational")).lower()
         severity = {"high": "High", "medium": "Medium", "low": "Low", "informational": "Info"}.get(risk, "Info")
         title = str(alert.get("alert", "OWASP ZAP passive alert"))[:240]
-        evidence_parts = [
-            str(alert.get("description", "")).strip(),
-            ("Evidence: " + str(alert.get("evidence", ""))).strip() if alert.get("evidence") else "",
-            ("Parameter: " + str(alert.get("param", ""))).strip() if alert.get("param") else "",
-        ]
+        evidence_parts = [str(alert.get("description", "")).strip()]
+        if alert.get("evidence"):
+            evidence_parts.append("Evidence: " + str(alert.get("evidence", "")))
+        if alert.get("param"):
+            evidence_parts.append("Parameter: " + str(alert.get("param", "")))
         evidence = " ".join(part for part in evidence_parts if part)[:1800] or "Reported by OWASP ZAP passive scanner."
         remediation = str(alert.get("solution", "") or "Review the ZAP alert and validate its applicability.")[:1800]
         confidence = str(alert.get("confidence", "Medium"))
-        normalized.append((severity, "OWASP ZAP: " + title, str(alert.get("url") or target), evidence, remediation, confidence))
-    return normalized
+        normalized.append((severity, "OWASP ZAP: " + title, alert_url[:2048], evidence, remediation, confidence))
+
+    status = "completed_with_warnings" if failures else "completed"
+    return normalized, {"status": status, "urls_requested": len(safe_targets), "urls_scanned": len(scanned),
+                       "finding_count": len(normalized), "errors": failures[:3],
+                       "mode": "passive only; no spider or active scan; same-origin URLs only"}
 
 def perform_testssl_check(target: str, timeout_seconds: int = 75) -> tuple[list[tuple], dict]:
     """Run a bounded testssl.sh fast assessment for an authorized HTTPS target."""
@@ -1055,10 +1100,12 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             tool_status["WhatWeb"] = {"status": "skipped", "detail": "Not selected for this profile"}
             tool_status["TLS (testssl.sh)"] = {"status": "skipped", "detail": "Not selected for this profile"}
 
-        tool_status["OWASP ZAP passive"] = {"status": "running", "detail": "Checking the configured local ZAP passive integration"}
+        tool_status["OWASP ZAP passive"] = {"status": "running", "detail": "Checking passive alerts across approved same-origin URLs"}
         update_scan_progress(scan_id, 88, "Checking optional OWASP ZAP passive alerts", tool_status)
-        findings.extend(perform_zap_passive_check(target))
-        tool_status["OWASP ZAP passive"] = {"status": "completed", "detail": "Optional passive check finished; see scan summary for integration availability"}
+        zap_targets = discovery_status.get("urls", [target])
+        zap_findings, zap_status = perform_zap_passive_check(target, targets=zap_targets)
+        findings.extend(zap_findings)
+        tool_status["OWASP ZAP passive"] = {"status": zap_status.get("status", "error"), "detail": f"{zap_status.get('finding_count', len(zap_findings))} alert(s) across {zap_status.get('urls_scanned', 0)} URL(s); {zap_status.get('reason', zap_status.get('mode', 'integration status recorded'))}"}
         update_scan_progress(scan_id, 95, "Combining and deduplicating findings", tool_status)
         deduped = []
         seen = set()
@@ -1078,9 +1125,9 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                     "completed", now(),
                     json.dumps({
                         "http_status": status_code, "final_url": final_url,
-                        "checks": "passive HTTP/header checks plus optional WhatWeb, testssl.sh, and ZAP passive checks",
+                        "checks": "passive HTTP/header checks, bounded same-origin discovery, curated Nuclei checks, WhatWeb fingerprinting, optional TLS assessment, Deep-profile Nikto checks, and optional ZAP passive alerts",
                         "tls_check": tls_status, "whatweb_check": whatweb_status,
-                        "nuclei_check": nuclei_status, "nikto_check": nikto_status,
+                        "nuclei_check": nuclei_status, "nikto_check": nikto_status, "zap_check": zap_status,
                         "endpoint_discovery": discovery_status,
                         "finding_count": len(findings),
                     }),

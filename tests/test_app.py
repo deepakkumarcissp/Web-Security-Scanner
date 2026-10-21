@@ -701,3 +701,46 @@ def test_nikto_json_report_is_normalized_conservatively():
 def test_nikto_report_parser_handles_unknown_and_malformed_shapes():
     assert app.parse_nikto_report({"host": "example.test", "findings": "not-a-list"}, "https://example.test") == []
     assert app.parse_nikto_report(None, "https://example.test") == []
+
+
+def test_zap_passive_scans_only_same_origin_urls_and_reports_status(monkeypatch):
+    import json
+    from types import SimpleNamespace
+    seen = []
+    monkeypatch.setattr(app, "diagnose_zap_api", lambda: {"status": "ready", "endpoint": "http://127.0.0.1:8090"})
+    monkeypatch.setattr(app, "zap_api_settings", lambda: ("http://127.0.0.1:8090", "test-key"))
+    class FakeResponse:
+        def __init__(self, payload): self.payload = payload
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self, _size): return json.dumps(self.payload).encode()
+    def fake_urlopen(request, timeout=4):
+        from urllib.parse import urlparse, parse_qs
+        url = request.full_url
+        seen.append(url)
+        path = urlparse(url).path
+        if path.endswith("/accessUrl/"): return FakeResponse({"Result": "OK"})
+        if path.endswith("/recordsToScan/"): return FakeResponse({"recordsToScan": "0"})
+        if path.endswith("/alerts/"):
+            return FakeResponse({"alerts": [
+                {"risk": "Medium", "alert": "CSP header missing", "url": "http://app.example.test/about", "description": "No CSP", "solution": "Set CSP"},
+                {"risk": "High", "alert": "Out of scope", "url": "https://evil.example.test/", "description": "ignore", "solution": "ignore"},
+            ]})
+        raise AssertionError(url)
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    findings, status = app.perform_zap_passive_check("http://app.example.test/", targets=[
+        "http://app.example.test/", "http://app.example.test/about", "https://evil.example.test/",
+    ])
+    assert status["status"] == "completed"
+    assert status["urls_scanned"] == 2
+    assert len(findings) == 1
+    assert findings[0][1] == "OWASP ZAP: CSP header missing"
+    assert all("evil.example.test" not in url for url in seen)
+
+
+def test_zap_passive_unavailable_status_is_not_reported_as_success(monkeypatch):
+    monkeypatch.setattr(app, "diagnose_zap_api", lambda: {"status": "api_unreachable", "message": "ZAP unavailable"})
+    findings, status = app.perform_zap_passive_check("https://example.test")
+    assert findings == []
+    assert status["status"] == "api_unreachable"
+    assert status["reason"] == "ZAP unavailable"
