@@ -497,12 +497,10 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
     allowed_tags = {"misconfig", "misconfiguration", "exposure", "headers", "ssl", "config", "token", "tech", "cve", "vulnerability", "panel", "discovery"}
     excluded_tags = {"dos", "fuzz", "bruteforce", "brute-force", "intrusive", "headless", "token-spray", "default-login", "default-credentials", "filefuzz", "takeover"}
     severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "unknown": 5}
-    category_rank = {"cve": 0, "vulnerability": 0, "misconfig": 1, "misconfiguration": 1, "exposure": 2, "ssl": 3, "headers": 4, "config": 5, "token": 6, "panel": 7, "tech": 8, "discovery": 9}
+    category_order = ["misconfig", "misconfiguration", "exposure", "ssl", "headers", "config", "cve", "vulnerability", "token", "panel", "tech", "discovery"]
     scanned = 0
     for path in root.rglob("*.yaml"):
         scanned += 1
-        if len(candidates) >= 5000:
-            break
         try:
             text = path.read_text(encoding="utf-8", errors="replace")[:12000]
         except OSError:
@@ -530,13 +528,29 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
         if max_requests > 5:
             continue
         severity = (severity_match.group(1).strip("'\"").lower() if severity_match else "unknown")
-        priority = min((category_rank.get(tag, 99) for tag in tags), default=99)
-        candidates.append((severity_rank.get(severity, 5), priority, id_match.group(1), str(path), tags))
+        primary_category = next((tag for tag in category_order if tag in tags), "other")
+        candidates.append((primary_category, severity_rank.get(severity, 5), id_match.group(1), str(path), tags))
 
-    # Prefer higher-severity vulnerability/misconfiguration checks, then use stable
-    # identifiers for deterministic selection across runs on the same template set.
-    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
-    selected = candidates[:max_templates]
+    # Balance categories first so a large number of CVE templates cannot crowd out
+    # configuration, exposure, TLS/header, and technology checks. Within each group,
+    # higher-severity templates are selected first and identifiers keep selection stable.
+    groups = {}
+    for candidate in candidates:
+        groups.setdefault(candidate[0], []).append(candidate)
+    for group in groups.values():
+        group.sort(key=lambda item: (item[1], item[2]))
+    selected = []
+    while len(selected) < max_templates:
+        made_progress = False
+        for category in category_order + ["other"]:
+            group = groups.get(category, [])
+            if group:
+                selected.append(group.pop(0))
+                made_progress = True
+                if len(selected) >= max_templates:
+                    break
+        if not made_progress:
+            break
     return [item[3] for item in selected], {
         "status": "ready" if selected else "unavailable",
         "template_root": str(root), "templates_considered": scanned,
