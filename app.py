@@ -470,8 +470,8 @@ def perform_testssl_check(target: str, timeout_seconds: int = 75) -> tuple[list[
 
 
 
-def perform_nuclei_check(target: str, timeout_seconds: int = 30) -> tuple[list[tuple], dict]:
-    """Run a bounded Nuclei pass using conservative, non-OAST template categories."""
+def perform_nuclei_check(target: str, timeout_seconds: int = 60) -> tuple[list[tuple], dict]:
+    """Run a broader bounded Nuclei pass over conservative HTTP misconfiguration/exposure categories."""
     binary = shutil.which(TOOL_CATALOG["nuclei"]["binary"])
     if not binary:
         return [], {"status": "unavailable", "reason": "Nuclei is not installed"}
@@ -479,12 +479,17 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 30) -> tuple[list[t
     findings: list[tuple] = []
     with tempfile.TemporaryDirectory(prefix="dkcissp-nuclei-") as temp_dir:
         jsonl_path = str(Path(temp_dir) / "results.jsonl")
+        # Use maintained template tags for breadth rather than three hard-coded IDs.
+        # Keep this first broadening pass HTTP-only and exclude categories commonly
+        # associated with intrusive probes, fuzzing, brute force, or denial of service.
+        safe_tags = "misconfig,exposure,headers,ssl,config,token,tech"
+        excluded_tags = "dos,fuzz,bruteforce,brute-force,intrusive,headless,token-spray,default-login"
         command = [
             binary, "-target", target,
-            "-id", "http-missing-security-headers,cookies-without-secure,cookies-without-httponly",
+            "-tags", safe_tags, "-exclude-tags", excluded_tags,
             "-pt", "http",
             "-severity", "info,low,medium,high,critical",
-            "-rl", "3", "-c", "1", "-timeout", "3", "-retries", "0",
+            "-rl", "3", "-c", "1", "-timeout", "5", "-retries", "0",
             "-duc", "-disable-redirects", "-no-interactsh", "-silent",
             "-jsonl-export", jsonl_path,
         ]
@@ -547,9 +552,10 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 30) -> tuple[list[t
     return deduped, {"status": "completed" if result.returncode == 0 else "completed_with_warnings",
                      "return_code": result.returncode, "finding_count": len(deduped),
                      "malformed_records": malformed,
-                     "template_ids": ["http-missing-security-headers", "cookies-without-secure", "cookies-without-httponly"],
+                     "template_selection": {"mode": "tag allowlist", "tags": safe_tags.split(","),
+                                            "excluded_tags": excluded_tags.split(","), "protocols": ["http"]},
                      "rate_limit_per_second": 3, "concurrency": 1, "redirects_disabled": True,
-                     "interactsh_disabled": True}
+                     "interactsh_disabled": True, "timeout_seconds": timeout_seconds}
 
 
 def perform_whatweb_check(target: str, timeout_seconds: int = 30) -> tuple[list[tuple], dict]:

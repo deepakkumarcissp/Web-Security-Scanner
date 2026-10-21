@@ -172,14 +172,16 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
 
     def fake_run(command, **kwargs):
         assert command[0] == "/usr/bin/nuclei"
-        assert command[command.index("-id") + 1] == "http-missing-security-headers,cookies-without-secure,cookies-without-httponly"
+        assert command[command.index("-tags") + 1] == "misconfig,exposure,headers,ssl,config,token,tech"
+        assert "intrusive" in command[command.index("-exclude-tags") + 1]
+        assert "dos" in command[command.index("-exclude-tags") + 1]
         assert command[command.index("-pt") + 1] == "http"
         assert command[command.index("-rl") + 1] == "3"
         assert command[command.index("-c") + 1] == "1"
         assert "-disable-redirects" in command
         assert "-no-interactsh" in command
         assert "-jsonl-export" in command
-        assert kwargs["timeout"] == 30
+        assert kwargs["timeout"] == 60
         report_path = command[command.index("-jsonl-export") + 1]
         records = [
             {"template-id": "tls-test", "matched-at": "https://example.test/", "info": {"name": "Weak TLS setting", "severity": "high", "remediation": "Enable secure TLS."}},
@@ -197,6 +199,9 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
     assert status["status"] == "completed"
     assert status["finding_count"] == 2
     assert status["malformed_records"] == 1
+    assert status["template_selection"]["mode"] == "tag allowlist"
+    assert status["rate_limit_per_second"] == 3
+    assert status["interactsh_disabled"] is True
     assert findings[0][0] == "High"
     assert findings[0][1] == "Nuclei: Weak TLS setting"
     assert "template-id" not in findings[0][3]
@@ -209,7 +214,7 @@ def test_nuclei_timeout_is_reported(monkeypatch):
     monkeypatch.setattr(app.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("nuclei", 30)))
     findings, status = app.perform_nuclei_check("https://example.test")
     assert findings == []
-    assert status == {"status": "timeout", "timeout_seconds": 30}
+    assert status == {"status": "timeout", "timeout_seconds": 60}
 
 
 def test_whatweb_reports_missing_binary(monkeypatch):
