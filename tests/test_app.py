@@ -169,7 +169,7 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
     from types import SimpleNamespace
 
     monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/nuclei")
-    monkeypatch.setattr(app, "select_nuclei_templates", lambda: (["/tmp/safe-template.yaml"], {"status": "ready", "templates_selected": 1}))
+    monkeypatch.setattr(app, "select_nuclei_templates", lambda max_templates=30: (["/tmp/safe-template.yaml"], {"status": "ready", "templates_selected": 1, "max_templates": max_templates}))
 
     def fake_run(command, **kwargs):
         assert command[0] == "/usr/bin/nuclei"
@@ -178,8 +178,9 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
         with open(command[command.index("-list") + 1], encoding="utf-8") as targets_file:
             assert targets_file.read().splitlines() == ["https://example.test", "https://example.test/admin"]
         assert command[command.index("-pt") + 1] == "http"
-        assert command[command.index("-rl") + 1] == "3"
-        assert command[command.index("-c") + 1] == "1"
+        assert command[command.index("-rl") + 1] == "5"
+        assert command[command.index("-c") + 1] == "3"
+        assert command[command.index("-timeout") + 1] == "4"
         assert "-disable-redirects" in command
         assert "-no-interactsh" in command
         assert "-jsonl-export" in command
@@ -206,7 +207,7 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
     assert status["finding_count"] == 2
     assert status["malformed_records"] == 1
     assert status["template_selection"]["status"] == "ready"
-    assert status["rate_limit_per_second"] == 3
+    assert status["rate_limit_per_second"] == 5
     assert status["interactsh_disabled"] is True
     assert findings[0][0] == "High"
     assert findings[0][1] == "Nuclei: Weak TLS setting"
@@ -217,14 +218,33 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
 def test_nuclei_timeout_is_reported(monkeypatch):
     import subprocess
     monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/nuclei")
-    monkeypatch.setattr(app, "select_nuclei_templates", lambda: (["/tmp/safe-template.yaml"], {"status": "ready", "templates_selected": 1}))
+    monkeypatch.setattr(app, "select_nuclei_templates", lambda max_templates=30: (["/tmp/safe-template.yaml"], {"status": "ready", "templates_selected": 1, "max_templates": max_templates}))
     monkeypatch.setattr(app.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("nuclei", 60)))
     findings, status = app.perform_nuclei_check("https://example.test")
     assert findings == []
     assert findings == []
     assert status["status"] == "timeout"
     assert status["timeout_seconds"] == 60
+    assert status["target_count"] == 1
     assert status["interactsh_disabled"] is True
+
+
+def test_nuclei_timeout_retains_valid_partial_jsonl_findings(monkeypatch):
+    import json
+    import subprocess
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/nuclei")
+    monkeypatch.setattr(app, "select_nuclei_templates", lambda max_templates=30: (["/tmp/safe-template.yaml"], {"status": "ready", "templates_selected": 1, "max_templates": max_templates}))
+    def fake_run(command, **kwargs):
+        report_path = command[command.index("-jsonl-export") + 1]
+        record = {"template-id": "partial-check", "matched-at": "https://example.test/health", "info": {"name": "Partial evidence", "severity": "medium"}}
+        Path(report_path).write_text(json.dumps(record) + "\n", encoding="utf-8")
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    findings, status = app.perform_nuclei_check("https://example.test", timeout_seconds=60)
+    assert status["status"] == "partial_timeout"
+    assert status["partial_results_retained"] is True
+    assert status["finding_count"] == 1
+    assert findings[0][1] == "Nuclei: Partial evidence"
 
 
 def test_nuclei_template_selector_excludes_high_risk_and_non_http_templates(tmp_path, monkeypatch):
