@@ -485,7 +485,12 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
         Path.home() / "nuclei-templates" / "http",
         Path("/root/nuclei-templates/http"),
     ]
-    root = next((candidate for candidate in roots if candidate.is_dir()), None)
+    def is_directory(candidate: Path) -> bool:
+        try:
+            return candidate.is_dir()
+        except OSError:
+            return False
+    root = next((candidate for candidate in roots if is_directory(candidate)), None)
     if root is None:
         return [], {"status": "unavailable", "reason": "Local HTTP Nuclei templates were not found"}
 

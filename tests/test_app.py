@@ -210,7 +210,8 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
 def test_nuclei_timeout_is_reported(monkeypatch):
     import subprocess
     monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/nuclei")
-    monkeypatch.setattr(app.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("nuclei", 30)))
+    monkeypatch.setattr(app, "select_nuclei_templates", lambda: (["/tmp/safe-template.yaml"], {"status": "ready", "templates_selected": 1}))
+    monkeypatch.setattr(app.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("nuclei", 60)))
     findings, status = app.perform_nuclei_check("https://example.test")
     assert findings == []
     assert findings == []
