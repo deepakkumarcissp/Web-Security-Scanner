@@ -1308,10 +1308,10 @@ def create_scan(request: ScanRequest):
         registered_port = registered.port or (443 if registered.scheme.lower() == "https" else 80)
         if hostname == registered_host and port == registered_port and asset["scope_status"] != "in_scope":
             raise HTTPException(403, "This target is marked " + asset["scope_status"].replace("_", " ") + " in Asset Inventory. Review its scope before scanning.")
-    scan_id = start_scan(target, "standard")
+    scan_id = start_scan(target, request.profile)
     return {
-        "id": scan_id, "status": "running",
-        "message": "Low-impact HTTP/header checks started; standard/deep HTTPS scans also run testssl.sh when installed, with a bounded timeout. Local ZAP passive alerts are optional.",
+        "id": scan_id, "status": "running", "profile": request.profile,
+        "message": "Assessment started with the selected profile. Standard adds bounded discovery and safe Nuclei checks; Deep adds bounded Nikto server checks. Optional ZAP passive alerts require a healthy local API.",
     }
 
 
