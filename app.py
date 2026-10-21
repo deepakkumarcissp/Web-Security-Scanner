@@ -1532,6 +1532,99 @@ def scan_detail(scan_id: int):
         return {"scan": dict(scan), "findings": findings}
 
 
+def finding_fingerprint(finding: dict) -> tuple[str, str]:
+    """Match repeat findings by normalized title and same-origin path, ignoring query noise."""
+    title = re.sub(r"\s+", " ", str(finding.get("title", "")).strip().lower())
+    parsed = urlparse(str(finding.get("affected_url", "")))
+    path = re.sub(r"/{2,}", "/", parsed.path or "/").rstrip("/") or "/"
+    return title, path
+
+
+def finding_risk_points(severity: str) -> int:
+    return {"critical": 10, "high": 8, "medium": 4, "low": 1, "info": 0,
+            "informational": 0}.get(str(severity).strip().lower(), 0)
+
+
+@app.get("/api/scans/{scan_id}/comparison")
+def compare_scan(scan_id: int, baseline_id: int | None = None):
+    """Compare completed scans of the same normalized target; this is a heuristic, not proof of remediation."""
+    with connect() as conn:
+        current = conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not current:
+            raise HTTPException(404, "Scan not found")
+        if current["status"] != "completed":
+            raise HTTPException(409, "Only completed scans can be compared")
+        current_target = validate_target(current["target"])
+        if baseline_id is None:
+            baseline = conn.execute(
+                """SELECT * FROM scans WHERE id<>? AND status='completed' AND profile=?
+                ORDER BY COALESCE(finished_at,created_at) DESC,id DESC""",
+                (scan_id, current["profile"]),
+            ).fetchall()
+            baseline = next((row for row in baseline if validate_target(row["target"]) == current_target), None)
+        else:
+            baseline = conn.execute("SELECT * FROM scans WHERE id=?", (baseline_id,)).fetchone()
+            if not baseline:
+                raise HTTPException(404, "Baseline scan not found")
+            if baseline["status"] != "completed":
+                raise HTTPException(409, "Baseline scan must be completed")
+            if baseline["id"] == scan_id:
+                raise HTTPException(400, "A scan cannot be compared with itself")
+            if validate_target(baseline["target"]) != current_target:
+                raise HTTPException(400, "Scans must use the same normalized target URL")
+        if baseline is None:
+            return {"scan_id": scan_id, "baseline": None, "target": current_target,
+                    "message": "No earlier completed scan of this target and profile is available. Run another scan after remediation to measure change.",
+                    "summary": {"new": 0, "resolved": 0, "persistent": 0, "severity_increased": 0,
+                                "severity_decreased": 0, "risk_points_before": 0, "risk_points_after": 0,
+                                "risk_reduction_percent": None}, "new_findings": [], "resolved_findings": [],
+                    "persistent_findings": [], "limitations": ["The comparison matches normalized title and URL path; it is heuristic.",
+                    "A resolved match means the detector did not report it in this scan, not proof that the underlying issue is fixed."]}
+        baseline_findings = [dict(row) for row in conn.execute("SELECT * FROM findings WHERE scan_id=? ORDER BY id", (baseline["id"],))]
+        current_findings = [dict(row) for row in conn.execute("SELECT * FROM findings WHERE scan_id=? ORDER BY id", (scan_id,))]
+    from collections import defaultdict, deque
+    old_by_key = defaultdict(deque)
+    new_by_key = defaultdict(deque)
+    for finding in baseline_findings:
+        old_by_key[finding_fingerprint(finding)].append(finding)
+    for finding in current_findings:
+        new_by_key[finding_fingerprint(finding)].append(finding)
+    new_items, resolved_items, persistent_items = [], [], []
+    severity_increased = severity_decreased = 0
+    for key in set(old_by_key) | set(new_by_key):
+        old_items, fresh_items = old_by_key[key], new_by_key[key]
+        while old_items and fresh_items:
+            old, fresh = old_items.popleft(), fresh_items.popleft()
+            before, after = finding_risk_points(old["severity"]), finding_risk_points(fresh["severity"])
+            if after > before: severity_increased += 1
+            elif after < before: severity_decreased += 1
+            persistent_items.append({"title": fresh["title"], "affected_url": fresh["affected_url"],
+                                     "severity_before": old["severity"], "severity_after": fresh["severity"],
+                                     "severity_changed": old["severity"] != fresh["severity"],
+                                     "risk_points_before": before, "risk_points_after": after,
+                                     "finding_id": fresh["id"]})
+        resolved_items.extend({"title": item["title"], "affected_url": item["affected_url"],
+                               "severity": item["severity"], "finding_id": item["id"]} for item in old_items)
+        new_items.extend({"title": item["title"], "affected_url": item["affected_url"],
+                          "severity": item["severity"], "finding_id": item["id"]} for item in fresh_items)
+    before_points = sum(finding_risk_points(f["severity"]) for f in baseline_findings)
+    after_points = sum(finding_risk_points(f["severity"]) for f in current_findings)
+    reduction = round((before_points - after_points) / before_points * 100, 1) if before_points else (100.0 if after_points == 0 else None)
+    return {"scan_id": scan_id, "baseline": {"scan_id": baseline["id"], "target": baseline["target"],
+            "profile": baseline["profile"], "finished_at": baseline["finished_at"]},
+            "target": current_target, "profile": current["profile"], "finished_at": current["finished_at"],
+            "summary": {"new": len(new_items), "resolved": len(resolved_items), "persistent": len(persistent_items),
+                        "severity_increased": severity_increased, "severity_decreased": severity_decreased,
+                        "risk_points_before": before_points, "risk_points_after": after_points,
+                        "risk_reduction_percent": reduction},
+            "new_findings": new_items, "resolved_findings": resolved_items,
+            "persistent_findings": persistent_items,
+            "limitations": ["Finding matching uses normalized title and URL path; renamed detections may appear new or resolved.",
+                            "Risk points are an internal prioritization heuristic, not CVSS or a formal risk measurement.",
+                            "A finding absent from a later scan is not proof that the underlying vulnerability is remediated.",
+                            "For a meaningful comparison, use the same target and assessment profile after remediation."]}
+
+
 @app.patch("/api/findings/{finding_id}/lifecycle")
 def update_finding_lifecycle(finding_id: int, request: FindingLifecycleUpdate):
     with connect() as conn:
