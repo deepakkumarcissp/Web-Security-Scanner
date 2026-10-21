@@ -119,8 +119,9 @@ init_db()
 
 class ScanRequest(BaseModel):
     target: str = Field(min_length=8, max_length=2048)
-    profile: str = Field(default="standard", pattern="^(quick|standard|deep)$")
+    profile: str = Field(default="standard", pattern="^(quick|standard|deep|active)$")
     authorized: bool = False
+    active_testing_approved: bool = False
 
 
 class ScheduleRequest(ScanRequest):
@@ -807,6 +808,106 @@ def perform_nikto_check(target: str, timeout_seconds: int = 50) -> tuple[list[tu
                       "safety": "Deep profile only; same supplied target; bounded runtime and request delay; tuning excludes injection, DoS, command execution, upload, and authentication-bypass test groups; no redirect-following flag"}
 
 
+def parse_wapiti_report(report, target: str) -> list[tuple]:
+    """Normalize Wapiti JSON without storing raw requests, cookies, or curl commands."""
+    if not isinstance(report, dict):
+        return []
+    root = urlparse(target)
+    root_port = root.port or (443 if root.scheme == "https" else 80)
+    classifications = report.get("classifications", {}) if isinstance(report.get("classifications"), dict) else {}
+    severity_map = {0: "Info", 1: "Low", 2: "Medium", 3: "High", 4: "Critical"}
+    findings = []
+    seen = set()
+    for group_name in ("vulnerabilities", "additionals"):
+        groups = report.get(group_name, {})
+        if not isinstance(groups, dict):
+            continue
+        for category, entries in groups.items():
+            if not isinstance(entries, list):
+                continue
+            classification = classifications.get(category, {}) if isinstance(classifications.get(category), dict) else {}
+            remediation = str(classification.get("sol") or "Validate the observation and apply the vendor-recommended remediation.")[:1800]
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                path = str(entry.get("path") or "")
+                affected = urljoin(target, path) if path else target
+                parsed = urlparse(affected)
+                port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                if (parsed.scheme != root.scheme or not parsed.hostname or not root.hostname or
+                        parsed.hostname.lower().rstrip(".") != root.hostname.lower().rstrip(".") or port != root_port):
+                    continue
+                level = entry.get("level", 0 if group_name == "additionals" else 1)
+                try:
+                    level = int(level)
+                except (TypeError, ValueError):
+                    level = 1
+                severity = "Info" if group_name == "additionals" else severity_map.get(level, "Low")
+                title = ("Wapiti: " if group_name == "vulnerabilities" else "Wapiti observation: ") + str(category)[:220]
+                detail = str(entry.get("info") or entry.get("message") or "Scanner reported this observation.")[:1000]
+                method = str(entry.get("method") or "")[:12]
+                parameter = str(entry.get("parameter") or "")[:160]
+                module = str(entry.get("module") or "")[:80]
+                evidence_parts = [detail]
+                if method:
+                    evidence_parts.append("Method: " + method)
+                if parameter:
+                    evidence_parts.append("Parameter: " + parameter)
+                if module:
+                    evidence_parts.append("Module: " + module)
+                evidence = "; ".join(evidence_parts)[:1800]
+                key = (title, affected, evidence)
+                if key in seen:
+                    continue
+                seen.add(key)
+                confidence = "Medium" if group_name == "vulnerabilities" else "Low"
+                findings.append((severity, title, affected[:2048], evidence, remediation, confidence))
+    return findings
+
+
+def perform_wapiti_check(target: str, timeout_seconds: int = 90) -> tuple[list[tuple], dict]:
+    """Run an explicitly approved, bounded active Wapiti assessment on the supplied URL scope."""
+    binary = shutil.which(TOOL_CATALOG["wapiti"]["binary"])
+    if not binary:
+        return [], {"status": "unavailable", "reason": "Wapiti is not installed"}
+    modules = "backup,crlf,csrf,exec,file,htaccess,ldap,methods,redirect,sql,ssl,xss,xxe"
+    with tempfile.TemporaryDirectory(prefix="dkcissp-wapiti-") as temp_dir:
+        report_path = str(Path(temp_dir) / "report.json")
+        command = [binary, "-u", target, "--scope", "folder", "-m", modules,
+                   "-f", "json", "-o", report_path, "-d", "2",
+                   "--max-links-per-page", "10", "--max-files-per-dir", "5",
+                   "--max-parameters", "10", "--max-scan-time", "75",
+                   "--max-attack-time", "8", "--tasks", "1", "-t", "4",
+                   "-l", "1", "-S", "polite", "--no-bugreport", "--verify-ssl", "1", "-v", "0"]
+        for excluded_path in ("logout", "signout", "session/logout", "account/delete", "unsubscribe", "checkout", "payment"):
+            command.extend(["-x", urljoin(target.rstrip("/") + "/", excluded_path)])
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout_seconds,
+                                    check=False, env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"})
+        except subprocess.TimeoutExpired:
+            return [], {"status": "timeout", "timeout_seconds": timeout_seconds,
+                        "reason": "Wapiti reached its runtime limit before a report was available"}
+        except OSError as exc:
+            return [], {"status": "error", "reason": str(exc)[:300]}
+        if not os.path.isfile(report_path) or os.path.getsize(report_path) == 0:
+            return [], {"status": "error" if result.returncode else "completed",
+                        "return_code": result.returncode, "finding_count": 0,
+                        "reason": "Wapiti produced no JSON report" if result.returncode else "Wapiti completed without a report"}
+        try:
+            with open(report_path, encoding="utf-8", errors="replace") as report_file:
+                report = json.load(report_file)
+        except (OSError, json.JSONDecodeError):
+            return [], {"status": "error", "return_code": result.returncode,
+                        "reason": "Wapiti produced an unreadable JSON report"}
+    findings = parse_wapiti_report(report, target)
+    return findings, {"status": "completed" if result.returncode == 0 else "completed_with_warnings",
+                      "return_code": result.returncode, "finding_count": len(findings),
+                      "crawled_pages": (report.get("infos", {}) or {}).get("crawled_pages_nbr") if isinstance(report, dict) else None,
+                      "timeout_seconds": timeout_seconds,
+                      "modules": modules.split(","),
+                      "safety": "Active payload testing explicitly approved by user; same-folder scope; depth 2; one crawler task; polite mode; no SSRF, upload, stored-XSS, brute-force, timing-SQL, or OAST modules"}
+
+
 def perform_whatweb_check(target: str, timeout_seconds: int = 30) -> tuple[list[tuple], dict]:
     """Run WhatWeb at its stealthy single-request aggression level and normalize its JSON output."""
     binary = shutil.which(TOOL_CATALOG["whatweb"]["binary"])
@@ -888,7 +989,8 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         "Built-in HTTP & headers": {"status": "running", "detail": "Requesting the supplied URL and inspecting response headers"},
         "Endpoint discovery": {"status": "queued", "detail": "Waiting for the initial page response"},
         "Nuclei": {"status": "queued", "detail": "Waiting for built-in checks"},
-        "Nikto": {"status": "queued", "detail": "Runs only in the Deep profile"},
+        "Nikto": {"status": "queued", "detail": "Runs in Deep and Active profiles"},
+        "Wapiti active checks": {"status": "queued", "detail": "Runs only after explicit active-testing approval"},
         "WhatWeb": {"status": "queued", "detail": "Waiting for built-in checks"},
         "TLS (testssl.sh)": {"status": "queued", "detail": "Waiting for built-in checks"},
         "OWASP ZAP passive": {"status": "queued", "detail": "Optional local integration"},
@@ -988,7 +1090,7 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                 "Low", "Cookie may lack HttpOnly attribute", cookies[:220],
                 "Set HttpOnly for session cookies that do not require JavaScript access.", "Medium",
             )
-        if profile in ("standard", "deep"):
+        if profile in ("standard", "deep", "active"):
             if re.search(r"<form\b", body, re.I) and "content-security-policy" not in headers:
                 finding(
                     "Info", "HTML form detected without CSP",
@@ -1002,8 +1104,8 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                     "Disable directory listing or restrict access.", "Medium",
                 )
 
-        discovery_status = {"status": "skipped", "reason": "Endpoint discovery is enabled for Standard/Deep scans only", "urls": [final_url]}
-        if profile in ("standard", "deep"):
+        discovery_status = {"status": "skipped", "reason": "Endpoint discovery is enabled for Standard/Deep/Active scans only", "urls": [final_url]}
+        if profile in ("standard", "deep", "active"):
             tool_status["Endpoint discovery"] = {"status": "running", "detail": "Discovering same-origin links without submitting forms"}
             update_scan_progress(scan_id, 27, "Discovering same-origin pages", tool_status)
             discovery_status = discover_same_origin_pages(final_url, body)
@@ -1050,12 +1152,12 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         # only for explicitly authorized scans, and its status is recorded in the scan summary.
         tls_status = {"status": "not_run", "reason": "TLS check not requested by profile"}
         whatweb_status = {"status": "not_run", "reason": "Technology discovery not requested by profile"}
-        nuclei_status = {"status": "not_run", "reason": "Nuclei checks are enabled for standard/deep profiles only"}
-        nikto_status = {"status": "not_run", "reason": "Nikto server checks are enabled for the Deep profile only"}
-        if profile in ("standard", "deep"):
-            nuclei_targets = discovery_status.get("urls", [target]) if profile in ("standard", "deep") else [target]
-            nuclei_template_cap = 60 if profile == "deep" else 30
-            nuclei_timeout = 150 if profile == "deep" else 75
+        nuclei_status = {"status": "not_run", "reason": "Nuclei checks are enabled for Standard/Deep/Active profiles only"}
+        nikto_status = {"status": "not_run", "reason": "Nikto server checks are enabled for Deep/Active profiles only"}
+        if profile in ("standard", "deep", "active"):
+            nuclei_targets = discovery_status.get("urls", [target])
+            nuclei_template_cap = 60 if profile in ("deep", "active") else 30
+            nuclei_timeout = 150 if profile in ("deep", "active") else 75
             tool_status["Nuclei"] = {"status": "running", "detail": f"Running up to {nuclei_template_cap} safe templates across {len(nuclei_targets[:12])} same-origin URL(s); 5 requests/second maximum"}
             update_scan_progress(scan_id, 35, "Running Nuclei safe checks", tool_status)
             nuclei_findings, nuclei_status = perform_nuclei_check(target, timeout_seconds=nuclei_timeout,
@@ -1070,22 +1172,22 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             elif nuclei_status.get("reason"):
                 nuclei_detail += "; " + str(nuclei_status["reason"])
             tool_status["Nuclei"] = {"status": nuclei_state, "detail": nuclei_detail}
-        if profile == "deep":
+        if profile in ("deep", "active"):
             tool_status["Nikto"] = {"status": "running", "detail": "Checking common web-server exposures with a bounded request rate and runtime"}
             update_scan_progress(scan_id, 48, "Checking web-server exposures with Nikto", tool_status)
             nikto_findings, nikto_status = perform_nikto_check(target)
             findings.extend(nikto_findings)
             tool_status["Nikto"] = {"status": nikto_status.get("status", "completed"), "detail": f"{nikto_status.get('finding_count', len(nikto_findings))} finding(s); {nikto_status.get('reason', 'check finished')}"}
         else:
-            tool_status["Nikto"] = {"status": "skipped", "detail": "Nikto runs only in the Deep profile"}
+            tool_status["Nikto"] = {"status": "skipped", "detail": "Nikto runs only in Deep and Active profiles"}
 
-        if profile in ("standard", "deep"):
+        if profile in ("standard", "deep", "active"):
             tool_status["WhatWeb"] = {"status": "running", "detail": "Fingerprinting technologies from the supplied URL"}
             update_scan_progress(scan_id, 55, "Identifying website technologies", tool_status)
             whatweb_findings, whatweb_status = perform_whatweb_check(target)
             findings.extend(whatweb_findings)
             tool_status["WhatWeb"] = {"status": whatweb_status.get("status", "completed"), "detail": f"{whatweb_status.get('finding_count', len(whatweb_findings))} technology signal(s); {whatweb_status.get('reason', 'check finished')}"}
-        if profile in ("standard", "deep"):
+        if profile in ("standard", "deep", "active"):
             if target.lower().startswith("https://"):
                 tool_status["TLS (testssl.sh)"] = {"status": "running", "detail": "Checking TLS configuration with a bounded runtime"}
                 update_scan_progress(scan_id, 70, "Assessing TLS configuration", tool_status)
@@ -1101,12 +1203,22 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             tool_status["TLS (testssl.sh)"] = {"status": "skipped", "detail": "Not selected for this profile"}
 
         tool_status["OWASP ZAP passive"] = {"status": "running", "detail": "Checking passive alerts across approved same-origin URLs"}
-        update_scan_progress(scan_id, 88, "Checking optional OWASP ZAP passive alerts", tool_status)
+        update_scan_progress(scan_id, 84, "Checking optional OWASP ZAP passive alerts", tool_status)
         zap_targets = discovery_status.get("urls", [target])
         zap_findings, zap_status = perform_zap_passive_check(target, targets=zap_targets)
         findings.extend(zap_findings)
         tool_status["OWASP ZAP passive"] = {"status": zap_status.get("status", "error"), "detail": f"{zap_status.get('finding_count', len(zap_findings))} alert(s) across {zap_status.get('urls_scanned', 0)} URL(s); {zap_status.get('reason', zap_status.get('mode', 'integration status recorded'))}"}
-        update_scan_progress(scan_id, 95, "Combining and deduplicating findings", tool_status)
+        wapiti_status = {"status": "not_run", "reason": "Wapiti active testing is available only in the Active profile"}
+        if profile == "active":
+            tool_status["Wapiti active checks"] = {"status": "running", "detail": "Active tests approved; checking common injection, file, redirect, and configuration weaknesses with bounded scope and runtime"}
+            update_scan_progress(scan_id, 91, "Running approved Wapiti active checks", tool_status)
+            wapiti_findings, wapiti_status = perform_wapiti_check(target)
+            findings.extend(wapiti_findings)
+            tool_status["Wapiti active checks"] = {"status": wapiti_status.get("status", "error"), "detail": f"{wapiti_status.get('finding_count', len(wapiti_findings))} finding(s); {wapiti_status.get('reason', 'active check finished')}"}
+        else:
+            tool_status["Wapiti active checks"] = {"status": "skipped", "detail": "Requires the separate Active profile and explicit approval"}
+
+        update_scan_progress(scan_id, 97, "Combining and deduplicating findings", tool_status)
         deduped = []
         seen = set()
         for item in findings:
@@ -1125,9 +1237,9 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                     "completed", now(),
                     json.dumps({
                         "http_status": status_code, "final_url": final_url,
-                        "checks": "passive HTTP/header checks, bounded same-origin discovery, curated Nuclei checks, WhatWeb fingerprinting, optional TLS assessment, Deep-profile Nikto checks, and optional ZAP passive alerts",
+                        "checks": "passive HTTP/header checks, bounded same-origin discovery, curated Nuclei checks, WhatWeb fingerprinting, optional TLS assessment, Deep/Active Nikto checks, optional ZAP passive alerts, and explicitly approved Active-profile Wapiti tests",
                         "tls_check": tls_status, "whatweb_check": whatweb_status,
-                        "nuclei_check": nuclei_status, "nikto_check": nikto_status, "zap_check": zap_status,
+                        "nuclei_check": nuclei_status, "nikto_check": nikto_status, "wapiti_check": wapiti_status, "zap_check": zap_status,
                         "endpoint_discovery": discovery_status,
                         "finding_count": len(findings),
                     }),
@@ -1373,6 +1485,8 @@ def discover_subdomains(asset_id: int, request: AssetDiscoveryRequest):
 def create_scan(request: ScanRequest):
     if not request.authorized:
         raise HTTPException(400, "Confirm you are authorized to test this target.")
+    if request.profile == "active" and not request.active_testing_approved:
+        raise HTTPException(400, "Active profile requires the separate active-testing approval confirmation.")
     target = validate_target(request.target)
     # Simple one-URL workflow: explicit authorization is enough for a newly entered target.
     # If the target already exists in inventory, respect any review or out-of-scope decision.
@@ -1390,7 +1504,7 @@ def create_scan(request: ScanRequest):
     scan_id = start_scan(target, request.profile)
     return {
         "id": scan_id, "status": "running", "profile": request.profile,
-        "message": "Assessment started with the selected profile. Standard adds bounded discovery and safe Nuclei checks; Deep adds bounded Nikto server checks. Optional ZAP passive alerts require a healthy local API.",
+        "message": "Assessment started with the selected profile. Standard adds bounded discovery and safe Nuclei checks; Deep adds bounded Nikto checks; Active additionally runs explicitly approved Wapiti payload tests. Optional ZAP passive alerts require a healthy local API.",
     }
 
 
@@ -1475,6 +1589,8 @@ def export_findings():
 def create_schedule(request: ScheduleRequest):
     if not request.authorized:
         raise HTTPException(400, "Confirm you are authorized to test this target.")
+    if request.profile == "active":
+        raise HTTPException(400, "Active payload testing cannot be scheduled; start it manually with explicit approval.")
     target = validate_target(request.target)
     require_in_scope_asset(target)
     delta = timedelta(days=1 if request.frequency == "daily" else 7)
@@ -1537,6 +1653,7 @@ TOOL_CATALOG = {
     "testssl": {"label": "testssl.sh", "binary": "testssl.sh", "package": "testssl.sh", "version_args": ["--version"], "purpose": "TLS and HTTPS configuration assessment"},
     "nuclei": {"label": "Nuclei", "binary": "nuclei", "package": "nuclei", "version_args": ["-version"], "purpose": "Template-based checks for known exposures and misconfigurations"},
     "nikto": {"label": "Nikto", "binary": "nikto", "package": "nikto", "version_args": ["-Version"], "purpose": "Deep-profile checks for common web-server files and misconfigurations"},
+    "wapiti": {"label": "Wapiti", "binary": "wapiti", "package": "wapiti", "version_args": ["--version"], "purpose": "Explicitly approved active tests for web-application vulnerabilities"},
 }
 
 

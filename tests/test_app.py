@@ -293,6 +293,53 @@ def test_nuclei_template_selection_balances_categories_before_filling_cap(tmp_pa
     assert status["templates_selected"] == 5
 
 
+def test_wapiti_parser_normalizes_findings_and_filters_out_of_scope_urls():
+    report = {
+        "classifications": {"SQL Injection": {"sol": "Use parameterized queries."}},
+        "vulnerabilities": {"SQL Injection": [
+            {"level": 3, "path": "/search?q=x", "info": "SQL error detected", "method": "GET", "parameter": "q", "module": "sql", "http_request": "SECRET REQUEST", "curl_command": "SECRET CURL"},
+            {"level": 4, "path": "https://evil.example/", "info": "out of scope", "method": "GET"},
+        ]},
+        "additionals": {"HTTP Methods": [{"level": 0, "path": "/", "info": "Unexpected method response", "module": "methods"}]},
+    }
+    findings = app.parse_wapiti_report(report, "https://app.example.test/")
+    assert len(findings) == 2
+    sql = next(item for item in findings if "SQL Injection" in item[1])
+    assert sql[0] == "High"
+    assert sql[2] == "https://app.example.test/search?q=x"
+    assert "Use parameterized queries" in sql[4]
+    assert "SECRET" not in str(findings)
+    additional = next(item for item in findings if "HTTP Methods" in item[1])
+    assert additional[0] == "Info"
+
+
+def test_wapiti_runs_bounded_active_modules_and_parses_json(monkeypatch, tmp_path):
+    import json
+    from types import SimpleNamespace
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/wapiti")
+    def fake_run(command, **kwargs):
+        assert command[command.index("--scope") + 1] == "folder"
+        modules = command[command.index("-m") + 1].split(",")
+        assert "sql" in modules and "xss" in modules and "exec" in modules
+        assert not ({"ssrf", "upload", "permanentxss", "timesql"} & set(modules))
+        assert command[command.index("--max-scan-time") + 1] == "75"
+        assert command[command.index("--tasks") + 1] == "1"
+        assert "--no-bugreport" in command
+        assert kwargs["timeout"] == 90
+        report_path = command[command.index("-o") + 1]
+        with open(report_path, "w", encoding="utf-8") as handle:
+            json.dump({"classifications": {"SQL Injection": {"sol": "Use prepared statements."}},
+                       "vulnerabilities": {"SQL Injection": [{"level": 2, "path": "/search", "info": "Test evidence", "method": "GET", "parameter": "q", "module": "sql"}]},
+                       "additionals": {}, "infos": {"crawled_pages_nbr": 2}}, handle)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    findings, status = app.perform_wapiti_check("https://app.example.test/")
+    assert status["status"] == "completed"
+    assert status["finding_count"] == 1
+    assert status["crawled_pages"] == 2
+    assert findings[0][0] == "Medium"
+
+
 def test_whatweb_reports_missing_binary(monkeypatch):
     monkeypatch.setattr(app.shutil, "which", lambda _binary: None)
     findings, status = app.perform_whatweb_check("https://example.test")
@@ -346,6 +393,8 @@ def test_dashboard_renders_with_schedule_and_report_navigation():
     assert "Schedules" in response.text
     assert "Download findings.csv" in response.text
     assert "Assessment depth" in response.text
+    assert "Active — test application vulnerabilities" in response.text
+    assert "I explicitly approve active payload testing" in response.text
 
 
 
@@ -354,7 +403,7 @@ def test_tool_status_reports_allowlisted_integrations():
     assert response.status_code == 200
     payload = response.json()
     assert {tool["id"] for tool in payload["tools"]} == {
-        "curl", "zaproxy", "whatweb", "testssl", "nuclei", "nikto"
+        "curl", "zaproxy", "whatweb", "testssl", "nuclei", "nikto", "wapiti"
     }
     assert all("status" in tool and "installed" in tool for tool in payload["tools"])
 
@@ -544,6 +593,33 @@ def test_one_off_assessment_needs_no_inventory_but_respects_reviewed_scope(monke
     client.patch(f"/api/assets/{asset['id']}/scope", json={"scope_status": "out_of_scope", "authorized": True})
     out_of_scope = client.post("/api/scans", json={"target": reviewed_target, "authorized": True})
     assert out_of_scope.status_code == 403
+
+
+def test_active_scan_requires_separate_approval_and_reaches_worker(monkeypatch):
+    from uuid import uuid4
+    target = f"https://active-{uuid4().hex}.example"
+    started = []
+    monkeypatch.setattr(app, "start_scan", lambda target, profile: started.append((target, profile)) or 98765)
+    denied = client.post("/api/scans", json={"target": target, "profile": "active", "authorized": True})
+    assert denied.status_code == 400
+    assert "active-testing approval" in denied.json()["detail"].lower()
+    allowed = client.post("/api/scans", json={
+        "target": target, "profile": "active", "authorized": True, "active_testing_approved": True,
+    })
+    assert allowed.status_code == 200
+    assert allowed.json()["profile"] == "active"
+    assert started == [(target, "active")]
+
+
+def test_active_scan_cannot_be_scheduled():
+    from uuid import uuid4
+    response = client.post("/api/schedules", json={
+        "name": "active scan", "target": f"https://active-schedule-{uuid4().hex}.example",
+        "profile": "active", "frequency": "daily", "authorized": True,
+        "active_testing_approved": True,
+    })
+    assert response.status_code == 400
+    assert "cannot be scheduled" in response.json()["detail"].lower()
 
 
 def test_scan_progress_fields_are_available_to_the_dashboard(monkeypatch):
