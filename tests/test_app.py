@@ -174,6 +174,9 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
     def fake_run(command, **kwargs):
         assert command[0] == "/usr/bin/nuclei"
         assert command[command.index("-templates") + 1].endswith("selected-templates.txt")
+        assert command[command.index("-list") + 1].endswith("targets.txt")
+        with open(command[command.index("-list") + 1], encoding="utf-8") as targets_file:
+            assert targets_file.read().splitlines() == ["https://example.test", "https://example.test/admin"]
         assert command[command.index("-pt") + 1] == "http"
         assert command[command.index("-rl") + 1] == "3"
         assert command[command.index("-c") + 1] == "1"
@@ -194,8 +197,12 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(app.subprocess, "run", fake_run)
-    findings, status = app.perform_nuclei_check("https://example.test")
+    findings, status = app.perform_nuclei_check("https://example.test", targets=[
+        "https://example.test", "https://example.test/admin", "https://evil.example/",
+        "http://example.test/insecure",
+    ])
     assert status["status"] == "completed"
+    assert status["target_count"] == 2
     assert status["finding_count"] == 2
     assert status["malformed_records"] == 1
     assert status["template_selection"]["status"] == "ready"
@@ -312,7 +319,7 @@ def test_tool_status_reports_allowlisted_integrations():
     assert response.status_code == 200
     payload = response.json()
     assert {tool["id"] for tool in payload["tools"]} == {
-        "curl", "zaproxy", "whatweb", "testssl", "nuclei"
+        "curl", "zaproxy", "whatweb", "testssl", "nuclei", "nikto"
     }
     assert all("status" in tool and "installed" in tool for tool in payload["tools"])
 
@@ -634,3 +641,25 @@ def test_endpoint_discovery_extracts_only_same_origin_http_urls():
 def test_endpoint_discovery_does_not_cross_port_or_scheme():
     html = '<a href="http://app.example.test/plain">http</a><a href="https://app.example.test:8443/admin">port</a>'
     assert app.extract_same_origin_links("https://app.example.test/", html) == []
+
+
+def test_nikto_json_report_is_normalized_conservatively():
+    report = {"host": "example.test", "findings": [
+        {"method": "GET", "url": "/admin/", "msg": "Directory indexing found.", "OSVDB": "1234"},
+        {"method": "GET", "url": "/admin/", "msg": "Directory indexing found.", "OSVDB": "1234"},
+        {"method": "GET", "url": "/", "msg": "Server banner disclosure"},
+        {"method": "GET", "url": "/empty", "msg": ""},
+    ]}
+    findings = app.parse_nikto_report(report, "https://example.test/")
+    assert len(findings) == 2
+    directory = next(item for item in findings if "Directory indexing" in item[1])
+    assert directory[0] == "Low"
+    assert directory[2] == "https://example.test/admin/"
+    assert "1234" in directory[3]
+    banner = next(item for item in findings if "banner disclosure" in item[1])
+    assert banner[0] == "Info"
+
+
+def test_nikto_report_parser_handles_unknown_and_malformed_shapes():
+    assert app.parse_nikto_report({"host": "example.test", "findings": "not-a-list"}, "https://example.test") == []
+    assert app.parse_nikto_report(None, "https://example.test") == []

@@ -561,8 +561,8 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
     }
 
 
-def perform_nuclei_check(target: str, timeout_seconds: int = 60) -> tuple[list[tuple], dict]:
-    """Run a bounded Nuclei pass over a curated local HTTP template subset."""
+def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[str] | None = None) -> tuple[list[tuple], dict]:
+    """Run bounded Nuclei checks on the supplied target and optional same-origin discovered URLs."""
     binary = shutil.which(TOOL_CATALOG["nuclei"]["binary"])
     if not binary:
         return [], {"status": "unavailable", "reason": "Nuclei is not installed"}
@@ -571,14 +571,31 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60) -> tuple[list[t
         return [], {"status": "unavailable", "reason": selection_status.get("reason", "No templates passed the safety filter"),
                     "template_selection": selection_status}
 
+    # Keep target-list input within the exact origin of the user-supplied URL.
+    root = urlparse(target)
+    root_port = root.port or (443 if root.scheme == "https" else 80)
+    safe_targets = []
+    for candidate in (targets or [target])[:12]:
+        parsed = urlparse(candidate)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if (parsed.scheme == root.scheme and parsed.hostname and root.hostname and
+                parsed.hostname.lower().rstrip(".") == root.hostname.lower().rstrip(".") and port == root_port and
+                parsed.scheme in {"http", "https"} and candidate not in safe_targets):
+            safe_targets.append(candidate)
+    if target not in safe_targets:
+        safe_targets.insert(0, target)
+    safe_targets = safe_targets[:12]
     findings: list[tuple] = []
     with tempfile.TemporaryDirectory(prefix="dkcissp-nuclei-") as temp_dir:
         jsonl_path = str(Path(temp_dir) / "results.jsonl")
         templates_path = str(Path(temp_dir) / "selected-templates.txt")
+        targets_path = str(Path(temp_dir) / "targets.txt")
         with open(templates_path, "w", encoding="utf-8") as template_file:
             template_file.write("\n".join(selected_templates) + "\n")
+        with open(targets_path, "w", encoding="utf-8") as target_file:
+            target_file.write("\n".join(safe_targets) + "\n")
         command = [
-            binary, "-target", target,
+            binary, "-list", targets_path,
             "-templates", templates_path,
             "-pt", "http",
             "-severity", "info,low,medium,high,critical,unknown",
@@ -645,8 +662,83 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60) -> tuple[list[t
     return deduped, {"status": "completed" if result.returncode == 0 else "completed_with_warnings",
                      "return_code": result.returncode, "finding_count": len(deduped),
                      "malformed_records": malformed, "template_selection": selection_status,
+                     "target_count": len(safe_targets), "target_limit": 12,
                      "rate_limit_per_second": 3, "concurrency": 1, "redirects_disabled": True,
                      "interactsh_disabled": True, "timeout_seconds": timeout_seconds}
+
+
+def parse_nikto_report(report, target: str) -> list[tuple]:
+    """Normalize Nikto JSON findings conservatively; Nikto messages rarely provide severity."""
+    if isinstance(report, list):
+        entries = report
+    elif isinstance(report, dict):
+        entries = next((report.get(key) for key in ("findings", "vulnerabilities", "items", "data")
+                        if isinstance(report.get(key), list)), [])
+    else:
+        entries = []
+    findings = []
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        message = str(entry.get("msg") or entry.get("message") or entry.get("description") or entry.get("title") or "").strip()
+        if not message:
+            continue
+        path = str(entry.get("url") or entry.get("uri") or "")
+        if path.startswith(("http://", "https://")):
+            affected = path
+        else:
+            affected = urljoin(target.rstrip("/") + "/", path.lstrip("/")) if path else target
+        method = str(entry.get("method") or "GET").upper()[:12]
+        reference = str(entry.get("OSVDB") or entry.get("osvdb") or entry.get("id") or "")[:120]
+        evidence = f"Nikto reported: {message}"
+        if reference:
+            evidence += f"; reference: {reference}"
+        evidence += f"; method: {method}"
+        key = (message.lower(), affected)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Do not infer High/Critical from free-text scanner output. The report needs
+        # validation and CVE/vendor evidence before severity can be raised.
+        severity = "Info" if re.search(r"server banner|server header|version.*disclos|banner.*disclos", message, re.I) else "Low"
+        findings.append((severity, "Nikto: " + message[:220], affected[:2048], evidence[:1800],
+                         "Validate this observation manually, confirm the affected component and version, then apply the vendor-recommended remediation or remove unnecessary exposure.",
+                         "Medium"))
+    return findings
+
+
+def perform_nikto_check(target: str, timeout_seconds: int = 50) -> tuple[list[tuple], dict]:
+    """Run a time-bounded Nikto server-misconfiguration pass for Deep scans only."""
+    binary = shutil.which(TOOL_CATALOG["nikto"]["binary"])
+    if not binary:
+        return [], {"status": "unavailable", "reason": "Nikto is not installed"}
+    with tempfile.TemporaryDirectory(prefix="dkcissp-nikto-") as temp_dir:
+        report_path = str(Path(temp_dir) / "nikto.json")
+        command = [binary, "-host", target, "-Format", "json", "-output", report_path,
+                   "-maxtime", f"{max(5, min(timeout_seconds - 5, 45))}s", "-Pause", "0.1",
+                   "-Tuning", "123b", "-nointeractive", "-nolookup", "-nocheck", "-ask", "no"]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout_seconds,
+                                    check=False, env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"})
+        except subprocess.TimeoutExpired:
+            return [], {"status": "timeout", "timeout_seconds": timeout_seconds}
+        except OSError as exc:
+            return [], {"status": "error", "reason": str(exc)[:300]}
+        if not os.path.isfile(report_path) or os.path.getsize(report_path) == 0:
+            return [], {"status": "error", "return_code": result.returncode,
+                        "reason": "Nikto did not produce a JSON report; no findings were inferred from console text"}
+        try:
+            with open(report_path, encoding="utf-8", errors="replace") as handle:
+                report = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return [], {"status": "error", "return_code": result.returncode,
+                        "reason": "Nikto produced an unreadable JSON report"}
+    findings = parse_nikto_report(report, target)
+    return findings, {"status": "completed" if result.returncode == 0 else "completed_with_warnings",
+                      "return_code": result.returncode, "finding_count": len(findings),
+                      "timeout_seconds": timeout_seconds,
+                      "safety": "Deep profile only; same supplied target; bounded runtime and request delay; tuning excludes injection, DoS, command execution, upload, and authentication-bypass test groups; no redirect-following flag"}
 
 
 def perform_whatweb_check(target: str, timeout_seconds: int = 30) -> tuple[list[tuple], dict]:
@@ -730,6 +822,7 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         "Built-in HTTP & headers": {"status": "running", "detail": "Requesting the supplied URL and inspecting response headers"},
         "Endpoint discovery": {"status": "queued", "detail": "Waiting for the initial page response"},
         "Nuclei": {"status": "queued", "detail": "Waiting for built-in checks"},
+        "Nikto": {"status": "queued", "detail": "Runs only in the Deep profile"},
         "WhatWeb": {"status": "queued", "detail": "Waiting for built-in checks"},
         "TLS (testssl.sh)": {"status": "queued", "detail": "Waiting for built-in checks"},
         "OWASP ZAP passive": {"status": "queued", "detail": "Optional local integration"},
@@ -892,12 +985,23 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         tls_status = {"status": "not_run", "reason": "TLS check not requested by profile"}
         whatweb_status = {"status": "not_run", "reason": "Technology discovery not requested by profile"}
         nuclei_status = {"status": "not_run", "reason": "Nuclei checks are enabled for standard/deep profiles only"}
+        nikto_status = {"status": "not_run", "reason": "Nikto server checks are enabled for the Deep profile only"}
         if profile in ("standard", "deep"):
             tool_status["Nuclei"] = {"status": "running", "detail": "Running the bounded safe HTTP template set"}
             update_scan_progress(scan_id, 35, "Running Nuclei safe checks", tool_status)
-            nuclei_findings, nuclei_status = perform_nuclei_check(target)
+            nuclei_targets = discovery_status.get("urls", [target]) if profile in ("standard", "deep") else [target]
+            nuclei_findings, nuclei_status = perform_nuclei_check(target, targets=nuclei_targets)
             findings.extend(nuclei_findings)
-            tool_status["Nuclei"] = {"status": nuclei_status.get("status", "completed"), "detail": f"{nuclei_status.get('finding_count', len(nuclei_findings))} finding(s); {nuclei_status.get('reason', 'check finished')}"}
+            tool_status["Nuclei"] = {"status": nuclei_status.get("status", "completed"), "detail": f"{nuclei_status.get('finding_count', len(nuclei_findings))} finding(s) across {nuclei_status.get('target_count', 1)} same-origin URL(s); {nuclei_status.get('reason', 'check finished')}"}
+        if profile == "deep":
+            tool_status["Nikto"] = {"status": "running", "detail": "Checking common web-server exposures with a bounded request rate and runtime"}
+            update_scan_progress(scan_id, 48, "Checking web-server exposures with Nikto", tool_status)
+            nikto_findings, nikto_status = perform_nikto_check(target)
+            findings.extend(nikto_findings)
+            tool_status["Nikto"] = {"status": nikto_status.get("status", "completed"), "detail": f"{nikto_status.get('finding_count', len(nikto_findings))} finding(s); {nikto_status.get('reason', 'check finished')}"}
+        else:
+            tool_status["Nikto"] = {"status": "skipped", "detail": "Nikto runs only in the Deep profile"}
+
         if profile in ("standard", "deep"):
             tool_status["WhatWeb"] = {"status": "running", "detail": "Fingerprinting technologies from the supplied URL"}
             update_scan_progress(scan_id, 55, "Identifying website technologies", tool_status)
@@ -944,7 +1048,8 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                         "http_status": status_code, "final_url": final_url,
                         "checks": "passive HTTP/header checks plus optional WhatWeb, testssl.sh, and ZAP passive checks",
                         "tls_check": tls_status, "whatweb_check": whatweb_status,
-                        "nuclei_check": nuclei_status, "endpoint_discovery": discovery_status,
+                        "nuclei_check": nuclei_status, "nikto_check": nikto_status,
+                        "endpoint_discovery": discovery_status,
                         "finding_count": len(findings),
                     }),
                     "Assessment complete", json.dumps(tool_status), scan_id,
@@ -1352,6 +1457,7 @@ TOOL_CATALOG = {
     "whatweb": {"label": "WhatWeb", "binary": "whatweb", "package": "whatweb", "version_args": ["--version"], "purpose": "Technology fingerprinting"},
     "testssl": {"label": "testssl.sh", "binary": "testssl.sh", "package": "testssl.sh", "version_args": ["--version"], "purpose": "TLS and HTTPS configuration assessment"},
     "nuclei": {"label": "Nuclei", "binary": "nuclei", "package": "nuclei", "version_args": ["-version"], "purpose": "Template-based checks for known exposures and misconfigurations"},
+    "nikto": {"label": "Nikto", "binary": "nikto", "package": "nikto", "version_args": ["-Version"], "purpose": "Deep-profile checks for common web-server files and misconfigurations"},
 }
 
 
