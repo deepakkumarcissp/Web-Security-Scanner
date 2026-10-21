@@ -14,7 +14,7 @@ A community-first, local-first web application security scanner designed to help
 - **Backend:** Python + FastAPI
 - **Storage:** SQLite
 - **Reports:** CSV findings export with spreadsheet-formula injection mitigation
-- **Current scan behavior:** built-in passive HTTP/response-header checks; Standard/Deep scans perform bounded same-origin endpoint discovery and repeat low-impact header/cookie checks on discovered URLs; optional WhatWeb, Nuclei, testssl.sh, and OWASP ZAP passive integrations run when configured
+- **Current scan behavior:** Quick uses built-in passive HTTP/response-header checks; Standard adds bounded same-origin endpoint discovery, Nuclei safe-template checks, WhatWeb technology fingerprinting, and testssl.sh on HTTPS targets; Deep adds time-bounded Nikto web-server checks. OWASP ZAP passive integration runs only when its local API is configured and healthy.
 - **Scope:** only scan systems you own or have explicit authorization to assess
 
 ## What is this project?
