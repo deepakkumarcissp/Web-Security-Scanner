@@ -200,6 +200,24 @@ The current API includes the following main routes:
 
 API behavior can evolve as the MVP develops; consult the route definitions and tests when integrating clients.
 
+## Repeatable local OWASP Juice Shop validation
+
+The loopback-only smoke test starts a **Standard** assessment against an already-running local Juice Shop instance, waits for completion, and writes a timestamped JSON evidence report. It never starts containers, changes firewall rules, targets public hosts, or runs the Active profile. Keep the lab bound to loopback (for example, `127.0.0.1:1003:3000`).
+
+Prerequisites: Docker with Juice Shop running on loopback, and the DKCISSP scanner running locally (default `http://127.0.0.1:1005`). Then run:
+
+```bash
+python3 scripts/validate_juice_shop.py
+```
+
+For a different loopback port or a longer timeout:
+
+```bash
+python3 scripts/validate_juice_shop.py --target http://127.0.0.1:1003 --scanner http://127.0.0.1:1005 --timeout 900
+```
+
+Reports are written to `validation-reports/` (ignored by Git because scan output can contain target-specific evidence). A PASS means the API workflow completed; it does **not** mean every known Juice Shop issue was detected. The report includes the tool execution statuses and findings so detector benchmarks can be added without confusing scan completion with detection quality. The script rejects non-loopback scanner and target URLs. Do not change it to run Active scans automatically.
+
 ## Run tests
 
 ```bash
