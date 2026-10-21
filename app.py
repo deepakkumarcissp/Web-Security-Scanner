@@ -618,9 +618,21 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
             return [], {"status": "error", "reason": str(exc)[:300], "template_selection": selection_status}
 
         if not os.path.isfile(jsonl_path) or os.path.getsize(jsonl_path) == 0:
-            return [], {"status": "timeout" if timed_out else "error", "return_code": result.returncode,
+            if timed_out:
+                status = "timeout"
+                reason = "Nuclei reached its time limit before producing findings"
+            elif result.returncode == 0:
+                # Nuclei may omit the JSONL file entirely when there are no matches.
+                # A successful exit without a report is a clean zero-finding result,
+                # not a tool failure.
+                status = "completed"
+                reason = "Nuclei completed successfully and reported no matches"
+            else:
+                status = "error"
+                reason = "Nuclei exited non-zero without producing its JSONL report"
+            return [], {"status": status, "return_code": result.returncode,
                         "timeout_seconds": timeout_seconds if timed_out else None,
-                        "reason": "Nuclei reached its time limit before producing findings" if timed_out else "Nuclei did not produce its JSONL report",
+                        "reason": reason, "finding_count": 0, "partial_results_retained": False,
                         "template_selection": selection_status, "target_count": len(safe_targets),
                         "rate_limit_per_second": 5, "concurrency": 3,
                         "redirects_disabled": True, "interactsh_disabled": True}

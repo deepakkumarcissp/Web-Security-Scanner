@@ -229,6 +229,18 @@ def test_nuclei_timeout_is_reported(monkeypatch):
     assert status["interactsh_disabled"] is True
 
 
+def test_nuclei_success_without_jsonl_is_zero_findings_not_error(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/nuclei")
+    monkeypatch.setattr(app, "select_nuclei_templates", lambda max_templates=30: (["/tmp/safe-template.yaml"], {"status": "ready", "templates_selected": 1, "max_templates": max_templates}))
+    monkeypatch.setattr(app.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    findings, status = app.perform_nuclei_check("https://example.test")
+    assert findings == []
+    assert status["status"] == "completed"
+    assert status["finding_count"] == 0
+    assert "no matches" in status["reason"]
+
+
 def test_nuclei_timeout_retains_valid_partial_jsonl_findings(monkeypatch):
     import json
     import subprocess
