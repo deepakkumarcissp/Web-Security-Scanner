@@ -14,7 +14,7 @@ A community-first, local-first web application security scanner designed to help
 - **Backend:** Python + FastAPI
 - **Storage:** SQLite
 - **Reports:** CSV findings export with spreadsheet-formula injection mitigation
-- **Current scan behavior:** built-in passive HTTP/response-header checks, with an optional OWASP ZAP passive-alert adapter when a local ZAP API is running
+- **Current scan behavior:** built-in passive HTTP/response-header checks; Standard/Deep scans perform bounded same-origin endpoint discovery and repeat low-impact header/cookie checks on discovered URLs; optional WhatWeb, Nuclei, testssl.sh, and OWASP ZAP passive integrations run when configured
 - **Scope:** only scan systems you own or have explicit authorization to assess
 
 ## What is this project?
@@ -46,6 +46,15 @@ Built-in passive HTTP and response-header checks
       +----------------------------------------------+
       |
       v
+Bounded same-origin page discovery (Standard/Deep only)
+      |
+      v
+Passive header/cookie checks on discovered URLs
+      |
+      v
+Optional Nuclei / WhatWeb / testssl.sh / ZAP passive adapters
+      |
+      v
 Normalize findings, evidence, confidence, remediation
       |
       v
@@ -57,12 +66,13 @@ SQLite persistence
       +--> Scheduled scans (while the app process is running)
 ```
 
-The ZAP adapter does **not** launch a spider or active scan. The optional WhatWeb adapter runs only for Standard/Deep scans, uses aggression level 1, disables redirect following to prevent scope expansion, writes a temporary JSON report, and has a 30-second timeout. The optional `testssl.sh` adapter runs only for authorized HTTPS scans using the Standard or Deep profile, writes a temporary JSON report, and has a 75-second timeout. The optional Nuclei adapter runs for Standard/Deep profiles with an explicit three-template allowlist (`http-missing-security-headers`, `cookies-without-secure`, `cookies-without-httponly`), HTTP-only protocol filtering, a 3 requests/second rate cap, concurrency 1, 3-second per-request timeout, no retries, redirects disabled, and OAST/Interactsh disabled. Its run is capped at 30 seconds and results are parsed from a temporary JSONL report. If a binary is missing or a tool errors/times out, the scan summary records that status and built-in checks continue. The application must not imply that an external tool ran when it did not.
+Standard/Deep scans now discover up to 12 same-origin URLs, with a maximum link depth of two and a short per-request timeout. Discovery extracts links, resource URLs, and form actions but never submits forms or executes JavaScript; query strings are retained, and cross-origin links/redirects are rejected. Passive header/cookie checks are repeated on discovered URLs. This is a bounded link crawler, not a JavaScript renderer or authenticated crawler, so it will miss client-side routes and pages requiring login. The ZAP adapter does **not** launch a spider or active scan. The optional WhatWeb adapter runs only for Standard/Deep scans, uses aggression level 1, disables redirect following to prevent scope expansion, writes a temporary JSON report, and has a 30-second timeout. The optional `testssl.sh` adapter runs only for authorized HTTPS scans using the Standard or Deep profile, writes a temporary JSON report, and has a 75-second timeout. The optional Nuclei adapter runs for Standard/Deep profiles with an explicit three-template allowlist (`http-missing-security-headers`, `cookies-without-secure`, `cookies-without-httponly`), HTTP-only protocol filtering, a 3 requests/second rate cap, concurrency 1, 3-second per-request timeout, no retries, redirects disabled, and OAST/Interactsh disabled. Its run is capped at 30 seconds and results are parsed from a temporary JSONL report. If a binary is missing or a tool errors/times out, the scan summary records that status and built-in checks continue. The application must not imply that an external tool ran when it did not.
 
 ## Current capabilities
 
 - Risk-focused dashboard with summary cards, findings, and scan history
 - Built-in low-impact HTTP and response-header checks
+- Bounded same-origin endpoint discovery for Standard/Deep scans, followed by passive header/cookie checks across discovered URLs
 - Optional OWASP ZAP passive-alert retrieval from a local API
 - Scanner Setup page with real executable/version checks for supported tools
 - Allow-listed tool installation workflow with explicit user confirmation
