@@ -235,6 +235,23 @@ def test_nuclei_template_selector_excludes_high_risk_and_non_http_templates(tmp_
     assert "intrusive" in status["excluded_tags"]
 
 
+def test_nuclei_template_selection_balances_categories_before_filling_cap(tmp_path, monkeypatch):
+    root = tmp_path / "http"
+    root.mkdir()
+    categories = ["cve", "misconfig", "exposure", "ssl", "tech"]
+    for category in categories:
+        for index in range(3):
+            (root / f"{category}-{index}.yaml").write_text(
+                f"id: {category}-{index}\ninfo:\n  name: {category} check\n  severity: high\n  metadata:\n    max-request: 1\n  tags: {category}\nhttp:\n  - method: GET\n    path: [\"{{{{BaseURL}}}}/\"]\n"
+            )
+    monkeypatch.setenv("DKCISSP_NUCLEI_TEMPLATES", str(root))
+    selected, status = app.select_nuclei_templates(max_templates=5)
+    selected_ids = {Path(path).stem.split("-")[0] for path in selected}
+    assert selected_ids == set(categories)
+    assert status["templates_eligible"] == 15
+    assert status["templates_selected"] == 5
+
+
 def test_whatweb_reports_missing_binary(monkeypatch):
     monkeypatch.setattr(app.shutil, "which", lambda _binary: None)
     findings, status = app.perform_whatweb_check("https://example.test")
