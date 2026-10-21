@@ -560,3 +560,23 @@ def test_zap_diagnostics_rejects_invalid_endpoint(monkeypatch):
     monkeypatch.setenv("DKCISSP_ZAP_API_URL", "http://user:password@127.0.0.1:8080")
     result = app.diagnose_zap_api()
     assert result["status"] == "configuration_error"
+
+
+def test_endpoint_discovery_extracts_only_same_origin_http_urls():
+    base = "https://app.example.test/home"
+    html = '''<html><a href="/account">Account</a><a href="https://app.example.test/search?q=x#top">Search</a>
+      <a href="https://evil.example/steal">external</a><a href="//other.example.test/path">other host</a>
+      <a href="javascript:alert(1)">script</a><form action="/login"><input></form>
+      <script src="/assets/app.js"></script><a href="mailto:help@example.test">mail</a></html>'''
+    urls = app.extract_same_origin_links(base, html)
+    assert "https://app.example.test/account" in urls
+    assert "https://app.example.test/search?q=x" in urls
+    assert "https://app.example.test/login" in urls
+    assert "https://app.example.test/assets/app.js" in urls
+    assert all("evil.example" not in url and "other.example.test" not in url for url in urls)
+    assert all("javascript:" not in url and "mailto:" not in url and "#top" not in url for url in urls)
+
+
+def test_endpoint_discovery_does_not_cross_port_or_scheme():
+    html = '<a href="http://app.example.test/plain">http</a><a href="https://app.example.test:8443/admin">port</a>'
+    assert app.extract_same_origin_links("https://app.example.test/", html) == []

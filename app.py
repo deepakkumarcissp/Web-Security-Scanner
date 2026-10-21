@@ -16,8 +16,9 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse, urlencode
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse, urlencode, urljoin, urldefrag
+from html.parser import HTMLParser
+from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler, HTTPSHandler
 
 from fastapi import FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -186,6 +187,121 @@ def validate_target(raw: str) -> str:
     if any(ch in raw for ch in "\r\n\x00"):
         raise HTTPException(400, "Invalid URL characters")
     return raw.rstrip("/")
+
+
+class _PageLinkParser(HTMLParser):
+    """Extract navigational/resource URLs without executing page scripts."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        values = dict(attrs)
+        for key in ("href", "src", "action"):
+            value = values.get(key)
+            if value:
+                self.links.append(value.strip())
+
+
+def extract_same_origin_links(base_url: str, html: str) -> list[str]:
+    """Return normalized HTTP(S) links on the exact same origin as base_url."""
+    base = urlparse(base_url)
+    if base.scheme not in {"http", "https"} or not base.hostname:
+        return []
+    base_port = base.port or (443 if base.scheme == "https" else 80)
+    parser = _PageLinkParser()
+    try:
+        parser.feed(html[:500_000])
+    except Exception:
+        return []
+    found = []
+    seen = set()
+    for raw in parser.links:
+        if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
+            continue
+        absolute, _fragment = urldefrag(urljoin(base_url, raw))
+        parsed = urlparse(absolute)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            continue
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if parsed.scheme != base.scheme or parsed.hostname.lower().rstrip(".") != base.hostname.lower().rstrip(".") or port != base_port:
+            continue
+        # Drop fragments and normalize empty paths; retain query strings because they
+        # can identify distinct application routes/parameters.
+        normalized = parsed._replace(fragment="").geturl()
+        if normalized not in seen:
+            seen.add(normalized)
+            found.append(normalized)
+    return found
+
+
+class _SameOriginRedirectHandler(HTTPRedirectHandler):
+    """Reject redirects that would expand a passive scan beyond its starting origin."""
+    def __init__(self, origin_url: str):
+        super().__init__()
+        parsed = urlparse(origin_url)
+        self.scheme = parsed.scheme.lower()
+        self.hostname = (parsed.hostname or "").lower().rstrip(".")
+        self.port = parsed.port or (443 if self.scheme == "https" else 80)
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urlparse(newurl)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if (parsed.scheme.lower() != self.scheme or
+                (parsed.hostname or "").lower().rstrip(".") != self.hostname or port != self.port):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def same_origin_opener(origin_url: str):
+    return build_opener(_SameOriginRedirectHandler(origin_url), HTTPSHandler(context=ssl.create_default_context()))
+
+
+def discover_same_origin_pages(root_url: str, root_html: str, max_pages: int = 12, max_depth: int = 2) -> dict:
+    """Bounded, low-rate, same-origin page discovery; never submits forms or executes JS."""
+    root = root_url.rstrip("/") or root_url
+    root_origin = urlparse(root)
+    discovered = [root]
+    depths = {root: 0}
+    queue = [(url, 0) for url in extract_same_origin_links(root, root_html)]
+    seen = {root}
+    opener = same_origin_opener(root)
+    while queue and len(discovered) < max_pages:
+        url, depth = queue.pop(0)
+        if url in seen or depth > max_depth:
+            continue
+        seen.add(url)
+        parsed = urlparse(url)
+        root_port = root_origin.port or (443 if root_origin.scheme == "https" else 80)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if (parsed.scheme != root_origin.scheme or parsed.hostname != root_origin.hostname or port != root_port):
+            continue
+        request = Request(url, headers={"User-Agent": "DKCISSP-WebSecurityScanner/0.1 (+authorized passive discovery)",
+                                        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5"})
+        try:
+            with opener.open(request, timeout=4) as response:
+                final_url = response.geturl()
+                final = urlparse(final_url)
+                final_port = final.port or (443 if final.scheme == "https" else 80)
+                if (final.scheme != root_origin.scheme or final.hostname != root_origin.hostname or final_port != root_port):
+                    continue
+                content_type = response.headers.get("Content-Type", "").lower()
+                if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+                    discovered.append(url)
+                    depths[url] = depth
+                    time.sleep(0.2)
+                    continue
+                body = response.read(250_000).decode("utf-8", "replace")
+        except (HTTPError, URLError, TimeoutError, OSError, ssl.SSLError, ValueError):
+            continue
+        discovered.append(url)
+        depths[url] = depth
+        if depth < max_depth:
+            queue.extend((link, depth + 1) for link in extract_same_origin_links(url, body) if link not in seen)
+        time.sleep(0.2)
+    return {"urls": discovered[:max_pages], "pages_visited": max(0, len(discovered) - 1),
+            "max_pages": max_pages, "max_depth": max_depth,
+            "mode": "same-origin passive links only; forms not submitted; JavaScript not executed"}
 
 
 def add_finding(conn, scan_id, target, severity, title, url, evidence, remediation, confidence="High"):
@@ -515,6 +631,7 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
     findings = []
     tool_status = {
         "Built-in HTTP & headers": {"status": "running", "detail": "Requesting the supplied URL and inspecting response headers"},
+        "Endpoint discovery": {"status": "queued", "detail": "Waiting for the initial page response"},
         "Nuclei": {"status": "queued", "detail": "Waiting for built-in checks"},
         "WhatWeb": {"status": "queued", "detail": "Waiting for built-in checks"},
         "TLS (testssl.sh)": {"status": "queued", "detail": "Waiting for built-in checks"},
@@ -629,6 +746,48 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                     "Disable directory listing or restrict access.", "Medium",
                 )
 
+        discovery_status = {"status": "skipped", "reason": "Endpoint discovery is enabled for Standard/Deep scans only", "urls": [final_url]}
+        if profile in ("standard", "deep"):
+            tool_status["Endpoint discovery"] = {"status": "running", "detail": "Discovering same-origin links without submitting forms"}
+            update_scan_progress(scan_id, 27, "Discovering same-origin pages", tool_status)
+            discovery_status = discover_same_origin_pages(final_url, body)
+            discovered_urls = discovery_status.get("urls", [final_url])
+            tool_status["Endpoint discovery"] = {"status": "completed", "detail": f"Mapped {len(discovered_urls)} same-origin URL(s); bounded passive discovery"}
+            # Extend low-impact response-header checks to discovered pages. Each URL is
+            # fetched with a short timeout; only same-origin results are accepted.
+            root_parsed = urlparse(final_url)
+            root_port = root_parsed.port or (443 if root_parsed.scheme == "https" else 80)
+            for page_url in discovered_urls:
+                if page_url == final_url:
+                    continue
+                try:
+                    page_req = Request(page_url, headers={"User-Agent": "DKCISSP-WebSecurityScanner/0.1 (+authorized passive checks)", "Accept": "text/html,*/*;q=0.5"})
+                    with same_origin_opener(final_url).open(page_req, timeout=4) as page_response:
+                        page_final = urlparse(page_response.geturl())
+                        page_port = page_final.port or (443 if page_final.scheme == "https" else 80)
+                        if page_final.scheme != root_parsed.scheme or page_final.hostname != root_parsed.hostname or page_port != root_port:
+                            continue
+                        page_headers = {k.lower(): v for k, v in page_response.headers.items()}
+                        page_body = page_response.read(100_000).decode("utf-8", "replace")
+                        page_url_final = page_response.geturl()
+                    if page_url_final.startswith("https://") and "strict-transport-security" not in page_headers:
+                        findings.append(("Medium", "Strict-Transport-Security header missing", page_url_final, "HTTPS response does not include Strict-Transport-Security.", "Configure HSTS after confirming all required subdomains support HTTPS.", "High"))
+                    if "content-security-policy" not in page_headers:
+                        findings.append(("Medium", "Content-Security-Policy header missing", page_url_final, "Discovered same-origin response does not include Content-Security-Policy.", "Define and test a restrictive CSP appropriate to the application.", "High"))
+                    if page_headers.get("x-content-type-options", "").lower() != "nosniff":
+                        findings.append(("Low", "X-Content-Type-Options missing or weak", page_url_final, f"Observed: {page_headers.get('x-content-type-options', 'not present')}", "Set X-Content-Type-Options: nosniff.", "High"))
+                    if "referrer-policy" not in page_headers:
+                        findings.append(("Low", "Referrer-Policy header missing", page_url_final, "Discovered same-origin response does not include Referrer-Policy.", "Set an appropriate Referrer-Policy.", "High"))
+                    page_cookies = page_headers.get("set-cookie", "")
+                    if page_cookies and page_url_final.startswith("https://") and "secure" not in page_cookies.lower():
+                        findings.append(("Medium", "Cookie may lack Secure attribute", page_url_final, page_cookies[:220], "Set Secure on cookies that should only be sent over HTTPS.", "Medium"))
+                    if page_cookies and "httponly" not in page_cookies.lower():
+                        findings.append(("Low", "Cookie may lack HttpOnly attribute", page_url_final, page_cookies[:220], "Set HttpOnly for session cookies that do not require JavaScript access.", "Medium"))
+                    if re.search(r"<title>\s*Index of /", page_body, re.I):
+                        findings.append(("Medium", "Directory listing appears enabled", page_url_final, "Page title resembles a directory index. Validate manually before treating as confirmed.", "Disable directory listing or restrict access.", "Medium"))
+                except (HTTPError, URLError, TimeoutError, OSError, ssl.SSLError, ValueError):
+                    continue
+
         # If ZAP is configured locally, merge its passive-only alerts into the same finding store.
         # This remains optional; absence of ZAP never blocks the built-in scan.
         # testssl.sh is an optional, bounded HTTPS check. It is invoked without a shell,
@@ -688,7 +847,8 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                         "http_status": status_code, "final_url": final_url,
                         "checks": "passive HTTP/header checks plus optional WhatWeb, testssl.sh, and ZAP passive checks",
                         "tls_check": tls_status, "whatweb_check": whatweb_status,
-                        "nuclei_check": nuclei_status, "finding_count": len(findings),
+                        "nuclei_check": nuclei_status, "endpoint_discovery": discovery_status,
+                        "finding_count": len(findings),
                     }),
                     "Assessment complete", json.dumps(tool_status), scan_id,
                 ),
