@@ -514,7 +514,7 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
         # or payload-driven fuzzing in this bounded default profile.
         if re.search(r"(?im)^\s*method\s*:\s*['\"]?(POST|PUT|PATCH|DELETE|OPTIONS)\b", text):
             continue
-        if re.search(r"(?m)^(payloads|attack|raw)\s*:", text):
+        if re.search(r"(?m)^\s*(payloads|attack|raw)\s*:", text):
             continue
         id_match = re.search(r"(?m)^id\s*:\s*['\"]?([^\s'\"]+)", text)
         tags_match = re.search(r"(?m)^\s*tags\s*:\s*([^\n]+)", text)
