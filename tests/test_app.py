@@ -169,17 +169,18 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
     from types import SimpleNamespace
 
     monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/nuclei")
+    monkeypatch.setattr(app, "select_nuclei_templates", lambda: (["/tmp/safe-template.yaml"], {"status": "ready", "templates_selected": 1}))
 
     def fake_run(command, **kwargs):
         assert command[0] == "/usr/bin/nuclei"
-        assert command[command.index("-id") + 1] == "http-missing-security-headers,cookies-without-secure,cookies-without-httponly"
+        assert command[command.index("-templates") + 1].endswith("selected-templates.txt")
         assert command[command.index("-pt") + 1] == "http"
         assert command[command.index("-rl") + 1] == "3"
         assert command[command.index("-c") + 1] == "1"
         assert "-disable-redirects" in command
         assert "-no-interactsh" in command
         assert "-jsonl-export" in command
-        assert kwargs["timeout"] == 30
+        assert kwargs["timeout"] == 60
         report_path = command[command.index("-jsonl-export") + 1]
         records = [
             {"template-id": "tls-test", "matched-at": "https://example.test/", "info": {"name": "Weak TLS setting", "severity": "high", "remediation": "Enable secure TLS."}},
@@ -197,6 +198,9 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
     assert status["status"] == "completed"
     assert status["finding_count"] == 2
     assert status["malformed_records"] == 1
+    assert status["template_selection"]["status"] == "ready"
+    assert status["rate_limit_per_second"] == 3
+    assert status["interactsh_disabled"] is True
     assert findings[0][0] == "High"
     assert findings[0][1] == "Nuclei: Weak TLS setting"
     assert "template-id" not in findings[0][3]
@@ -206,10 +210,29 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
 def test_nuclei_timeout_is_reported(monkeypatch):
     import subprocess
     monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/nuclei")
-    monkeypatch.setattr(app.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("nuclei", 30)))
+    monkeypatch.setattr(app, "select_nuclei_templates", lambda: (["/tmp/safe-template.yaml"], {"status": "ready", "templates_selected": 1}))
+    monkeypatch.setattr(app.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired("nuclei", 60)))
     findings, status = app.perform_nuclei_check("https://example.test")
     assert findings == []
-    assert status == {"status": "timeout", "timeout_seconds": 30}
+    assert findings == []
+    assert status["status"] == "timeout"
+    assert status["timeout_seconds"] == 60
+    assert status["interactsh_disabled"] is True
+
+
+def test_nuclei_template_selector_excludes_high_risk_and_non_http_templates(tmp_path, monkeypatch):
+    import app
+    root = tmp_path / "http"
+    root.mkdir()
+    (root / "safe.yaml").write_text("id: safe-config\ninfo:\n  name: Safe config\n  severity: medium\n  metadata:\n    max-request: 2\n  tags: misconfig,headers\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n")
+    (root / "intrusive.yaml").write_text("id: risky-probe\ninfo:\n  name: Risky probe\n  severity: high\n  tags: cve,intrusive\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n")
+    (root / "too-many-requests.yaml").write_text("id: noisy-probe\ninfo:\n  name: Noisy probe\n  severity: high\n  metadata:\n    max-request: 10\n  tags: cve\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n")
+    (root / "headless.yaml").write_text("id: browser-check\ninfo:\n  name: Browser check\n  severity: low\n  tags: tech\nheadless:\n  - steps: []\n")
+    monkeypatch.setenv("DKCISSP_NUCLEI_TEMPLATES", str(root))
+    selected, status = app.select_nuclei_templates(max_templates=10)
+    assert selected == [str(root / "safe.yaml")]
+    assert status["templates_selected"] == 1
+    assert "intrusive" in status["excluded_tags"]
 
 
 def test_whatweb_reports_missing_binary(monkeypatch):

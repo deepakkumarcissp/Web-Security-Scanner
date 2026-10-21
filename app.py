@@ -470,21 +470,105 @@ def perform_testssl_check(target: str, timeout_seconds: int = 75) -> tuple[list[
 
 
 
-def perform_nuclei_check(target: str, timeout_seconds: int = 30) -> tuple[list[tuple], dict]:
-    """Run a bounded Nuclei pass using conservative, non-OAST template categories."""
+def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
+    """Select a bounded, locally installed set of low-impact HTTP templates.
+
+    Template tags alone are not a safety boundary. This selector also excludes
+    known intrusive categories, headless/flow/code templates, and templates that
+    declare more than five requests. A hard cap prevents a full community-template
+    corpus from making each assessment run for many minutes.
+    """
+    configured = os.environ.get("DKCISSP_NUCLEI_TEMPLATES", "").strip()
+    candidates = []
+    roots = [Path(configured).expanduser()] if configured else [
+        Path.home() / ".local" / "nuclei-templates" / "http",
+        Path.home() / "nuclei-templates" / "http",
+        Path("/root/nuclei-templates/http"),
+    ]
+    def is_directory(candidate: Path) -> bool:
+        try:
+            return candidate.is_dir()
+        except OSError:
+            return False
+    root = next((candidate for candidate in roots if is_directory(candidate)), None)
+    if root is None:
+        return [], {"status": "unavailable", "reason": "Local HTTP Nuclei templates were not found"}
+
+    allowed_tags = {"misconfig", "misconfiguration", "exposure", "headers", "ssl", "config", "token", "tech", "cve", "vulnerability", "panel", "discovery"}
+    excluded_tags = {"dos", "fuzz", "bruteforce", "brute-force", "intrusive", "headless", "token-spray", "default-login", "default-credentials", "filefuzz", "takeover"}
+    severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "unknown": 5}
+    category_rank = {"cve": 0, "vulnerability": 0, "misconfig": 1, "misconfiguration": 1, "exposure": 2, "ssl": 3, "headers": 4, "config": 5, "token": 6, "panel": 7, "tech": 8, "discovery": 9}
+    scanned = 0
+    for path in root.rglob("*.yaml"):
+        scanned += 1
+        if len(candidates) >= 5000:
+            break
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")[:12000]
+        except OSError:
+            continue
+        # Restrict to HTTP templates; reject flow/headless/code and templates
+        # carrying explicit high-risk tags or excessive request counts.
+        if not re.search(r"(?m)^http\s*:", text) or re.search(r"(?m)^(flow|headless|javascript|code)\s*:", text):
+            continue
+        # Do not execute state-changing HTTP methods, raw handcrafted requests,
+        # or payload-driven fuzzing in this bounded default profile.
+        if re.search(r"(?im)^\s*method\s*:\s*['\"]?(POST|PUT|PATCH|DELETE|OPTIONS)\b", text):
+            continue
+        if re.search(r"(?m)^(payloads|attack|raw)\s*:", text):
+            continue
+        id_match = re.search(r"(?m)^id\s*:\s*['\"]?([^\s'\"]+)", text)
+        tags_match = re.search(r"(?m)^\s*tags\s*:\s*([^\n]+)", text)
+        severity_match = re.search(r"(?m)^\s*severity\s*:\s*([^\s#]+)", text)
+        request_match = re.search(r"(?m)^\s*max-request\s*:\s*(\d+)", text)
+        if not id_match or not tags_match:
+            continue
+        tags = {tag.strip().lower() for tag in re.split(r"[,\s]+", tags_match.group(1).strip(" []\"'")) if tag.strip()}
+        if not (tags & allowed_tags) or tags & excluded_tags:
+            continue
+        max_requests = int(request_match.group(1)) if request_match else 1
+        if max_requests > 5:
+            continue
+        severity = (severity_match.group(1).strip("'\"").lower() if severity_match else "unknown")
+        priority = min((category_rank.get(tag, 99) for tag in tags), default=99)
+        candidates.append((severity_rank.get(severity, 5), priority, id_match.group(1), str(path), tags))
+
+    # Prefer higher-severity vulnerability/misconfiguration checks, then use stable
+    # identifiers for deterministic selection across runs on the same template set.
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    selected = candidates[:max_templates]
+    return [item[3] for item in selected], {
+        "status": "ready" if selected else "unavailable",
+        "template_root": str(root), "templates_considered": scanned,
+        "templates_eligible": len(candidates), "templates_selected": len(selected),
+        "max_templates": max_templates,
+        "selected_tags": sorted(allowed_tags), "excluded_tags": sorted(excluded_tags),
+        "selection_note": "Local HTTP templates only; excludes explicit high-risk tags, flow/headless/code templates, and templates declaring over five requests.",
+    }
+
+
+def perform_nuclei_check(target: str, timeout_seconds: int = 60) -> tuple[list[tuple], dict]:
+    """Run a bounded Nuclei pass over a curated local HTTP template subset."""
     binary = shutil.which(TOOL_CATALOG["nuclei"]["binary"])
     if not binary:
         return [], {"status": "unavailable", "reason": "Nuclei is not installed"}
+    selected_templates, selection_status = select_nuclei_templates()
+    if not selected_templates:
+        return [], {"status": "unavailable", "reason": selection_status.get("reason", "No templates passed the safety filter"),
+                    "template_selection": selection_status}
 
     findings: list[tuple] = []
     with tempfile.TemporaryDirectory(prefix="dkcissp-nuclei-") as temp_dir:
         jsonl_path = str(Path(temp_dir) / "results.jsonl")
+        templates_path = str(Path(temp_dir) / "selected-templates.txt")
+        with open(templates_path, "w", encoding="utf-8") as template_file:
+            template_file.write("\n".join(selected_templates) + "\n")
         command = [
             binary, "-target", target,
-            "-id", "http-missing-security-headers,cookies-without-secure,cookies-without-httponly",
+            "-templates", templates_path,
             "-pt", "http",
-            "-severity", "info,low,medium,high,critical",
-            "-rl", "3", "-c", "1", "-timeout", "3", "-retries", "0",
+            "-severity", "info,low,medium,high,critical,unknown",
+            "-rl", "3", "-c", "1", "-timeout", "5", "-retries", "0",
             "-duc", "-disable-redirects", "-no-interactsh", "-silent",
             "-jsonl-export", jsonl_path,
         ]
@@ -494,13 +578,15 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 30) -> tuple[list[t
                 check=False, env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"},
             )
         except subprocess.TimeoutExpired:
-            return [], {"status": "timeout", "timeout_seconds": timeout_seconds}
+            return [], {"status": "timeout", "timeout_seconds": timeout_seconds,
+                        "template_selection": selection_status, "rate_limit_per_second": 3,
+                        "concurrency": 1, "redirects_disabled": True, "interactsh_disabled": True}
         except OSError as exc:
-            return [], {"status": "error", "reason": str(exc)[:300]}
+            return [], {"status": "error", "reason": str(exc)[:300], "template_selection": selection_status}
 
         if not os.path.isfile(jsonl_path):
             return [], {"status": "error", "return_code": result.returncode,
-                        "reason": "Nuclei did not produce its JSONL report"}
+                        "reason": "Nuclei did not produce its JSONL report", "template_selection": selection_status}
         malformed = 0
         with open(jsonl_path, encoding="utf-8", errors="replace") as report_file:
             for line in report_file:
@@ -516,7 +602,7 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 30) -> tuple[list[t
                     continue
                 info = item.get("info") if isinstance(item.get("info"), dict) else {}
                 severity_raw = str(info.get("severity", "")).strip().lower()
-                severity_map = {"critical": "Critical", "high": "High", "medium": "Medium", "low": "Low", "info": "Info"}
+                severity_map = {"critical": "Critical", "high": "High", "medium": "Medium", "low": "Low", "info": "Info", "unknown": "Info"}
                 severity = severity_map.get(severity_raw)
                 if not severity:
                     continue
@@ -530,13 +616,11 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 30) -> tuple[list[t
                     evidence_parts.append(f"Matcher: {matcher}")
                 if isinstance(extracted, list) and extracted:
                     evidence_parts.append("Extracted: " + ", ".join(str(x)[:200] for x in extracted[:5]))
-                curl_command = str(item.get("curl-command") or "")
-                if curl_command:
+                if item.get("curl-command"):
                     evidence_parts.append("Request details omitted from stored evidence for safety.")
                 remediation = str(info.get("remediation") or "Review the template evidence, validate applicability, and apply the vendor-recommended fix.")[:1800]
                 findings.append((severity, "Nuclei: " + title, matched_at, "; ".join(evidence_parts)[:1800], remediation, "Medium"))
 
-    # Keep a stable, deterministic set of results even if templates emit duplicates.
     deduped = []
     seen = set()
     for finding in findings:
@@ -546,10 +630,9 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 30) -> tuple[list[t
             deduped.append(finding)
     return deduped, {"status": "completed" if result.returncode == 0 else "completed_with_warnings",
                      "return_code": result.returncode, "finding_count": len(deduped),
-                     "malformed_records": malformed,
-                     "template_ids": ["http-missing-security-headers", "cookies-without-secure", "cookies-without-httponly"],
+                     "malformed_records": malformed, "template_selection": selection_status,
                      "rate_limit_per_second": 3, "concurrency": 1, "redirects_disabled": True,
-                     "interactsh_disabled": True}
+                     "interactsh_disabled": True, "timeout_seconds": timeout_seconds}
 
 
 def perform_whatweb_check(target: str, timeout_seconds: int = 30) -> tuple[list[tuple], dict]:
