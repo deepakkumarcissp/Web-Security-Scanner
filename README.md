@@ -96,9 +96,9 @@ The Scanner Setup page checks tools independently of scan results. Availability 
 | `curl` | HTTP connectivity diagnostics | Detected/version checked by setup page |
 | WhatWeb | Technology fingerprinting | Invoked for Standard/Deep scans when installed; stealthy aggression level 1, no redirect following, bounded timeout, JSON findings normalization |
 | `testssl.sh` | TLS configuration assessment | Invoked for Standard/Deep HTTPS scans when installed; 75-second timeout and JSON report parsing; controlled local HTTPS execution validated |
-| Nuclei | Known exposure/misconfiguration template checks | Invoked for Standard/Deep scans; constrained tags, rate/concurrency caps, no redirects or OAST, 90-second timeout, JSONL parsing; controlled local execution validation in progress |
+| Nuclei | Known exposure/misconfiguration template checks | Invoked for Standard/Deep scans; selects at most 60 locally installed HTTP templates after filtering explicit high-risk tags, non-HTTP flows, state-changing methods, raw/payload-driven requests, and templates declaring over five requests; 3 requests/second, concurrency 1, redirects and OAST disabled, 60-second cap, JSONL parsing; controlled local execution passed |
 
-**Important distinction:** testssl.sh completed against a temporary local HTTPS target; that validates invocation and report parsing, not every TLS scenario. Nuclei is restricted to three explicit template IDs and bounded request/runtime settings; the selected IDs must exist in the locally installed template set. Quick scans do not invoke these optional integrations. WhatWeb runs only for Standard/Deep profiles at low aggression and records detected technologies as informational findings, not as confirmed vulnerabilities. Live WhatWeb behavior still needs validation against a controlled local lab.
+**Important distinction:** testssl.sh completed against a temporary local HTTPS target; that validates invocation and report parsing, not every TLS scenario. Nuclei selects a bounded local HTTP template set and completed a controlled local execution in about 22 seconds; that validates invocation and report handling, not broad vulnerability coverage or the safety of every third-party template. Quick scans do not invoke these optional integrations. WhatWeb runs only for Standard/Deep profiles at low aggression and records detected technologies as informational findings, not as confirmed vulnerabilities. Live WhatWeb behavior still needs validation against a controlled local lab.
 
 ### Tool installation safety
 
@@ -193,7 +193,7 @@ python -m pip install pytest httpx
 pytest -q
 ```
 
-The GitHub Actions workflow runs Python compilation and the automated test suite on Ubuntu/Python 3.11. CSV exports neutralize untrusted cell values that spreadsheet applications could interpret as formulas. CI does not prove a clean Kali install, browser-based end-to-end behavior, or live external scanner integrations. Before merging or announcing a release, follow the [Public-Release Verification Checklist](RELEASE_CHECKLIST.md). A running end-to-end OWASP ZAP scan still needs to be verified against an actual local ZAP service. Configure the API endpoint with `DKCISSP_ZAP_API_URL` (defaults to `http://127.0.0.1:8080`) and optionally set `DKCISSP_ZAP_API_KEY`; the key is never included in diagnostic response fields. A listening port alone is not proof that ZAP is running.
+The GitHub Actions workflow runs Python compilation and the automated test suite on Ubuntu/Python 3.11. CSV exports neutralize untrusted cell values that spreadsheet applications could interpret as formulas. CI does not prove a clean Kali install, browser-based end-to-end behavior, or live external scanner integrations. Before merging or announcing a release, follow the [Public-Release Verification Checklist](RELEASE_CHECKLIST.md). A running end-to-end OWASP ZAP scan still needs to be verified against an actual local ZAP service. Configure the API endpoint with `DKCISSP_ZAP_API_URL` (defaults to `http://127.0.0.1:8080`) and optionally set `DKCISSP_ZAP_API_KEY`; the key is never included in diagnostic response fields. On the Kali development machine, a dedicated ZAP daemon is configured on loopback port `8090`, with its API key stored in a user-only config file. Port `8080` is another service and is not modified. The daemon is configured for passive-alert retrieval only by this scanner; no ZAP spider or active scan is launched. A listening port alone is not proof that ZAP is running.
 
 ## Safety model
 
@@ -234,7 +234,7 @@ The roadmap is staged so each integration is independently testable and the UI s
 - [x] Allow-listed tool status/version checks
 - [x] Explicit-confirmation package installation flow
 - [x] Optional OWASP ZAP passive-alert adapter
-- [ ] Verify ZAP adapter against a running local ZAP service
+- [x] Verify ZAP adapter against a running local ZAP service and a controlled local HTTP fixture
 - [x] Improve ZAP service setup guidance and actionable diagnostics
 
 ### Phase 2 — Safe, modular scanner integrations
@@ -247,7 +247,7 @@ The roadmap is staged so each integration is independently testable and the UI s
 - [x] Add mocked integration-level tests for testssl.sh and WhatWeb outputs
 - [ ] Validate WhatWeb end-to-end against a controlled local target
 - [x] Add constrained Nuclei adapter with JSONL parsing and bounded execution
-- [ ] Validate Nuclei against a controlled local target and confirm template coverage
+- [x] Validate bounded Nuclei invocation/report parsing against a controlled local HTTP target; broader template coverage still requires benchmark testing
 - [ ] Connect scan profiles to clearly documented, real module sets
 
 ### Phase 3 — Scan operations and reporting

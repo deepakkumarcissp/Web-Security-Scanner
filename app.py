@@ -1374,6 +1374,12 @@ def scanner_tools_status() -> list[dict]:
             item["service_message"] = zap_api["message"]
             item["service_endpoint"] = zap_api.get("endpoint")
             item["service_version"] = zap_api.get("version")
+            # Some ZAP package launchers do not emit a usable CLI version string.
+            # A successful authenticated API version response is stronger evidence
+            # that the actual scanner service is ready than the launcher output.
+            if item["installed"] and zap_api["status"] == "ready":
+                item["status"] = "ready"
+                item["version"] = item["version"] or f"OWASP ZAP API {zap_api.get('version', 'available')}"
     return tools
 
 

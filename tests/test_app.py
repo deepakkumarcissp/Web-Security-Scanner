@@ -300,6 +300,20 @@ def test_tool_status_reports_allowlisted_integrations():
     assert all("status" in tool and "installed" in tool for tool in payload["tools"])
 
 
+def test_zap_api_readiness_overrides_unhelpful_launcher_version(monkeypatch):
+    monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/zaproxy" if binary == "zaproxy" else None)
+    monkeypatch.setattr(app, "_tool_version", lambda tool: None)
+    monkeypatch.setattr(app, "diagnose_zap_api", lambda: {
+        "status": "ready", "message": "OWASP ZAP API responded successfully.",
+        "endpoint": "http://127.0.0.1:8090", "version": "2.17.0",
+    })
+    tools = app.scanner_tools_status()
+    zap = next(tool for tool in tools if tool["id"] == "zaproxy")
+    assert zap["status"] == "ready"
+    assert zap["version"] == "OWASP ZAP API 2.17.0"
+    assert zap["service_status"] == "ready"
+
+
 def test_tool_install_requires_approval_and_allowlisted_id():
     denied = client.post("/api/tools/install/zaproxy", json={"approved": False})
     assert denied.status_code == 400
