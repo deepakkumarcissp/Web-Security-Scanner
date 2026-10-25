@@ -31,9 +31,9 @@ import yaml
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("DKCISSP_DB", ROOT / "data.sqlite3"))
 app = FastAPI(
-    title="DKCISSP Web Security Scanner",
+    title="DKCISSP External Attack Surface & Web Security Scanner",
     version="0.1.0",
-    description="Local-first web security checks, schedules, and CSV reports",
+    description="Local-first asset inventory, passive EASM discovery, and scoped web security assessment",
 )
 
 
@@ -1588,7 +1588,7 @@ def home():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "product": "DKCISSP Web Security Scanner", "version": app.version}
+    return {"status": "ok", "product": "DKCISSP External Attack Surface & Web Security Scanner", "version": app.version}
 
 
 @app.get("/api/dashboard")

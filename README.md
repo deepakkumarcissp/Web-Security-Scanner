@@ -1,9 +1,9 @@
-# DKCISSP Web Security Scanner
+# DKCISSP External Attack Surface & Web Security Scanner
 
 **DKCISSP — Where Security Becomes Simple.**  
 *Security Is Better Together.*
 
-A community-first, local-first web application security scanner designed to help security practitioners understand web exposure, prioritize findings, and track remediation from one dashboard. It is being built for Kali Linux first, with a clear path from safe passive checks toward carefully scoped, modular scanner integrations.
+A community-first, local-first security workbench with an emerging External Attack Surface Management (EASM) foundation and a modular web security assessment engine. It is being built for Kali Linux first. The current EASM beta manages explicitly registered roots, performs opt-in passive certificate-transparency discovery, and places discovered hostname candidates into a human-review queue before any scan.
 
 > **Project principle:** show what actually ran, show the evidence, explain the risk, and make remediation and retesting measurable. Never report a tool as working just because it is listed in the UI.
 
@@ -19,7 +19,7 @@ A community-first, local-first web application security scanner designed to help
 
 ## What is this project?
 
-The DKCISSP Web Security Scanner is intended to be a practical workbench for authorized web security assessments. Instead of making users jump between tool output, scan logs, and spreadsheets, the project brings target scans, findings, evidence, confidence, remediation guidance, scan history, schedules, and exports into a consistent workflow.
+DKCISSP combines an EASM asset-inventory foundation with a practical workbench for authorized web security assessments. Instead of making users jump between discovery sources, tool output, scan logs, and spreadsheets, the project is evolving toward one workflow for asset provenance, scope approval, assessment evidence, remediation guidance, scan history, and exports.
 
 The dashboard is risk-focused. Tool installation and integration health live on a separate **Scanner Setup** page so the main dashboard remains about the security posture and findings.
 
@@ -33,7 +33,23 @@ The dashboard is risk-focused. Tool installation and integration health live on 
 ## How it works
 
 ```text
-Authorized target
+Authorized root asset (explicitly registered)
+      |
+      v
+Opt-in passive certificate-transparency discovery
+      |
+      v
+Hostname candidate inventory (Needs Review; no scan starts)
+      |
+      v
+Human scope review + approval/change reference
+      |
+      v
+Approved asset → web assessment engine
+      |
+      +--> findings, evidence, remediation, retest/reporting
+
+Assessment engine (for an approved target)
       |
       v
 Create scan / choose profile
@@ -70,6 +86,7 @@ Standard/Deep scans now discover up to 12 same-origin URLs, with a maximum link 
 
 ## Current capabilities
 
+- **EASM foundation (beta):** explicit root-asset registration, passive certificate-transparency hostname discovery, source/provenance tracking, and a human-reviewed scope gate; discovered candidates do not trigger scans. DNS/ASN resolution, historical discovery, web fingerprinting, and exposure trends are not yet implemented in this scanner.
 - Risk-focused dashboard with summary cards, findings, and scan history
 - Built-in low-impact HTTP and response-header checks
 - Bounded same-origin endpoint discovery for Standard/Deep scans, followed by passive header/cookie checks across discovered URLs

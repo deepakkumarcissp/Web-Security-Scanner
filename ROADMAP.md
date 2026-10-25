@@ -1,6 +1,6 @@
 # DKCISSP Web Security Scanner — Engineering Roadmap
 
-**Goal:** turn the current local-first MVP into a reliable, repeatable, evidence-led scanner without overstating coverage.
+**Goal:** build DKCISSP as an asset-centric External Attack Surface Management (EASM) workbench, with the existing web scanner as its evidence-led assessment engine. Advance in small, tested steps without overstating coverage.
 
 ## Working rules
 
@@ -10,6 +10,21 @@
 - Do not restart/deploy the live service or merge a pull request as part of routine implementation.
 - Every finding must preserve source evidence, approved-origin validation, tool status, and clear confidence/severity semantics.
 - A passing smoke test means the workflow ran; only explicit expected-signal assertions count as detection validation.
+
+
+## EASM foundation — product direction
+
+**Baseline reference:** the AIAgent repository's `asm/asm_orchestrator.py` and `assessments/domain_recon.py`. Adapt the staged discovery → resolve → fingerprint → scope gate → assessment → reporting model; do not copy implementation wholesale or inherit automatic assessment defaults. See `EASM_FOUNDATION.md` for the review, gaps, guardrails, and delivery sequence.
+
+- [x] Review AIAgent ASM orchestration and broader domain-recon capability model.
+- [x] Document capability gaps, implementation stages, and security requirements for DKCISSP EASM.
+- [x] Expose the existing asset inventory as **Attack Surface (Beta)** while describing only capabilities that exist today.
+- [ ] Add organization/root-domain records and stronger canonical host identity without losing URL/port scope boundaries.
+- [ ] Add a discovery adapter contract and persist per-source status, provenance, timestamps, limits, and errors.
+- [ ] Add bounded DNS resolution as a distinct inventory stage, not implicit permission to probe/scan.
+- [ ] Add approved-only, low-impact HTTP/TLS fingerprinting and asset-change snapshots.
+
+**Non-negotiable gate:** passive discovery results remain `Needs Review`; no candidate is automatically scanned. Approval is auditable and tied to exact scope.
 
 ## Phase 1 — Regression safety and finding integrity
 **Status: In progress**
@@ -83,7 +98,8 @@
 
 - Latest regression implementation before current working changes: `b281bee` — controlled local HTTP fixture.
 - Commit `0fffdcd` blocks cross-origin redirects on the initial request; tests verify a second loopback port is never contacted.
-- Current uncommitted batch adds `tests/fixtures/controlled_http_expected_signals.json` and evaluator coverage for five declared signals; full suite: **100 passed**, 2 dependency deprecation warnings.
+- Commit `cdbb2cc` adds a controlled-HTTP expected-signal baseline and evaluator regression test; full suite: **100 passed**, 2 dependency deprecation warnings.
+- Current batch documents the AIAgent EASM reference architecture and exposes the existing inventory page as **Attack Surface (Beta)**; targeted asset/discovery tests: **7 passed**; full suite: **100 passed**; inline JavaScript syntax check passed.
 - Local Juice Shop Standard scan: **scan 31 PASS**, completed in 14.1 seconds; 7 same-origin URLs mapped, Nuclei completed, WhatWeb completed, and ZAP passive completed. Active Wapiti was correctly skipped.
 - Expected-signal evaluator: **PASS, 5/5 expected signals matched**, zero duplicate groups, three unmatched findings retained for human triage. This is 100% coverage of the five declared fixture signals only, not overall vulnerability detection coverage.
 - Full regression suite before the latest scope-hardening change: **98 passed**, 2 dependency deprecation warnings.

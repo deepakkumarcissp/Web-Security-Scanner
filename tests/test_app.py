@@ -679,10 +679,14 @@ def test_asset_inventory_ui_is_wired_to_scope_api():
     response = client.get("/")
     assert response.status_code == 200
     assert 'data-page="assets"' in response.text
+    nav = response.text.split('<nav class="nav">', 1)[1].split('</nav>', 1)[0]
+    assert '<button data-page="assets">' in nav
+    assert "Attack Surface (Beta)" in nav
     assert 'id="assetRows"' in response.text
     assert 'id="assetForm"' in response.text
     assert "loadAssets()" in response.text
     assert "New assets default to Needs Review" in response.text
+    assert "EASM foundation (beta)" in response.text
 
 
 
