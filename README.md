@@ -220,6 +220,18 @@ python3 scripts/validate_juice_shop.py --target http://127.0.0.1:1003 --scanner 
 
 Reports are written to `validation-reports/` (ignored by Git because scan output can contain target-specific evidence). A PASS means the API workflow completed; it does **not** mean every known Juice Shop issue was detected. The report includes the tool execution statuses and findings so detector benchmarks can be added without confusing scan completion with detection quality. The script rejects non-loopback scanner and target URLs. Do not change it to run Active scans automatically.
 
+### Evaluate expected-signal regression coverage
+
+Evaluate an existing report against the explicit baseline in `tests/fixtures/juice_shop_expected_signals.json` (four observed transport/header signals):
+
+```bash
+python3 scripts/evaluate_scan_baseline.py \
+  --report validation-reports/<scan-report>.json \
+  --output validation-reports/<scan-report>-evaluation.json
+```
+
+The evaluator fails if an expected signal is missing, reports duplicate findings by normalized title and affected URL, and lists unmatched findings for human triage. Unmatched findings are **not** automatically labeled false positives. The percentage covers only the four declared signals; it is not an overall vulnerability detection rate. Re-check the baseline if Juice Shop configuration or response headers change.
+
 ## Run tests
 
 ```bash

@@ -1,0 +1,28 @@
+{
+  "name": "DKCISSP loopback Juice Shop Standard-profile expected-signal baseline",
+  "version": 1,
+  "scope": "Deterministic built-in HTTP/header checks for a loopback HTTP target.",
+  "expected_signals": [
+    {
+      "id": "transport-http",
+      "description": "An HTTP target should produce the scanner's transport-encryption warning.",
+      "title_contains": "Target uses HTTP without transport encryption"
+    },
+    {
+      "id": "missing-csp",
+      "description": "The current Juice Shop lab response is expected to lack Content-Security-Policy.",
+      "title_contains": "Content-Security-Policy header missing"
+    },
+    {
+      "id": "missing-referrer-policy",
+      "description": "The current Juice Shop lab response is expected to lack Referrer-Policy.",
+      "title_contains": "Referrer-Policy header missing"
+    },
+    {
+      "id": "missing-permissions-policy",
+      "description": "The current Juice Shop lab response is expected to lack Permissions-Policy.",
+      "title_contains": "Permissions-Policy header missing"
+    }
+  ],
+  "coverage_boundary": "The expected-signal percentage applies only to these four observed lab configuration signals. It is not a vulnerability detection rate, and this baseline does not assert that all other findings are true or false positives. Revalidate these expectations if the lab configuration changes."
+}

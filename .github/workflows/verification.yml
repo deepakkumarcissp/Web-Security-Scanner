@@ -30,7 +30,7 @@ jobs:
           python -m pip install -r requirements.txt pytest httpx
 
       - name: Compile application, tests, and validation runner
-        run: python -m py_compile app.py tests/test_app.py tests/test_validation_runner.py scripts/validate_juice_shop.py
+        run: python -m py_compile app.py tests/test_app.py tests/test_validation_runner.py tests/test_scan_baseline.py scripts/validate_juice_shop.py scripts/evaluate_scan_baseline.py
 
       - name: Run automated tests
         run: pytest -q
