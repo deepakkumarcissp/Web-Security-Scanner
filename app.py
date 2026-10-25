@@ -25,6 +25,7 @@ from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler, 
 from fastapi import FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
+import yaml
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("DKCISSP_DB", ROOT / "data.sqlite3"))
@@ -629,44 +630,106 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
     for path in root.rglob("*.yaml"):
         scanned += 1
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")[:12000]
+            # Avoid parsing oversized/unrelated community templates. The quick
+            # checks are only a prefilter; accepted templates are still parsed.
+            if path.stat().st_size > 65536:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        # Restrict to HTTP templates; reject flow/headless/code and templates
-        # carrying explicit high-risk tags or excessive request counts.
-        if not re.search(r"(?m)^http\s*:", text) or re.search(r"(?m)^(flow|headless|javascript|code)\s*:", text):
+        if not re.search(r"(?m)^http\s*:", text):
             continue
-        # Do not execute state-changing HTTP methods, raw handcrafted requests,
-        # or payload-driven fuzzing in this bounded default profile.
+        if re.search(r"(?m)^(flow|headless|javascript|code|tcp|network|file|websocket|ssl)\s*:", text):
+            continue
+        if re.search(r"(?i)(interactsh|\boast\b|\bunsafe\b)", text):
+            continue
         if re.search(r"(?im)^\s*method\s*:\s*['\"]?(POST|PUT|PATCH|DELETE|OPTIONS)\b", text):
             continue
         if re.search(r"(?m)^\s*(payloads|attack|raw)\s*:", text):
             continue
-        id_match = re.search(r"(?m)^id\s*:\s*['\"]?([^\s'\"]+)", text)
-        tags_match = re.search(r"(?m)^\s*tags\s*:\s*([^\n]+)", text)
-        severity_match = re.search(r"(?m)^\s*severity\s*:\s*([^\s#]+)", text)
-        request_match = re.search(r"(?m)^\s*max-request\s*:\s*(\d+)", text)
-        if not id_match or not tags_match:
+        quick_tags = re.search(r"(?im)^\s*tags\s*:\s*([^\n]+)", text)
+        if not quick_tags:
             continue
-        tags = {tag.strip().lower() for tag in re.split(r"[,\s]+", tags_match.group(1).strip(" []\"'")) if tag.strip()}
-        # Reject risky aliases and mixed-tag templates before considering any
-        # positive tag; tag matching is not a substitute for a safety allowlist.
+        pre_tags = {tag.strip().lower() for tag in re.split(r"[,\s]+", quick_tags.group(1).strip(" []\"'")) if tag.strip()}
+        if not (pre_tags & allowed_tags) or pre_tags & excluded_tags:
+            continue
+        try:
+            # safe_load reads template structure without constructing arbitrary Python objects.
+            template = yaml.safe_load(text)
+        except (yaml.YAMLError, RecursionError):
+            continue
+        if not isinstance(template, dict):
+            continue
+        info = template.get("info") if isinstance(template.get("info"), dict) else {}
+        template_id = str(template.get("id") or "").strip()
+        raw_tags = info.get("tags", [])
+        if isinstance(raw_tags, str):
+            tags = {tag.strip().lower() for tag in re.split(r"[,\s]+", raw_tags) if tag.strip()}
+        elif isinstance(raw_tags, list):
+            tags = {str(tag).strip().lower() for tag in raw_tags if str(tag).strip()}
+        else:
+            continue
+        if not template_id or not tags:
+            continue
+        # Only ordinary HTTP templates are in the default profile. Reject all
+        # alternate execution engines and request forms that are hard to bound.
+        if not isinstance(template.get("http"), list) or not template["http"]:
+            continue
+        if any(key in template for key in ("flow", "headless", "javascript", "code", "tcp", "network", "file", "websocket", "ssl")):
+            continue
+        if re.search(r"(?i)(interactsh|\boast\b|\bunsafe\b)", text):
+            continue
+        # A state-changing method or raw/payload-driven request is out of scope
+        # for the default profile, regardless of how benign its tags look.
+        if re.search(r"(?im)^\s*method\s*:\s*['\"]?(POST|PUT|PATCH|DELETE|OPTIONS)\b", text):
+            continue
+        if re.search(r"(?m)^\s*(payloads|attack|raw)\s*:", text):
+            continue
         if not (tags & allowed_tags) or tags & excluded_tags:
             continue
-        # Keep templates that use external callback infrastructure out of the
-        # default profile even though the runtime also disables Interactsh.
-        if re.search(r"(?i)(interactsh|\boast\b|\bunsafe\b|\bcode\b)", text):
-            continue
-        max_requests = int(request_match.group(1)) if request_match else 1
-        if max_requests > 5:
-            continue
-        severity = (severity_match.group(1).strip("'\"").lower() if severity_match else "unknown")
-        primary_category = next((tag for tag in category_order if tag in tags), "other")
-        candidates.append((primary_category, severity_rank.get(severity, 5), id_match.group(1), str(path), tags))
 
-    # Balance categories first so a large number of CVE templates cannot crowd out
-    # configuration, exposure, TLS/header, and technology checks. Within each group,
-    # higher-severity templates are selected first and identifiers keep selection stable.
+        metadata = info.get("metadata") if isinstance(info.get("metadata"), dict) else {}
+        declared_max = metadata.get("max-request", metadata.get("max-request-count", 0))
+        try:
+            declared_max = int(declared_max or 0)
+        except (TypeError, ValueError):
+            continue
+        if declared_max > 5:
+            continue
+
+        # Estimate requests from the parsed HTTP blocks and path lists. Templates
+        # with more than five possible path requests are excluded even if they omit
+        # Nuclei's optional max-request metadata.
+        request_estimate = 0
+        request_shape_safe = True
+        for request in template["http"]:
+            if not isinstance(request, dict):
+                request_shape_safe = False
+                break
+            paths = request.get("path", [])
+            if isinstance(paths, str):
+                path_count = 1
+            elif isinstance(paths, list):
+                path_count = len(paths)
+            else:
+                request_shape_safe = False
+                break
+            if path_count < 1:
+                request_shape_safe = False
+                break
+            request_estimate += path_count
+            if request_estimate > 5:
+                break
+        if not request_shape_safe or request_estimate > 5:
+            continue
+
+        severity = str(info.get("severity", "unknown")).strip().lower()
+        primary_category = next((tag for tag in category_order if tag in tags), "other")
+        candidates.append((primary_category, severity_rank.get(severity, 5), template_id, str(path), tags))
+
+    # Balance allowed low-impact categories so one large family cannot crowd out
+    # configuration, exposure, TLS/header, technology, and discovery checks. Within
+    # each group, higher-severity templates are selected first with stable IDs.
     groups = {}
     for candidate in candidates:
         groups.setdefault(candidate[0], []).append(candidate)
@@ -690,7 +753,7 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
         "templates_eligible": len(candidates), "templates_selected": len(selected),
         "max_templates": max_templates,
         "selected_tags": sorted(allowed_tags), "excluded_tags": sorted(excluded_tags),
-        "selection_note": "Low-impact HTTP configuration, exposure, TLS/header, technology, and discovery templates only; rejects exploit/CVE classes, mixed-risk tags, external callbacks, flow/headless/code templates, state-changing methods, payload fuzzing, and templates declaring over five requests.",
+        "selection_note": "Parsed YAML HTTP templates for low-impact configuration, exposure, TLS/header, technology, and discovery only; rejects exploit/CVE classes, mixed-risk tags, external callbacks, alternate execution engines, state-changing methods, payload fuzzing, and templates with over five estimated path requests.",
     }
 
 
