@@ -64,3 +64,14 @@ The scanner adapter's current Wapiti module list includes sql and xss, but its f
 - Do not claim broad SQLi/XSS coverage from these narrow cases. Stored XSS, blind/time-based SQLi, authenticated flows, framework contexts, and false-positive behavior remain out of scope.
 - SQLi remains **unverified** until a database-backed local fixture or a known vulnerable lab input produces a reproducible expected finding with useful evidence.
 - XSS has one observed reflected-XSS hit in direct Wapiti; the full DKCISSP adapter path and broader XSS contexts remain unverified.
+
+
+## Follow-up: known SQLi behavior in Juice Shop login API
+
+A controlled manual request was made on 2026-10-25 to the loopback-only lab endpoint `POST http://127.0.0.1:1003/rest/user/login`. A normal invalid account returned HTTP 401, while a classic SQL-injection test value in the JSON `email` field with an invalid password returned HTTP 200 and an authentication response. The response token was not retained in the repository or documentation. This is evidence that this local training app exposes an expected-positive SQLi behavior at that endpoint; it is not evidence that DKCISSP or Wapiti detected it.
+
+A targeted Wapiti attempt against that endpoint used Wapiti's `--data` option, which sends URL-encoded form data. The Juice Shop endpoint expects JSON, so this was a mismatched request format. Wapiti logged an HTTP 500 anomaly, reported no SQL Injection or Blind SQL Injection findings, and exited with code 0. This attempt is therefore **inconclusive**, not a positive detection and not a valid negative benchmark.
+
+### Next engineering step
+
+The current DKCISSP Wapiti adapter crawls pages and query/form parameters; it does not currently accept an explicit JSON request body or an OpenAPI/Swagger definition. Add a safe, opt-in API test path (preferably OpenAPI-driven or an explicitly configured JSON request) with strict same-origin/loopback scope checks, then run it against this known local Juice Shop endpoint. Only mark SQLi implemented after the adapter produces a reproducible finding with the affected endpoint, parameter, and evidence, and regression tests cover both positive and control cases. Keep the general SQLi coverage status **unverified** until that is complete.
