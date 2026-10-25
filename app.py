@@ -667,6 +667,11 @@ def perform_zap_passive_check(target: str, targets: list[str] | None = None) -> 
             evidence_parts.append("Parameter: " + str(alert.get("param", "")))
         evidence = " ".join(part for part in evidence_parts if part)[:1800] or "Reported by OWASP ZAP passive scanner."
         remediation = str(alert.get("solution", "") or "Review the ZAP alert and validate its applicability.")[:1800]
+        # ZAP uses a broad CORS alert name. Preserve its reported severity, but make
+        # clear that a wildcard origin alone is not proof of exploitable data access.
+        if "cross-domain misconfiguration" in title.casefold() and "access-control-allow-origin" in str(alert.get("evidence", "")).casefold():
+            evidence = (evidence + " Validation note: a wildcard CORS origin alone does not prove exploitable exposure; verify whether sensitive responses are readable cross-origin and whether credentialed requests are accepted.")[:1800]
+            remediation = (remediation.rstrip() + " Validate the policy on sensitive endpoints; allow only required trusted origins, and review credentialed CORS behavior. Do not treat a wildcard header by itself as proof of data exposure.")[:1800]
         confidence = str(alert.get("confidence", "Medium"))
         normalized.append((severity, "OWASP ZAP: " + title, alert_url[:2048], evidence, remediation, confidence))
 
@@ -1320,13 +1325,14 @@ def perform_whatweb_check(target: str, timeout_seconds: int = 30) -> tuple[list[
             evidence = "Technology/plugin detected: " + name
             if version_values:
                 evidence += "; observed version: " + ", ".join(version_values[:3])
+            evidence += "; classification: informational technology inventory signal, not a confirmed vulnerability"
             key = (name.lower(), tuple(version_values[:3]))
             if key in seen_plugins:
                 continue
             seen_plugins.add(key)
             findings.append(("Info", "WhatWeb technology detected: " + name,
                              str(entry.get("target") or target)[:1000], evidence[:1800],
-                             "Confirm whether this technology and version are expected; keep components patched and minimize unnecessary disclosure.",
+                             "Inventory signal only—not a vulnerability finding by itself. Confirm whether this component/version is expected, check vendor support and patch status, and minimize unnecessary version disclosure.",
                              "Low"))
 
     return findings, {"status": "completed" if result.returncode == 0 else "completed_with_warnings",

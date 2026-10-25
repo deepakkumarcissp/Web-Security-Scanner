@@ -534,6 +534,8 @@ def test_whatweb_parses_technology_findings_with_bounded_subprocess(monkeypatch)
         "WhatWeb technology detected: WordPress", "WhatWeb technology detected: PHP"
     }
     assert all(finding[0] == "Info" and finding[5] == "Low" for finding in findings)
+    assert all("not a confirmed vulnerability" in finding[3] for finding in findings)
+    assert all("Inventory signal only—not a vulnerability finding by itself" in finding[4] for finding in findings)
     assert not any(title.endswith(("HTML5", "Script", "UncommonHeaders", "X-Frame-Options"))
                    for _severity, title, *_rest in findings)
 
@@ -1560,6 +1562,8 @@ def test_zap_cors_alert_preserves_credential_evidence_and_filters_other_origins(
     assert cors[2] == "http://app.example.test/api/profile"
     assert "Access-Control-Allow-Origin: *" in cors[3]
     assert "Access-Control-Allow-Credentials: true" in cors[3]
+    assert "wildcard CORS origin alone does not prove exploitable exposure" in cors[3]
+    assert "Validate the policy on sensitive endpoints" in cors[4]
     assert "attacker.invalid" not in str(findings)
 
 
