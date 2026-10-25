@@ -667,6 +667,14 @@ def test_asset_inventory_requires_explicit_authorization():
     assert "authorized" in response.json()["detail"].lower()
 
 
+def test_finding_deduplication_preserves_distinct_evidence_and_urls():
+    base = ("Medium", "Missing header", "https://example.test/", "Header absent", "Add header", "Medium")
+    whitespace_duplicate = (" medium ", "Missing header", "https://example.test/", " Header absent ", "Add header", "Medium")
+    different_evidence = ("Medium", "Missing header", "https://example.test/", "Header absent on second response", "Add header", "Medium")
+    different_url = ("Medium", "Missing header", "https://example.test/account", "Header absent", "Add header", "Medium")
+    assert app.deduplicate_findings([base, whitespace_duplicate, different_evidence, different_url]) == [base, different_evidence, different_url]
+
+
 def test_asset_inventory_normalizes_and_deduplicates_target():
     from uuid import uuid4
     hostname = f"inventory-{uuid4().hex}.example"

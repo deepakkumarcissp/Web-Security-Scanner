@@ -501,6 +501,23 @@ def discover_same_origin_pages(root_url: str, root_html: str, max_pages: int = 1
             "mode": "same-origin passive links only; forms not submitted; JavaScript not executed"}
 
 
+def deduplicate_findings(findings):
+    """Remove exact duplicate observations without discarding distinct evidence."""
+    deduped = []
+    seen = set()
+    for item in findings:
+        if len(item) < 6:
+            key = ("legacy", repr(item))
+        else:
+            severity, title, affected_url, evidence, remediation, confidence = item[:6]
+            normalize = lambda value: " ".join(str(value or "").split()).casefold()
+            key = tuple(normalize(value) for value in (severity, title, affected_url, evidence, remediation, confidence))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(item)
+    return deduped
+
+
 def add_finding(conn, scan_id, target, severity, title, url, evidence, remediation, confidence="High"):
     conn.execute(
         """INSERT INTO findings
@@ -1576,14 +1593,7 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             tool_status["Wapiti active checks"] = {"status": "skipped", "detail": "Requires the separate Active profile and explicit approval"}
 
         update_scan_progress(scan_id, 97, "Combining and deduplicating findings", tool_status)
-        deduped = []
-        seen = set()
-        for item in findings:
-            key = (item[0], item[1], item[2])
-            if key not in seen:
-                seen.add(key)
-                deduped.append(item)
-        findings = deduped
+        findings = deduplicate_findings(findings)
 
         with connect() as conn:
             for item in findings:

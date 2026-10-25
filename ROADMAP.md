@@ -131,3 +131,5 @@ The roadmap is intentionally evidence-gated. Do not claim broad detection covera
 
 
 - **Passive discovery expansion:** added an explicit Wayback CDX source with bounded responses/timeouts and hostname boundary validation, shared run-history tracking, and a separate dashboard action. Candidate assets remain Needs Review; no archived pages or candidate hosts are fetched.
+
+- **Finding quality checkpoint:** finding deduplication now removes only normalized exact duplicates across severity, title, affected URL, evidence, remediation, and confidence. Distinct evidence and URLs remain independently reportable. Regression test covers whitespace/case normalization and preservation of distinct observations. Validation: 120 tests passed; two dependency deprecation warnings remain.
