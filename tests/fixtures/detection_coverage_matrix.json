@@ -161,7 +161,7 @@
     {
       "id": "server-misconfiguration",
       "name": "Broader web-server misconfiguration checks",
-      "status": "planned",
+      "status": "implemented",
       "profiles": [
         "deep"
       ],
@@ -175,7 +175,7 @@
         "Stock-page signatures are low-confidence inventory signals and may be intentionally deployed.",
         "Current checks do not yet constitute a complete server-misconfiguration benchmark."
       ],
-      "next_action": "Add further controlled server-configuration cases, then continue to the local SQL injection and XSS benchmarks."
+      "next_action": "Add further controlled server-configuration cases; keep the category incomplete until a broader expected-signal benchmark is recorded."
     },
     {
       "id": "sql-injection",
@@ -184,11 +184,13 @@
       "profiles": [
         "active"
       ],
-      "evidence": [],
-      "known_gaps": [
-        "No dedicated repeatable expected-signal benchmark is currently registered in this matrix."
+      "evidence": [
+        "tests/test_wapiti_vulnerability_signals.py"
       ],
-      "next_action": "Create a local-only deliberately vulnerable fixture and validate the selected tool adapter and evidence quality before claiming support."
+      "known_gaps": [
+        "Parser normalization has regression coverage, but no live local fixture benchmark has demonstrated actual SQL injection detection or measured misses."
+      ],
+      "next_action": "Run the bounded Wapiti adapter against a deliberately vulnerable loopback-only fixture and record hits, misses, evidence quality, runtime, and tool failures."
     },
     {
       "id": "cross-site-scripting",
@@ -197,11 +199,13 @@
       "profiles": [
         "active"
       ],
-      "evidence": [],
-      "known_gaps": [
-        "A prior controlled reflected-XSS exercise does not establish broad XSS coverage across contexts or frameworks."
+      "evidence": [
+        "tests/test_wapiti_vulnerability_signals.py"
       ],
-      "next_action": "Create local controlled reflected and stored-XSS cases and measure which cases are detected, missed, or misclassified."
+      "known_gaps": [
+        "Parser normalization has regression coverage, but no live local fixture benchmark has demonstrated actual reflected or stored XSS detection or measured misses."
+      ],
+      "next_action": "Run the bounded Wapiti adapter against controlled loopback-only reflected and stored-XSS fixtures; record hits, misses, evidence quality, and scope behavior."
     },
     {
       "id": "api-security",

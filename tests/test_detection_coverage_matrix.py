@@ -44,3 +44,15 @@ def test_coverage_document_warns_against_unjustified_overall_claims():
     assert matrix["coverage_policy"]["unmatched_findings_policy"].startswith(
         "Unmatched findings remain for human triage"
     )
+
+
+def test_sql_injection_and_xss_remain_unverified_until_detection_benchmarks_run():
+    matrix = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
+    categories = {item["id"]: item for item in matrix["categories"]}
+
+    assert categories["server-misconfiguration"]["status"] == "implemented"
+    for category_id in ("sql-injection", "cross-site-scripting"):
+        category = categories[category_id]
+        assert category["status"] == "unverified"
+        assert "tests/test_wapiti_vulnerability_signals.py" in category["evidence"]
+        assert "benchmark" in category["next_action"].lower() or "fixture" in category["next_action"].lower()

@@ -15,9 +15,9 @@ This document is the human-readable companion to `tests/fixtures/detection_cover
 |---|---|---|---|
 | P0 | Detection baseline integrity | In progress | Keep each expected signal tied to a deterministic fixture and report coverage boundaries clearly. |
 | P0 | Scope enforcement | Validated | Add a scope regression test for every new external tool adapter. |
-| P1 | Web-server misconfiguration | In progress | Root directory-listing, stock-page signatures, and bounded OPTIONS/Allow method observations have helper and scan-level regression coverage. The broader category remains incomplete pending further controlled server-configuration cases. |
-| P1 | SQL injection | Unverified | Local deliberately vulnerable fixture with expected detection and miss cases. |
-| P1 | Cross-site scripting | Unverified | Separate reflected/stored cases and evidence-quality checks; a single reflected case is not broad coverage. |
+| P1 | Web-server misconfiguration | Implemented | Root directory-listing, stock-page signatures, and bounded OPTIONS/Allow method observations have helper and scan-level regression coverage. The broader category remains incomplete pending further controlled server-configuration cases. |
+| P1 | SQL injection | Unverified | Parser normalization tests exist; run a loopback-only deliberately vulnerable fixture to prove actual detection and record misses. |
+| P1 | Cross-site scripting | Unverified | Parser normalization tests exist; run controlled loopback-only reflected/stored cases and record hits, misses, and evidence quality. |
 | P1 | API security | Planned | Local API fixture with explicit role, authentication, and authorization expectations. |
 | P2 | Authenticated assessment | Planned | Credential-safe login/session design with explicit scope and secret redaction. |
 | P2 | Network/infrastructure assessment | Planned | Separate authorization model and controlled host/service lab. |
@@ -32,6 +32,10 @@ This document is the human-readable companion to `tests/fixtures/detection_cover
 6. Report per-category results. Do not combine unrelated categories into a single headline coverage percentage.
 7. Do not claim a vulnerability class is comprehensively supported because one example was detected.
 8. Run external scans only with explicit authorization and bounded approved scope.
+
+## Important distinction: parser tests versus detection benchmarks
+
+`tests/test_wapiti_vulnerability_signals.py` verifies how sample Wapiti SQL injection and XSS report records are normalized, deduplicated, scoped, and assigned severity/evidence. It does **not** prove that Wapiti discovers those vulnerabilities on a live target. SQL injection and XSS therefore remain **unverified** until a controlled loopback-only benchmark records expected hits and misses.
 
 ## Existing benchmark suites
 
