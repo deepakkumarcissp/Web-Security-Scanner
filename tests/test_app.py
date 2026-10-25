@@ -520,14 +520,29 @@ def test_dashboard_renders_with_schedule_and_report_navigation():
 
 
 
-def test_tool_status_reports_allowlisted_integrations():
+def test_tool_status_reports_expanded_capability_registry():
     response = client.get("/api/tools")
     assert response.status_code == 200
     payload = response.json()
-    assert {tool["id"] for tool in payload["tools"]} == {
-        "curl", "zaproxy", "whatweb", "testssl", "nuclei", "nikto", "wapiti"
-    }
+    tools = {tool["id"]: tool for tool in payload["tools"]}
+    assert {"curl", "zaproxy", "whatweb", "testssl", "nuclei", "nikto", "wapiti"}.issubset(tools)
+    assert {"nmap", "katana", "ffuf", "dirsearch", "gobuster", "feroxbuster", "sqlmap", "wpscan", "sslscan", "amass", "subfinder", "dnsx", "httpx", "dalfox", "arjun", "commix", "joomscan", "wafw00f", "gitleaks"}.issubset(tools)
     assert all("status" in tool and "installed" in tool for tool in payload["tools"])
+    assert all("capabilities" in tool and "risk" in tool and "integration" in tool for tool in payload["tools"])
+    assert payload["inventory_count"] == len(tools)
+    assert "known_vulnerabilities" in tools["nuclei"]["capabilities"]
+    assert "sql_injection" in payload["capability_map"]
+    assert any(item["tool_id"] == "sqlmap" for item in payload["capability_map"]["sql_injection"])
+    assert tools["sqlmap"]["risk"] == "intrusive_requires_explicit_approval"
+    assert tools["httpx"]["installable"] is False
+
+
+def test_tool_capability_registry_never_executes_inventory_only_tools_by_claim():
+    response = client.get("/api/tools")
+    tools = {tool["id"]: tool for tool in response.json()["tools"]}
+    assert tools["katana"]["integration"] == "inventory_only"
+    assert tools["ffuf"]["integration"] == "inventory_only"
+    assert tools["sqlmap"]["integration"] == "manual_only"
 
 
 def test_zap_api_readiness_overrides_unhelpful_launcher_version(monkeypatch):
@@ -549,6 +564,12 @@ def test_tool_install_requires_approval_and_allowlisted_id():
     assert denied.status_code == 400
     unknown = client.post("/api/tools/install/not-allowlisted", json={"approved": True})
     assert unknown.status_code == 404
+
+
+def test_tool_install_refuses_unverified_package_mapping():
+    response = client.post("/api/tools/install/httpx", json={"approved": True})
+    assert response.status_code == 400
+    assert "verified" in response.json()["detail"].lower() or "conflicts" in response.json()["detail"].lower()
 
 
 def test_tool_setup_page_is_separate_from_risk_dashboard():

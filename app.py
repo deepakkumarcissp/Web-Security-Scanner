@@ -2005,14 +2005,78 @@ def delete_schedule(schedule_id: int):
 
 # Scanner-tool management is deliberately allow-listed. No user-supplied shell commands.
 TOOL_CATALOG = {
-    "curl": {"label": "curl", "binary": "curl", "package": "curl", "version_args": ["--version"], "purpose": "HTTP connectivity and endpoint diagnostics"},
-    "zaproxy": {"label": "OWASP ZAP", "binary": "zaproxy", "package": "zaproxy", "version_args": ["-version"], "purpose": "Web crawler and passive security scanner"},
-    "whatweb": {"label": "WhatWeb", "binary": "whatweb", "package": "whatweb", "version_args": ["--version"], "purpose": "Technology fingerprinting"},
-    "testssl": {"label": "testssl.sh", "binary": "testssl.sh", "package": "testssl.sh", "version_args": ["--version"], "purpose": "TLS and HTTPS configuration assessment"},
-    "nuclei": {"label": "Nuclei", "binary": "nuclei", "package": "nuclei", "version_args": ["-version"], "purpose": "Template-based checks for known exposures and misconfigurations"},
-    "nikto": {"label": "Nikto", "binary": "nikto", "package": "nikto", "version_args": ["-Version"], "purpose": "Deep-profile checks for common web-server files and misconfigurations"},
-    "wapiti": {"label": "Wapiti", "binary": "wapiti", "package": "wapiti", "version_args": ["--version"], "purpose": "Explicitly approved active tests for web-application vulnerabilities"},
+    # Existing scanner integrations. A registered tool is not necessarily run in every profile.
+    "curl": {"label": "curl", "binary": "curl", "package": "curl", "version_args": ["--version"], "purpose": "HTTP connectivity and endpoint diagnostics", "capabilities": ["http_diagnostics"], "risk": "passive", "integration": "integrated", "installable": True},
+    "zaproxy": {"label": "OWASP ZAP", "binary": "zaproxy", "package": "zaproxy", "version_args": ["-version"], "purpose": "Web application security rules and passive alerts", "capabilities": ["web_app", "passive_checks", "api_security"], "risk": "passive_by_default", "integration": "integrated", "installable": True},
+    "whatweb": {"label": "WhatWeb", "binary": "whatweb", "package": "whatweb", "version_args": ["--version"], "purpose": "Technology fingerprinting", "capabilities": ["technology_fingerprinting", "cms_detection"], "risk": "passive", "integration": "integrated", "installable": True},
+    "testssl": {"label": "testssl.sh", "binary": "testssl.sh", "package": "testssl.sh", "version_args": ["--version"], "purpose": "TLS and HTTPS configuration assessment", "capabilities": ["tls", "https_configuration"], "risk": "low_impact", "integration": "integrated", "installable": True},
+    "nuclei": {"label": "Nuclei", "binary": "nuclei", "package": "nuclei", "version_args": ["-version"], "purpose": "Template-based checks for known exposures and misconfigurations", "capabilities": ["known_vulnerabilities", "misconfiguration", "exposure_detection"], "risk": "curated_templates_only", "integration": "integrated", "installable": True},
+    "nikto": {"label": "Nikto", "binary": "nikto", "package": "nikto", "version_args": ["-Version"], "purpose": "Web-server files and misconfiguration checks", "capabilities": ["web_server", "exposed_files", "misconfiguration"], "risk": "low_to_moderate_request_volume", "integration": "integrated_deep_profile", "installable": True},
+    "wapiti": {"label": "Wapiti", "binary": "wapiti", "package": "wapiti", "version_args": ["--version"], "purpose": "Active web-application vulnerability tests", "capabilities": ["web_app_active", "injection_testing"], "risk": "active_requires_approval", "integration": "explicit_active_profile", "installable": True},
+    # Expanded Kali inventory. These are capability candidates, not a claim that the scan runner invokes them yet.
+    "nmap": {"label": "Nmap", "binary": "nmap", "package": "nmap", "version_args": ["--version"], "purpose": "Network/service discovery for explicitly scoped hosts", "capabilities": ["service_discovery", "network_exposure"], "risk": "network_scope_required", "integration": "inventory_only", "installable": True},
+    "httpx": {"label": "ProjectDiscovery httpx", "binary": "httpx", "package": None, "version_args": ["-version"], "purpose": "HTTP service probing and metadata enrichment", "capabilities": ["http_probing", "technology_enrichment"], "risk": "low_impact_scoped_probe", "integration": "inventory_only", "installable": False, "install_note": "Package name conflicts with other software; install only through a verified ProjectDiscovery-specific method."},
+    "katana": {"label": "Katana", "binary": "katana", "package": "katana", "version_args": ["-version"], "purpose": "Endpoint discovery and crawling", "capabilities": ["endpoint_discovery"], "risk": "crawl_scope_and_rate_limits_required", "integration": "inventory_only", "installable": True},
+    "ffuf": {"label": "FFUF", "binary": "ffuf", "package": "ffuf", "version_args": ["-V"], "purpose": "Content discovery and fuzzing", "capabilities": ["content_discovery", "fuzzing"], "risk": "active_high_request_volume", "integration": "inventory_only", "installable": True},
+    "dirsearch": {"label": "Dirsearch", "binary": "dirsearch", "package": "dirsearch", "version_args": ["--version"], "purpose": "Web path and content discovery", "capabilities": ["content_discovery", "exposed_files"], "risk": "active_high_request_volume", "integration": "inventory_only", "installable": True},
+    "gobuster": {"label": "Gobuster", "binary": "gobuster", "package": "gobuster", "version_args": ["version"], "purpose": "Directory and DNS discovery", "capabilities": ["content_discovery", "dns_discovery"], "risk": "active_scope_and_rate_limits_required", "integration": "inventory_only", "installable": True},
+    "feroxbuster": {"label": "Feroxbuster", "binary": "feroxbuster", "package": "feroxbuster", "version_args": ["--version"], "purpose": "Recursive content discovery", "capabilities": ["content_discovery", "exposed_files"], "risk": "active_high_request_volume", "integration": "inventory_only", "installable": True},
+    "sqlmap": {"label": "sqlmap", "binary": "sqlmap", "package": "sqlmap", "version_args": ["--version"], "purpose": "Specialized SQL injection testing", "capabilities": ["sql_injection"], "risk": "intrusive_requires_explicit_approval", "integration": "manual_only", "installable": True},
+    "wpscan": {"label": "WPScan", "binary": "wpscan", "package": "wpscan", "version_args": ["--version"], "purpose": "WordPress detection and vulnerability checks", "capabilities": ["wordpress", "cms_vulnerabilities", "plugin_theme_inventory"], "risk": "scoped_checks_api_token_may_be_needed", "integration": "inventory_only", "installable": True},
+    "dalfox": {"label": "Dalfox", "binary": "dalfox", "package": "dalfox", "version_args": ["version"], "purpose": "Specialized XSS detection and verification", "capabilities": ["xss_testing", "parameter_testing"], "risk": "active_payloads_requires_explicit_approval", "integration": "manual_only", "installable": True},
+    "arjun": {"label": "Arjun", "binary": "arjun", "package": "arjun", "version_args": ["--version"], "purpose": "HTTP parameter discovery for web and API endpoints", "capabilities": ["api_parameter_discovery", "endpoint_discovery"], "risk": "active_parameter_probing_requires_scope_limits", "integration": "inventory_only", "installable": True},
+    "commix": {"label": "Commix", "binary": "commix", "package": "commix", "version_args": ["--version"], "purpose": "Specialized command-injection testing", "capabilities": ["command_injection"], "risk": "intrusive_requires_explicit_approval", "integration": "manual_only", "installable": True},
+    "joomscan": {"label": "JoomScan", "binary": "joomscan", "package": "joomscan", "version_args": ["--version"], "purpose": "Joomla CMS vulnerability and exposure checks", "capabilities": ["joomla", "cms_vulnerabilities"], "risk": "scoped_checks_required", "integration": "inventory_only", "installable": True},
+    "wafw00f": {"label": "WAFW00F", "binary": "wafw00f", "package": "wafw00f", "version_args": ["--version"], "purpose": "Heuristic web application firewall detection", "capabilities": ["waf_detection", "technology_fingerprinting"], "risk": "low_impact_heuristic", "integration": "inventory_only", "installable": True},
+    "gitleaks": {"label": "Gitleaks", "binary": "gitleaks", "package": "gitleaks", "version_args": ["version"], "purpose": "Secret scanning for explicitly supplied local repositories", "capabilities": ["secret_scanning", "repository_security"], "risk": "local_files_only_no_remote_repo_clone_by_default", "integration": "inventory_only", "installable": True},
+    "sslscan": {"label": "sslscan", "binary": "sslscan", "package": "sslscan", "version_args": ["--version"], "purpose": "TLS protocol and certificate configuration checks", "capabilities": ["tls", "certificate_checks"], "risk": "low_impact", "integration": "inventory_only", "installable": True},
+    "amass": {"label": "OWASP Amass", "binary": "amass", "package": "amass", "version_args": ["-version"], "purpose": "Asset and subdomain discovery", "capabilities": ["asset_discovery", "dns_discovery"], "risk": "recon_scope_required", "integration": "inventory_only", "installable": True},
+    "subfinder": {"label": "Subfinder", "binary": "subfinder", "package": "subfinder", "version_args": ["-version"], "purpose": "Passive subdomain discovery", "capabilities": ["asset_discovery", "passive_recon"], "risk": "passive_but_scope_review_required", "integration": "inventory_only", "installable": True},
+    "dnsx": {"label": "DNSx", "binary": "dnsx", "package": "dnsx", "version_args": ["-version"], "purpose": "DNS resolution and record checks", "capabilities": ["dns_discovery", "asset_validation"], "risk": "low_impact_scoped_dns", "integration": "inventory_only", "installable": True},
 }
+
+TOOL_CAPABILITY_DESCRIPTIONS = {
+    "http_diagnostics": "HTTP connectivity and response diagnostics",
+    "web_app": "Web application security checks",
+    "passive_checks": "Passive checks that do not submit attack payloads",
+    "api_security": "API and web application security signals",
+    "technology_fingerprinting": "Identify frameworks, servers and libraries",
+    "cms_detection": "Identify content management systems",
+    "tls": "TLS and HTTPS configuration",
+    "https_configuration": "HTTPS response and transport configuration",
+    "known_vulnerabilities": "Template-based checks for known vulnerability patterns",
+    "misconfiguration": "Security misconfiguration checks",
+    "exposure_detection": "Detect exposed services, files and panels",
+    "web_server": "Web-server security checks",
+    "exposed_files": "Check for potentially exposed files and paths",
+    "web_app_active": "Active web-application testing",
+    "injection_testing": "Injection testing; requires approved profile",
+    "service_discovery": "Discover services on explicitly authorized hosts",
+    "network_exposure": "Network service exposure signals",
+    "http_probing": "HTTP service metadata and status checks",
+    "technology_enrichment": "Enrich detected web technology information",
+    "endpoint_discovery": "Discover same-origin application endpoints",
+    "content_discovery": "Discover web paths and content",
+    "fuzzing": "Payload/path fuzzing; not a default action",
+    "dns_discovery": "DNS and subdomain discovery",
+    "sql_injection": "Specialized SQL injection assessment; explicit approval required",
+    "wordpress": "WordPress-specific checks",
+    "cms_vulnerabilities": "CMS, plugin and theme vulnerability checks",
+    "plugin_theme_inventory": "Inventory CMS plugins and themes",
+    "xss_testing": "Cross-site scripting tests; explicit approval required",
+    "parameter_testing": "Parameter discovery and validation",
+    "api_parameter_discovery": "Discover potential HTTP/API parameters",
+    "command_injection": "Command-injection tests; intrusive and approval-gated",
+    "joomla": "Joomla CMS-specific checks",
+    "waf_detection": "Heuristic WAF presence detection, not proof of protection",
+    "secret_scanning": "Detect likely secrets in explicitly supplied local files",
+    "repository_security": "Static repository security checks",
+    "certificate_checks": "Certificate and TLS checks",
+    "asset_discovery": "Asset discovery requiring scope review",
+    "passive_recon": "Passive reconnaissance signals",
+    "asset_validation": "Validate discovered DNS assets",
+}
+
 
 
 def _tool_version(tool: dict) -> str | None:
@@ -2037,8 +2101,13 @@ def scanner_tools_status() -> list[dict]:
             "id": key, "name": spec["label"], "purpose": spec["purpose"],
             "installed": bool(path), "status": "ready" if path and version else ("installed_check_failed" if path else "missing"),
             "path": path, "version": version,
-            "install_method": "Kali/Debian package manager",
-            "package": spec["package"],
+            "install_method": "Kali/Debian package manager" if spec.get("installable") and spec.get("package") else "verified method required",
+            "package": spec.get("package"),
+            "installable": bool(spec.get("installable") and spec.get("package")),
+            "install_note": spec.get("install_note", ""),
+            "capabilities": spec.get("capabilities", []),
+            "risk": spec.get("risk", "review_required"),
+            "integration": spec.get("integration", "inventory_only"),
         })
     # ZAP executable and API are separate checks; an unrelated service on its port is not ZAP.
     zap_api = diagnose_zap_api()
@@ -2063,10 +2132,23 @@ class ToolInstallRequest(BaseModel):
 
 @app.get("/api/tools")
 def list_tools():
+    tools = scanner_tools_status()
+    capability_map = {}
+    for item in tools:
+        for capability in item.get("capabilities", []):
+            capability_map.setdefault(capability, []).append({
+                "tool_id": item["id"], "name": item["name"],
+                "installed": item["installed"], "integration": item["integration"],
+                "risk": item["risk"],
+            })
     return {
-        "tools": scanner_tools_status(),
-        "install_supported": bool(shutil.which("pkexec")),
-        "note": "Status is verified from executable/version checks. Installs are limited to the fixed package allow-list and require explicit approval.",
+        "tools": tools,
+        "install_supported": bool(shutil.which("pkexec") and shutil.which("apt-get")),
+        "capabilities": TOOL_CAPABILITY_DESCRIPTIONS,
+        "capability_map": capability_map,
+        "inventory_count": len(tools),
+        "installed_count": sum(1 for item in tools if item["installed"]),
+        "note": "Capability inventory covers curated web-security and supporting tools. Inventory-only tools are not automatically executed by scan profiles. Package installs use a fixed allow-list and require explicit local approval.",
     }
 
 
@@ -2080,6 +2162,8 @@ def install_tool(tool_id: str, request: ToolInstallRequest, client: FastAPIReque
     if client.client.host not in {"127.0.0.1", "::1", "testclient"}:
         raise HTTPException(403, "Tool installation is available only from the local machine.")
     spec = TOOL_CATALOG[tool_id]
+    if not spec.get("installable") or not spec.get("package"):
+        raise HTTPException(400, spec.get("install_note") or "No verified package installation method is configured for this tool.")
     if shutil.which(spec["binary"]):
         return {"ok": True, "message": f"{spec['label']} is already installed.", "tools": scanner_tools_status()}
     pkexec = shutil.which("pkexec")
