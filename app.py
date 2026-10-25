@@ -431,8 +431,18 @@ def perform_zap_passive_check(target: str, targets: list[str] | None = None) -> 
             query["apikey"] = api_key
         req = Request(api_root + path + "?" + urlencode(query),
                       headers={"Accept": "application/json", "User-Agent": "DKCISSP-WebSecurityScanner/0.1"})
+        # ZAP's accessUrl response embeds the fetched responseBody as a JSON string.
+        # Bundled JavaScript can exceed 1 MB, so the old cap truncated valid JSON.
+        # Keep a finite 5 MB limit and detect oversize responses explicitly.
+        max_response_bytes = 5_000_000
         with urlopen(req, timeout=4) as response:
-            return json.loads(response.read(1_000_000).decode("utf-8", "replace"))
+            raw = response.read(max_response_bytes + 1)
+        if len(raw) > max_response_bytes:
+            raise ValueError("ZAP API response exceeded the 5 MB safety limit")
+        payload = json.loads(raw.decode("utf-8", "replace"))
+        if not isinstance(payload, dict):
+            raise ValueError("ZAP API returned an unexpected JSON response shape")
+        return payload
 
     scanned = []
     failures = []

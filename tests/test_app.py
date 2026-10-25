@@ -942,6 +942,80 @@ def test_zap_passive_scans_only_same_origin_urls_and_reports_status(monkeypatch)
     assert all("evil.example.test" not in url for url in seen)
 
 
+def test_zap_passive_handles_large_valid_access_url_response(monkeypatch):
+    import json
+    from urllib.parse import urlparse
+
+    monkeypatch.setattr(app, "diagnose_zap_api", lambda: {"status": "ready", "endpoint": "http://127.0.0.1:8090"})
+    monkeypatch.setattr(app, "zap_api_settings", lambda: ("http://127.0.0.1:8090", "test-key"))
+
+    class FakeResponse:
+        def __init__(self, body):
+            self.body = body
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self, size):
+            return self.body[:size]
+
+    def fake_urlopen(request, timeout=4):
+        path = urlparse(request.full_url).path
+        if path.endswith("/accessUrl/"):
+            # Real ZAP accessUrl wraps the fetched body in JSON; large JS bundles
+            # can make the API response exceed the previous 1 MB read cap.
+            body = json.dumps({"accessUrl": [{"responseBody": "x" * 1_100_000}]}).encode()
+            return FakeResponse(body)
+        if path.endswith("/recordsToScan/"):
+            return FakeResponse(b'{"recordsToScan":"0"}')
+        if path.endswith("/alerts/"):
+            return FakeResponse(b'{"alerts":[]}')
+        raise AssertionError(request.full_url)
+
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    findings, status = app.perform_zap_passive_check(
+        "http://app.example.test/",
+        targets=["http://app.example.test/", "http://app.example.test/vendor.js"],
+    )
+    assert findings == []
+    assert status["status"] == "completed"
+    assert status["urls_scanned"] == 2
+
+
+def test_zap_passive_rejects_oversized_api_response(monkeypatch):
+    import json
+    from urllib.parse import urlparse
+
+    monkeypatch.setattr(app, "diagnose_zap_api", lambda: {"status": "ready", "endpoint": "http://127.0.0.1:8090"})
+    monkeypatch.setattr(app, "zap_api_settings", lambda: ("http://127.0.0.1:8090", "test-key"))
+
+    class FakeResponse:
+        def __init__(self, body):
+            self.body = body
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self, size):
+            return self.body[:size]
+
+    def fake_urlopen(request, timeout=4):
+        path = urlparse(request.full_url).path
+        if path.endswith("/accessUrl/"):
+            body = json.dumps({"accessUrl": [{"responseBody": "x" * 5_100_000}]}).encode()
+            return FakeResponse(body)
+        raise AssertionError(request.full_url)
+
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    findings, status = app.perform_zap_passive_check(
+        "http://app.example.test/",
+        targets=["http://app.example.test/"],
+    )
+    assert findings == []
+    assert status["status"] == "error"
+    assert "5 MB safety limit" in status["errors"][0]
+
+
 def test_zap_passive_unavailable_status_is_not_reported_as_success(monkeypatch):
     monkeypatch.setattr(app, "diagnose_zap_api", lambda: {"status": "api_unreachable", "message": "ZAP unavailable"})
     findings, status = app.perform_zap_passive_check("https://example.test")
