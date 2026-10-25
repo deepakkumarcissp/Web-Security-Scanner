@@ -75,3 +75,10 @@ A targeted Wapiti attempt against that endpoint used Wapiti's `--data` option, w
 ### Next engineering step
 
 The current DKCISSP Wapiti adapter crawls pages and query/form parameters; it does not currently accept an explicit JSON request body or an OpenAPI/Swagger definition. Add a safe, opt-in API test path (preferably OpenAPI-driven or an explicitly configured JSON request) with strict same-origin/loopback scope checks, then run it against this known local Juice Shop endpoint. Only mark SQLi implemented after the adapter produces a reproducible finding with the affected endpoint, parameter, and evidence, and regression tests cover both positive and control cases. Keep the general SQLi coverage status **unverified** until that is complete.
+
+
+### OpenAPI-driven Wapiti follow-up
+
+A temporary OpenAPI 3.0 specification describing the Juice Shop login endpoint was created under `/tmp` and used with Wapiti's `--swagger` option. The targeted run did send an `application/json` POST to `/rest/user/login`, confirming that Wapiti can exercise this endpoint when given an API schema. It again logged an HTTP 500 anomaly for a generated malformed-input request and reported no SQL Injection or Blind SQL Injection finding. The same result occurred when scope was narrowed to the login URL. Temporary specifications, reports, and session databases were kept outside the repository.
+
+This narrows the gap further: OpenAPI can provide JSON endpoint coverage, but the generic Wapiti SQL module still did not detect the manually demonstrated boolean-based login bypass in this test. The adapter also does not expose the OpenAPI option today. Before adding API support to the product, build an automated expected-positive benchmark using the known boolean-based behavior and verify which detector can reliably distinguish the bypass from the invalid-credentials control. Do not treat a malformed-input 500 as proof of SQLi detection.
