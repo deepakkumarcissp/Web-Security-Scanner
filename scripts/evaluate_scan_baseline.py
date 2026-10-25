@@ -45,9 +45,15 @@ def evaluate_report(report: dict[str, Any], baseline: dict[str, Any]) -> dict[st
     for check in checks:
         check_id = str(check.get("id", "unnamed-check"))
         needle = normalize(check.get("title_contains", ""))
+        url_needle = normalize(check.get("affected_url_contains", ""))
+        expected_severity = normalize(check.get("severity", ""))
         matching = [
             i for i, finding in enumerate(findings)
-            if isinstance(finding, dict) and needle and needle in normalize(finding.get("title"))
+            if isinstance(finding, dict)
+            and needle
+            and needle in normalize(finding.get("title"))
+            and (not url_needle or url_needle in normalize(finding.get("affected_url") or finding.get("target")))
+            and (not expected_severity or expected_severity == normalize(finding.get("severity")))
         ]
         matched_indexes.update(matching)
         expected_results.append({
@@ -56,6 +62,11 @@ def evaluate_report(report: dict[str, Any], baseline: dict[str, Any]) -> dict[st
             "status": "PASS" if matching else "MISS",
             "matching_finding_count": len(matching),
             "finding_titles": [findings[i].get("title", "") for i in matching],
+            "match_constraints": {
+                "title_contains": check.get("title_contains", ""),
+                "affected_url_contains": check.get("affected_url_contains"),
+                "severity": check.get("severity"),
+            },
         })
 
     duplicate_groups: dict[tuple[str, str], list[int]] = {}

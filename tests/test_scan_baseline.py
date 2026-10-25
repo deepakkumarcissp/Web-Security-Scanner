@@ -51,6 +51,39 @@ def test_duplicate_same_title_and_url_is_reported_but_not_misclassified():
     assert result["false_positive_status"] == "NOT_ASSESSED"
 
 
+def test_expected_signal_must_match_the_configured_url_scope():
+    baseline = {"expected_signals": [{
+        "id": "csp-root",
+        "title_contains": "Content-Security-Policy header missing",
+        "affected_url_contains": "127.0.0.1:1003",
+    }]}
+    report = {
+        "scan_status": "completed",
+        "tool_status": {"Nuclei": {"status": "completed"}},
+        "findings": [finding("Content-Security-Policy header missing", url="http://127.0.0.1:9999")],
+    }
+    result = evaluator.evaluate_report(report, baseline)
+    assert result["result"] == "FAIL"
+    assert result["missing_expected_signals"] == ["csp-root"]
+    assert result["unmatched_findings_requiring_triage"][0]["affected_url"] == "http://127.0.0.1:9999"
+
+
+def test_expected_signal_can_also_require_a_severity_match():
+    baseline = {"expected_signals": [{
+        "id": "csp-medium",
+        "title_contains": "Content-Security-Policy header missing",
+        "severity": "Medium",
+    }]}
+    report = {
+        "scan_status": "completed",
+        "tool_status": {"Nuclei": {"status": "completed"}},
+        "findings": [finding("Content-Security-Policy header missing", severity="Info")],
+    }
+    result = evaluator.evaluate_report(report, baseline)
+    assert result["result"] == "FAIL"
+    assert result["missing_expected_signals"] == ["csp-medium"]
+
+
 def test_empty_baseline_fails_instead_of_claiming_zero_percent_coverage():
     result = evaluator.evaluate_report({"findings": [], "scan_status": "completed", "tool_status": {"Nuclei": {"status": "completed"}}}, {"expected_signals": []})
     assert result["result"] == "FAIL"
