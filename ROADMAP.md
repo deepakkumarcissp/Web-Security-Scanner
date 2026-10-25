@@ -77,6 +77,10 @@
 
 ## Current execution checkpoint
 
-Latest completed implementation commit: `a43dcdb` — CORS evidence regression coverage.
+- Latest regression implementation: `a43dcdb` — CORS evidence regression coverage.
+- Latest roadmap commit: `9ea44cf` — this roadmap.
+- Local Juice Shop Standard scan: **scan 31 PASS**, completed in 14.1 seconds; 7 same-origin URLs mapped, Nuclei completed, WhatWeb completed, and ZAP passive completed. Active Wapiti was correctly skipped.
+- Expected-signal evaluator: **PASS, 5/5 expected signals matched**, zero duplicate groups, three unmatched findings retained for human triage. This is 100% coverage of the five declared fixture signals only, not overall vulnerability detection coverage.
+- Full regression suite: **98 passed**, 2 dependency deprecation warnings.
 
 The roadmap is intentionally evidence-gated. Do not claim broad detection coverage, production readiness, or a release-ready default branch until the relevant exit gates have been demonstrated.
