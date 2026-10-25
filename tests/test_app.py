@@ -1581,9 +1581,17 @@ def test_quick_scan_against_controlled_loopback_http_fixture(monkeypatch):
                 self.send_header("Location", f"http://127.0.0.1:{other_server.server_port}/outside")
                 self.end_headers()
                 return
-            body = b"<html><head><title>DKCISSP test fixture</title></head><body>fixture</body></html>"
+            if self.path == "/backup.zip":
+                body = b"SYNTHETIC_FIXTURE_MARKER_NOT_A_SECRET"
+                content_type = "application/zip"
+            elif self.path == "/.env.example":
+                body = b"EXAMPLE_SETTING=not-a-secret"
+                content_type = "text/plain; charset=utf-8"
+            else:
+                body = b"<html><head><title>DKCISSP test fixture</title></head><body>fixture</body></html>"
+                content_type = "text/html; charset=utf-8"
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Type", content_type)
             if self.path != "/missing-headers":
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
@@ -1674,6 +1682,35 @@ def test_quick_scan_against_controlled_loopback_http_fixture(monkeypatch):
         assert "Access-Control-Allow-Credentials: true" in cors_signal["evidence"]
         assert "not proof of sensitive cross-origin data exposure" in cors_signal["evidence"]
         assert "does not prove exploitable exposure" in cors_signal["remediation"]
+
+        backup_target = target + "backup.zip"
+        with app.connect() as conn:
+            backup_id = conn.execute(
+                "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+                (backup_target, "quick", "running", app.now())).lastrowid
+        app.perform_scan(backup_id, backup_target, "quick")
+        with app.connect() as conn:
+            backup_findings = conn.execute(
+                "SELECT title,severity,evidence,confidence FROM findings WHERE scan_id=?",
+                (backup_id,)).fetchall()
+        backup_signal = next(row for row in backup_findings
+                             if row["title"] == "Potentially exposed backup or configuration artifact")
+        assert backup_signal["severity"] == "Low"
+        assert backup_signal["confidence"] == "Low"
+        assert "HTTP 200" in backup_signal["evidence"]
+        assert "File contents were not included" in backup_signal["evidence"]
+        assert "SYNTHETIC_FIXTURE_MARKER_NOT_A_SECRET" not in str(backup_findings)
+
+        example_target = target + ".env.example"
+        with app.connect() as conn:
+            example_id = conn.execute(
+                "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+                (example_target, "quick", "running", app.now())).lastrowid
+        app.perform_scan(example_id, example_target, "quick")
+        with app.connect() as conn:
+            example_titles = {row["title"] for row in conn.execute(
+                "SELECT title FROM findings WHERE scan_id=?", (example_id,)).fetchall()}
+        assert "Potentially exposed backup or configuration artifact" not in example_titles
 
         redirect_target = target + "redirect-out"
         with app.connect() as conn:

@@ -51,7 +51,15 @@
       "affected_url_contains": "cors-wildcard",
       "severity": "Info",
       "confidence": "Medium"
+    },
+    {
+      "id": "backup-file-metadata-observation",
+      "description": "A supplied in-scope backup-like URL should produce a cautious metadata-only observation without storing its body.",
+      "title_contains": "Potentially exposed backup or configuration artifact",
+      "affected_url_contains": "backup.zip",
+      "severity": "Low",
+      "confidence": "Low"
     }
   ],
-  "coverage_boundary": "This baseline covers only the six explicit loopback fixture expectations. It does not measure overall scanner coverage or prove exploitability. Redirect scope is asserted separately by a test that verifies the second local server receives no request."
+  "coverage_boundary": "This baseline covers only the seven explicit loopback fixture expectations. It does not measure overall scanner coverage or prove exploitability. Exposed-file detection is limited to supplied or discovered same-origin URLs and does not enumerate arbitrary filenames. Redirect scope is asserted separately by a test that verifies the second local server receives no request."
 }

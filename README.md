@@ -90,6 +90,7 @@ Standard/Deep scans now discover up to 12 same-origin URLs, with a maximum link 
 - Risk-focused dashboard with summary cards, findings, and scan history
 - Built-in low-impact HTTP and response-header checks
 - Bounded same-origin endpoint discovery for Standard/Deep scans, followed by passive header/cookie checks across discovered URLs
+- Metadata-only observations for potentially exposed backup/configuration/repository paths when those URLs are supplied or discovered in scope; no arbitrary filename brute force, file contents are not recorded, and observations remain Low severity/Low confidence until validated
 - Optional OWASP ZAP passive-alert retrieval from a local API
 - Scanner Setup page with real executable/version checks for supported tools
 - Allow-listed tool installation workflow with explicit user confirmation
@@ -247,7 +248,7 @@ python3 scripts/evaluate_scan_baseline.py \
   --output validation-reports/<scan-report>-evaluation.json
 ```
 
-The evaluator fails if an expected signal is missing, the scan is incomplete, or the required Nuclei tool did not complete. It reports duplicate findings by normalized title and affected URL, and lists unmatched findings for human triage. Unmatched findings are **not** automatically labeled false positives. The percentage covers only the five declared signals; it is not an overall vulnerability detection rate. Regression tests in `tests/test_scan_baseline.py` cover expected-signal matching, severity/confidence drift, incomplete scans, required-tool failures, duplicate reporting, and unmatched-finding triage. Re-check the baseline if Juice Shop configuration or response headers change.
+The evaluator fails if an expected signal is missing, the scan is incomplete, or the required Nuclei tool did not complete. It reports duplicate findings by normalized title and affected URL, and lists unmatched findings for human triage. Unmatched findings are **not** automatically labeled false positives. The Juice Shop baseline covers only its five explicitly declared signals; the separate controlled loopback HTTP baseline covers seven explicit regression signals. Neither is an overall vulnerability detection rate. Regression tests in `tests/test_scan_baseline.py` cover expected-signal matching, severity/confidence drift, incomplete scans, required-tool failures, duplicate reporting, and unmatched-finding triage. Re-check the baseline if Juice Shop configuration or response headers change.
 
 ## Run tests
 

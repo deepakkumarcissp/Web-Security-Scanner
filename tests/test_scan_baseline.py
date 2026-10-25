@@ -211,12 +211,13 @@ def test_controlled_http_fixture_baseline_reports_header_and_transport_signals()
             finding("X-Content-Type-Options missing or weak", "http://127.0.0.1:34567/missing-headers", 4, "Low", "High"),
             finding("Permissions-Policy header missing", "http://127.0.0.1:34567/missing-headers", 5, "Info", "High"),
             finding("Wildcard CORS origin configured", "http://127.0.0.1:34567/cors-wildcard", 6, "Info", "Medium"),
-            finding("Unmatched observation retained for review", "http://127.0.0.1:34567/", 7, "Info", "Medium"),
+            finding("Potentially exposed backup or configuration artifact", "http://127.0.0.1:34567/backup.zip", 7, "Low", "Low"),
+            finding("Unmatched observation retained for review", "http://127.0.0.1:34567/", 8, "Info", "Medium"),
         ],
     }
     result = evaluator.evaluate_report(report, controlled)
     assert result["result"] == "PASS"
-    assert result["expected_signals_matched"] == 6
+    assert result["expected_signals_matched"] == 7
     assert result["expected_signal_coverage_percent"] == 100.0
     assert result["false_positive_status"] == "NOT_ASSESSED"
-    assert [item["id"] for item in result["unmatched_findings_requiring_triage"]] == [7]
+    assert [item["id"] for item in result["unmatched_findings_requiring_triage"]] == [8]

@@ -454,6 +454,56 @@ def same_origin_opener(origin_url: str):
     return build_opener(_SameOriginRedirectHandler(origin_url), HTTPSHandler(context=ssl.create_default_context()))
 
 
+def exposed_file_observation(url: str, status_code: int, headers: dict) -> dict | None:
+    """Return a cautious metadata-only signal for risky file paths already in scope.
+
+    This helper never enumerates filenames or reads file content. Example/documentation
+    files such as .env.example are intentionally excluded to reduce noisy findings.
+    """
+    if status_code < 200 or status_code >= 300:
+        return None
+    parsed = urlparse(url)
+    path = (parsed.path or "/").lower()
+    basename = path.rsplit("/", 1)[-1]
+    repository_metadata_paths = {".git/config", ".svn/entries", ".hg/store"}
+    sensitive_basenames = {
+        ".env", ".env.local", ".env.production", ".env.development",
+        "id_rsa", "id_ed25519", "server.key", "private.key",
+        "wp-config.php.bak", "config.php.bak", "configuration.php.bak",
+        "database.sql", "db.sql", "dump.sql", "backup.sql",
+        "backup.zip", "site.zip", "www.zip", "webroot.zip",
+    }
+    risky_suffixes = (".sql.gz", ".dump", ".bak", ".backup", ".old", ".orig", ".save", ".swp", ".tar.gz")
+    # Match sensitive basenames at any in-scope path, plus repository metadata
+    # paths. Do not flag example templates, public well-known files, generic
+    # config names, or ordinary ZIP downloads just because of their extension.
+    normalized_path = path.lstrip("/")
+    exact_match = basename in sensitive_basenames or any(
+        normalized_path == item or normalized_path.endswith("/" + item)
+        for item in repository_metadata_paths
+    )
+    suffix_match = basename.endswith(risky_suffixes)
+    if not exact_match and not suffix_match:
+        return None
+    content_type = str(headers.get("content-type", headers.get("Content-Type", "unknown")))[:120]
+    content_length = str(headers.get("content-length", headers.get("Content-Length", "unknown")))[:24]
+    return {
+        "title": "Potentially exposed backup or configuration artifact",
+        "severity": "Low",
+        "confidence": "Low",
+        "evidence": (
+            f"An in-scope URL matching a sensitive-file naming pattern returned HTTP {status_code}; "
+            f"path={parsed.path}; content-type={content_type}; content-length={content_length}. "
+            "File contents were not included in this finding. Validate access controls and intended publication."
+        ),
+        "remediation": (
+            "Confirm whether this artifact is intended to be public. Remove backups, private configuration, "
+            "repository metadata, and database dumps from web roots; rotate exposed credentials if validated. "
+            "This filename/status observation alone does not confirm that secrets are present."
+        ),
+    }
+
+
 def discover_same_origin_pages(root_url: str, root_html: str, max_pages: int = 12, max_depth: int = 2) -> dict:
     """Bounded, low-rate, same-origin page discovery; never submits forms or executes JS."""
     root = root_url.rstrip("/") or root_url
@@ -1396,7 +1446,12 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                 status_code = response.status
                 headers = {k.lower(): v for k, v in response.headers.items()}
                 final_url = response.geturl()
-                body = response.read(500_000).decode("utf-8", "replace")
+                # Do not read potentially sensitive backup/configuration bodies into the
+                # scanner process; filename/status/header metadata is enough for triage.
+                if exposed_file_observation(final_url, status_code, headers):
+                    body = ""
+                else:
+                    body = response.read(500_000).decode("utf-8", "replace")
         except HTTPError as exc:
             status_code = exc.code
             headers = {k.lower(): v for k, v in exc.headers.items()}
@@ -1415,6 +1470,11 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
 
         def finding(severity, title, evidence, remediation, confidence="High"):
             findings.append((severity, title, final_url, evidence, remediation, confidence))
+
+        exposure = exposed_file_observation(final_url, status_code, headers)
+        if exposure:
+            finding(exposure["severity"], exposure["title"], exposure["evidence"],
+                    exposure["remediation"], exposure["confidence"])
 
         if final_url.startswith("https://") and "strict-transport-security" not in headers:
             finding(
@@ -1523,6 +1583,12 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                         if page_final.scheme != root_parsed.scheme or page_final.hostname != root_parsed.hostname or page_port != root_port:
                             continue
                         page_headers = {k.lower(): v for k, v in page_response.headers.items()}
+                        # Check metadata for already-discovered same-origin files before
+                        # filtering non-HTML assets. Never read or store their contents.
+                        exposure = exposed_file_observation(page_response.geturl(), page_response.status, page_headers)
+                        if exposure:
+                            findings.append((exposure["severity"], exposure["title"], page_response.geturl(),
+                                             exposure["evidence"], exposure["remediation"], exposure["confidence"]))
                         # Document security policies should be assessed on HTML/XHTML
                         # documents, not every linked JS, CSS, image, or favicon asset.
                         if not is_html_document(page_headers.get("content-type", "")):
