@@ -1222,9 +1222,7 @@ def test_shared_same_origin_validator_fails_closed():
 def test_scan_creation_rejects_when_concurrency_limit_is_reached(monkeypatch):
     from uuid import uuid4
     target = f"https://capacity-{uuid4().hex}.example"
-    started = []
     monkeypatch.setenv("DKCISSP_MAX_CONCURRENT_SCANS", "1")
-    monkeypatch.setattr(app, "start_scan", lambda target, profile: started.append((target, profile)) or 777)
     with app.connect() as conn:
         cursor = conn.execute(
             "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
@@ -1235,10 +1233,45 @@ def test_scan_creation_rejects_when_concurrency_limit_is_reached(monkeypatch):
         response = client.post("/api/scans", json={"target": target, "profile": "quick", "authorized": True})
         assert response.status_code == 429
         assert "capacity reached" in response.json()["detail"].lower()
-        assert started == []
     finally:
         with app.connect() as conn:
             conn.execute("DELETE FROM scans WHERE id=?", (running_id,))
+
+
+def test_stale_scan_recovery_preserves_history_and_keeps_recent_scans_running():
+    from uuid import uuid4
+    stale_time = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(timespec="seconds")
+    with app.connect() as conn:
+        stale_id = conn.execute(
+            "INSERT INTO scans(target,profile,status,created_at,heartbeat_at,progress,current_stage) VALUES(?,?,?,?,?,?,?)",
+            (f"https://stale-{uuid4().hex}.example", "standard", "running", stale_time, stale_time, 35, "Running Nuclei safe checks"),
+        ).lastrowid
+        recent_id = conn.execute(
+            "INSERT INTO scans(target,profile,status,created_at,heartbeat_at,progress,current_stage) VALUES(?,?,?,?,?,?,?)",
+            (f"https://recent-{uuid4().hex}.example", "standard", "running", app.now(), app.now(), 35, "Running Nuclei safe checks"),
+        ).lastrowid
+        finding_id = conn.execute(
+            """INSERT INTO findings
+            (scan_id,target,severity,title,affected_url,evidence,remediation,confidence,discovered_at)
+            VALUES(?,?,?,?,?,?,?,?,?)""",
+            (stale_id, "https://stale.example", "Low", "Preserved test finding", "https://stale.example/", "evidence", "fix", "Medium", app.now()),
+        ).lastrowid
+    try:
+        recovered = app.recover_stale_scans(stale_after_minutes=30)
+        assert recovered >= 1
+        with app.connect() as conn:
+            stale = conn.execute("SELECT status,finished_at,current_stage,summary FROM scans WHERE id=?", (stale_id,)).fetchone()
+            recent = conn.execute("SELECT status FROM scans WHERE id=?", (recent_id,)).fetchone()
+            preserved = conn.execute("SELECT id FROM findings WHERE id=? AND scan_id=?", (finding_id, stale_id)).fetchone()
+        assert stale["status"] == "failed"
+        assert stale["finished_at"]
+        assert "heartbeat expired" in stale["current_stage"].lower()
+        assert recent["status"] == "running"
+        assert preserved is not None
+    finally:
+        with app.connect() as conn:
+            conn.execute("DELETE FROM findings WHERE scan_id IN (?,?)", (stale_id, recent_id))
+            conn.execute("DELETE FROM scans WHERE id IN (?,?)", (stale_id, recent_id))
 
 
 def test_concurrency_limit_is_bounded_and_has_safe_fallback(monkeypatch):

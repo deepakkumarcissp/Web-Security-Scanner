@@ -56,7 +56,8 @@ def init_db() -> None:
                 created_at TEXT NOT NULL, finished_at TEXT, summary TEXT,
                 progress INTEGER NOT NULL DEFAULT 0,
                 current_stage TEXT NOT NULL DEFAULT 'Queued',
-                tool_status TEXT NOT NULL DEFAULT '{}'
+                tool_status TEXT NOT NULL DEFAULT '{}',
+                heartbeat_at TEXT
             );
             CREATE TABLE IF NOT EXISTS install_jobs(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,6 +123,9 @@ def init_db() -> None:
             conn.execute("ALTER TABLE scans ADD COLUMN current_stage TEXT NOT NULL DEFAULT 'Queued'")
         if "tool_status" not in scan_columns:
             conn.execute("ALTER TABLE scans ADD COLUMN tool_status TEXT NOT NULL DEFAULT '{}'")
+        if "heartbeat_at" not in scan_columns:
+            conn.execute("ALTER TABLE scans ADD COLUMN heartbeat_at TEXT")
+        conn.execute("UPDATE scans SET heartbeat_at=created_at WHERE heartbeat_at IS NULL")
         finding_columns = {row["name"] for row in conn.execute("PRAGMA table_info(findings)")}
         if "lifecycle_status" not in finding_columns:
             conn.execute("ALTER TABLE findings ADD COLUMN lifecycle_status TEXT NOT NULL DEFAULT 'open'")
@@ -139,6 +143,32 @@ def init_db() -> None:
 
 
 init_db()
+
+
+def recover_stale_scans(conn=None, stale_after_minutes: int = 30) -> int:
+    """Fail scans with no worker heartbeat after a conservative timeout; keep all findings/history."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max(1, stale_after_minutes))).isoformat(timespec="seconds")
+    owns_connection = conn is None
+    if owns_connection:
+        conn = connect()
+    try:
+        cursor = conn.execute(
+            """UPDATE scans
+               SET status='failed', finished_at=?, current_stage='Failed: worker heartbeat expired',
+                   summary=?, heartbeat_at=?
+               WHERE status='running' AND COALESCE(heartbeat_at, created_at) < ?""",
+            (now(), json.dumps({"error": "Scan worker heartbeat expired; scan marked failed by stale-worker recovery. Existing findings and scan history were preserved."}), now(), cutoff),
+        )
+        recovered = cursor.rowcount
+        if owns_connection:
+            conn.commit()
+        return recovered
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+recover_stale_scans()
 
 
 class ScanRequest(BaseModel):
@@ -1181,10 +1211,10 @@ def update_scan_progress(scan_id: int, progress: int, stage: str, tools: dict | 
     with connect() as conn:
         previous = conn.execute("SELECT current_stage,status FROM scans WHERE id=?", (scan_id,)).fetchone()
         if tools is None:
-            conn.execute("UPDATE scans SET progress=?,current_stage=? WHERE id=?", (progress, stage, scan_id))
+            conn.execute("UPDATE scans SET progress=?,current_stage=?,heartbeat_at=? WHERE id=?", (progress, stage, now(), scan_id))
         else:
-            conn.execute("UPDATE scans SET progress=?,current_stage=?,tool_status=? WHERE id=?",
-                         (progress, stage, json.dumps(tools), scan_id))
+            conn.execute("UPDATE scans SET progress=?,current_stage=?,tool_status=?,heartbeat_at=? WHERE id=?",
+                         (progress, stage, json.dumps(tools), now(), scan_id))
         if previous and previous["current_stage"] != stage:
             conn.execute(
                 "INSERT INTO scanner_activity(scan_id,category,status,stage,message,created_at) VALUES(?,?,?,?,?,?)",
@@ -1229,8 +1259,8 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         except (URLError, TimeoutError, ssl.SSLError, socket.timeout) as exc:
             with connect() as conn:
                 conn.execute(
-                    "UPDATE scans SET status=?,finished_at=?,summary=? WHERE id=?",
-                    ("failed", now(), json.dumps({"error": str(exc)}), scan_id),
+                    "UPDATE scans SET status=?,finished_at=?,summary=?,heartbeat_at=? WHERE id=?",
+                    ("failed", now(), json.dumps({"error": str(exc)}), now(), scan_id),
                 )
             return
 
@@ -1452,7 +1482,7 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             for item in findings:
                 add_finding(conn, scan_id, target, *item)
             conn.execute(
-                "UPDATE scans SET status=?,finished_at=?,summary=?,progress=100,current_stage=?,tool_status=? WHERE id=?",
+                "UPDATE scans SET status=?,finished_at=?,summary=?,progress=100,current_stage=?,tool_status=?,heartbeat_at=? WHERE id=?",
                 (
                     "completed", now(),
                     json.dumps({
@@ -1463,14 +1493,14 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                         "endpoint_discovery": discovery_status,
                         "finding_count": len(findings),
                     }),
-                    "Assessment complete", json.dumps(tool_status), scan_id,
+                    "Assessment complete", json.dumps(tool_status), now(), scan_id,
                 ),
             )
     except Exception as exc:
         with connect() as conn:
             conn.execute(
-                "UPDATE scans SET status=?,finished_at=?,summary=?,current_stage=?,tool_status=? WHERE id=?",
-                ("failed", now(), json.dumps({"error": str(exc)}), "Assessment failed", json.dumps(tool_status), scan_id),
+                "UPDATE scans SET status=?,finished_at=?,summary=?,current_stage=?,tool_status=?,heartbeat_at=? WHERE id=?",
+                ("failed", now(), json.dumps({"error": str(exc)}), "Assessment failed", json.dumps(tool_status), now(), scan_id),
             )
 
 
@@ -1492,13 +1522,14 @@ def start_scan(target: str, profile: str) -> int:
         # Serialize the capacity check and insert so simultaneous requests cannot
         # all observe the same free slot and exceed the configured worker limit.
         conn.execute("BEGIN IMMEDIATE")
+        recover_stale_scans(conn)
         active_scans = running_scan_count(conn)
         limit = max_concurrent_scans()
         if active_scans >= limit:
             raise HTTPException(429, f"Scanner capacity reached ({active_scans}/{limit} assessments running). Wait for a scan to finish before starting another.")
         cursor = conn.execute(
-            "INSERT INTO scans(target,profile,status,created_at,progress,current_stage,tool_status) VALUES(?,?,?,?,?,?,?)",
-            (target, profile, "running", now(), 1, "Queued", json.dumps({})),
+            "INSERT INTO scans(target,profile,status,created_at,progress,current_stage,tool_status,heartbeat_at) VALUES(?,?,?,?,?,?,?,?)",
+            (target, profile, "running", now(), 1, "Queued", json.dumps({}), now()),
         )
         scan_id = cursor.lastrowid
     threading.Thread(target=perform_scan, args=(scan_id, target, profile), daemon=True).start()
@@ -1517,7 +1548,9 @@ def scheduler_loop() -> None:
                     except ValueError:
                         continue
                     if due <= current:
-                        # Scheduled work must respect the same worker cap as manual requests.
+                        # Recover abandoned workers before enforcing the shared capacity limit.
+                        recover_stale_scans(conn)
+                        conn.commit()
                         if running_scan_count(conn) >= max_concurrent_scans():
                             continue
                         try:
@@ -1747,11 +1780,7 @@ def create_scan(request: ScanRequest):
             continue
         if hostname == registered_host and port == registered_port and asset["scope_status"] != "in_scope":
             raise HTTPException(403, "This target is marked " + asset["scope_status"].replace("_", " ") + " in Asset Inventory. Review its scope before scanning.")
-    with connect() as conn:
-        active_scans = running_scan_count(conn)
-    limit = max_concurrent_scans()
-    if active_scans >= limit:
-        raise HTTPException(429, f"Scanner capacity reached ({active_scans}/{limit} assessments running). Wait for a scan to finish before starting another.")
+    # start_scan performs the authoritative, atomic capacity check and stale-worker recovery.
     scan_id = start_scan(target, request.profile)
     return {
         "id": scan_id, "status": "running", "profile": request.profile,
