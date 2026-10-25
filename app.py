@@ -1287,8 +1287,28 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             )
 
 
+def max_concurrent_scans() -> int:
+    """Bound concurrent workers; allow a small local-operator override."""
+    try:
+        configured = int(os.environ.get("DKCISSP_MAX_CONCURRENT_SCANS", "2"))
+    except (TypeError, ValueError):
+        configured = 2
+    return max(1, min(configured, 8))
+
+
+def running_scan_count(conn) -> int:
+    return int(conn.execute("SELECT COUNT(*) FROM scans WHERE status='running'").fetchone()[0])
+
+
 def start_scan(target: str, profile: str) -> int:
     with connect() as conn:
+        # Serialize the capacity check and insert so simultaneous requests cannot
+        # all observe the same free slot and exceed the configured worker limit.
+        conn.execute("BEGIN IMMEDIATE")
+        active_scans = running_scan_count(conn)
+        limit = max_concurrent_scans()
+        if active_scans >= limit:
+            raise HTTPException(429, f"Scanner capacity reached ({active_scans}/{limit} assessments running). Wait for a scan to finish before starting another.")
         cursor = conn.execute(
             "INSERT INTO scans(target,profile,status,created_at,progress,current_stage,tool_status) VALUES(?,?,?,?,?,?,?)",
             (target, profile, "running", now(), 1, "Queued", json.dumps({})),
@@ -1310,6 +1330,9 @@ def scheduler_loop() -> None:
                     except ValueError:
                         continue
                     if due <= current:
+                        # Scheduled work must respect the same worker cap as manual requests.
+                        if running_scan_count(conn) >= max_concurrent_scans():
+                            continue
                         try:
                             require_in_scope_asset(schedule["target"])
                         except HTTPException:
@@ -1531,9 +1554,17 @@ def create_scan(request: ScanRequest):
     for asset in assets:
         registered = urlparse(asset["target"])
         registered_host = (registered.hostname or "").lower().rstrip(".")
-        registered_port = registered.port or (443 if registered.scheme.lower() == "https" else 80)
+        try:
+            registered_port = registered.port or (443 if registered.scheme.lower() == "https" else 80)
+        except ValueError:
+            continue
         if hostname == registered_host and port == registered_port and asset["scope_status"] != "in_scope":
             raise HTTPException(403, "This target is marked " + asset["scope_status"].replace("_", " ") + " in Asset Inventory. Review its scope before scanning.")
+    with connect() as conn:
+        active_scans = running_scan_count(conn)
+    limit = max_concurrent_scans()
+    if active_scans >= limit:
+        raise HTTPException(429, f"Scanner capacity reached ({active_scans}/{limit} assessments running). Wait for a scan to finish before starting another.")
     scan_id = start_scan(target, request.profile)
     return {
         "id": scan_id, "status": "running", "profile": request.profile,
