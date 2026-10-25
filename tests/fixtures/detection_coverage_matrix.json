@@ -175,7 +175,7 @@
         "Stock-page signatures are low-confidence inventory signals and may be intentionally deployed.",
         "Current checks do not yet constitute a complete server-misconfiguration benchmark."
       ],
-      "next_action": "Add scan-level fixtures for default-page and OPTIONS behavior; then continue to controlled SQL injection and XSS benchmarks."
+      "next_action": "OPTIONS behavior has a scan-level fixture; add scan-level default-page coverage, then continue to controlled SQL injection and XSS benchmarks."
     },
     {
       "id": "sql-injection",

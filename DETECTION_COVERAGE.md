@@ -15,7 +15,7 @@ This document is the human-readable companion to `tests/fixtures/detection_cover
 |---|---|---|---|
 | P0 | Detection baseline integrity | In progress | Keep each expected signal tied to a deterministic fixture and report coverage boundaries clearly. |
 | P0 | Scope enforcement | Validated | Add a scope regression test for every new external tool adapter. |
-| P1 | Web-server misconfiguration | In progress | Root directory-listing, stock-page signatures, and a bounded OPTIONS/Allow method observation now have regression tests; add scan-level method-probe coverage. |
+| P1 | Web-server misconfiguration | In progress | Root directory-listing and stock-page signatures have regression tests; a bounded OPTIONS/Allow method observation now has both helper and scan-level coverage. Add scan-level default-page coverage. |
 | P1 | SQL injection | Unverified | Local deliberately vulnerable fixture with expected detection and miss cases. |
 | P1 | Cross-site scripting | Unverified | Separate reflected/stored cases and evidence-quality checks; a single reflected case is not broad coverage. |
 | P1 | API security | Planned | Local API fixture with explicit role, authentication, and authorization expectations. |
