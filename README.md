@@ -88,6 +88,8 @@ Standard/Deep scans now discover up to 12 same-origin URLs, with a maximum link 
 
 The maintained [Detection Coverage Matrix](DETECTION_COVERAGE.md) and machine-readable [coverage fixture](tests/fixtures/detection_coverage_matrix.json) distinguish validated behaviors from implemented integrations, unverified categories, and planned work. A category is not considered broadly supported just because one test case passes. Results are reported per category; there is no single overall detection-coverage percentage. The matrix is regression-tested so that validated claims keep references to existing test or fixture evidence.
 
+For repeatable SQL injection and reflected-XSS testing, see the [Local Detection Benchmark](LOCAL_DETECTION_BENCHMARK.md) and its intentionally vulnerable, loopback-only fixture (`scripts/local_vuln_benchmark_fixture.py`). Fixture unit tests verify that the expected signals exist; they do not substitute for a Wapiti detection run. SQL injection and XSS therefore remain **unverified** in the coverage matrix until actual benchmark output is reviewed and recorded.
+
 ## Current capabilities
 
 - **EASM foundation (beta):** organization/root-domain registry API, explicit root-asset registration, passive certificate-transparency hostname discovery, source/provenance tracking, and a human-reviewed scope gate; discovered candidates do not trigger scans. Organization/root records and asset association are currently API/data-layer capabilities, not yet a dedicated management screen. DNS/ASN resolution, historical discovery, web fingerprinting, and exposure trends are not yet implemented in this scanner.
