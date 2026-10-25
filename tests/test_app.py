@@ -440,6 +440,27 @@ def test_wapiti_parser_normalizes_findings_and_filters_out_of_scope_urls():
     assert not any("HTTP Methods" in item[1] for item in findings)
 
 
+def test_wapiti_parser_retains_xss_evidence_with_parameter_and_scope():
+    report = {
+        "classifications": {"Cross Site Scripting": {"sol": "Encode output for the correct browser context."}},
+        "vulnerabilities": {"Cross Site Scripting": [
+            {"level": 2, "path": "/search?q=probe", "info": "Reflected input was detected in the response", "method": "GET", "parameter": "q", "module": "xss"},
+            {"level": 2, "path": "https://outside.example/search?q=probe", "info": "Out-of-scope record", "method": "GET", "parameter": "q", "module": "xss"},
+        ]},
+        "additionals": {},
+    }
+    findings = app.parse_wapiti_report(report, "http://127.0.0.1:1003/")
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding[0] == "Medium"
+    assert "Cross Site Scripting" in finding[1]
+    assert finding[2] == "http://127.0.0.1:1003/search?q=probe"
+    assert "Parameter: q" in finding[3]
+    assert "Module: xss" in finding[3]
+    assert "Encode output" in finding[4]
+    assert finding[5] == "Medium"
+
+
 def test_wapiti_runs_bounded_active_modules_and_parses_json(monkeypatch, tmp_path):
     import json
     from types import SimpleNamespace
