@@ -11,17 +11,17 @@ SPEC.loader.exec_module(evaluator)
 BASELINE = __import__("json").loads((ROOT / "tests/fixtures/juice_shop_expected_signals.json").read_text())
 
 
-def finding(title, url="http://127.0.0.1:1003", finding_id=None, severity="Info"):
-    return {"id": finding_id, "title": title, "affected_url": url, "severity": severity}
+def finding(title, url="http://127.0.0.1:1003", finding_id=None, severity="Info", confidence="High"):
+    return {"id": finding_id, "title": title, "affected_url": url, "severity": severity, "confidence": confidence}
 
 
 def test_expected_signals_all_match_and_unmatched_findings_are_triage_only():
     report = {"scan_status": "completed", "profile": "standard", "tool_status": {"Nuclei": {"status": "completed"}}, "findings": [
         finding("Target uses HTTP without transport encryption", finding_id=1, severity="High"),
-        finding("Content-Security-Policy header missing", finding_id=2),
-        finding("Referrer-Policy header missing", finding_id=3),
-        finding("Permissions-Policy header missing", finding_id=4),
-        finding("Nuclei: Deprecated Feature-Policy Header - Detection", finding_id=5),
+        finding("Content-Security-Policy header missing", finding_id=2, severity="Medium"),
+        finding("Referrer-Policy header missing", finding_id=3, severity="Low"),
+        finding("Permissions-Policy header missing", finding_id=4, severity="Info"),
+        finding("Nuclei: Deprecated Feature-Policy Header - Detection", finding_id=5, severity="Info", confidence="Medium"),
         finding("WhatWeb technology detected: JQuery", finding_id=6),
     ]}
     result = evaluator.evaluate_report(report, BASELINE)
@@ -33,8 +33,8 @@ def test_expected_signals_all_match_and_unmatched_findings_are_triage_only():
 
 def test_missing_expected_signal_fails_regression_baseline():
     report = {"scan_status": "completed", "tool_status": {"Nuclei": {"status": "completed"}}, "findings": [
-        finding("Target uses HTTP without transport encryption"),
-        finding("Content-Security-Policy header missing"),
+        finding("Target uses HTTP without transport encryption", severity="High"),
+        finding("Content-Security-Policy header missing", severity="Medium"),
     ]}
     result = evaluator.evaluate_report(report, BASELINE)
     assert result["result"] == "FAIL"
@@ -84,6 +84,30 @@ def test_expected_signal_can_also_require_a_severity_match():
     assert result["missing_expected_signals"] == ["csp-medium"]
 
 
+
+
+def test_expected_signal_must_match_configured_confidence():
+    baseline = {"expected_signals": [{
+        "id": "csp-high-confidence",
+        "title_contains": "Content-Security-Policy header missing",
+        "severity": "Medium",
+        "confidence": "High",
+    }]}
+    report = {
+        "scan_status": "completed",
+        "tool_status": {"Nuclei": {"status": "completed"}},
+        "findings": [finding(
+            "Content-Security-Policy header missing",
+            severity="Medium",
+            confidence="Low",
+        )],
+    }
+    result = evaluator.evaluate_report(report, baseline)
+    assert result["result"] == "FAIL"
+    assert result["missing_expected_signals"] == ["csp-high-confidence"]
+    assert result["expected_signal_results"][0]["match_constraints"]["confidence"] == "High"
+
+
 def test_empty_baseline_fails_instead_of_claiming_zero_percent_coverage():
     result = evaluator.evaluate_report({"findings": [], "scan_status": "completed", "tool_status": {"Nuclei": {"status": "completed"}}}, {"expected_signals": []})
     assert result["result"] == "FAIL"
@@ -92,11 +116,11 @@ def test_empty_baseline_fails_instead_of_claiming_zero_percent_coverage():
 
 def test_tool_timeout_fails_overall_evaluation_even_when_expected_signals_match():
     report = {"scan_status": "completed", "tool_status": {"Nuclei": {"status": "timeout"}}, "findings": [
-        finding("Target uses HTTP without transport encryption"),
-        finding("Content-Security-Policy header missing"),
-        finding("Referrer-Policy header missing"),
-        finding("Permissions-Policy header missing"),
-        finding("Nuclei: Deprecated Feature-Policy Header - Detection"),
+        finding("Target uses HTTP without transport encryption", severity="High"),
+        finding("Content-Security-Policy header missing", severity="Medium"),
+        finding("Referrer-Policy header missing", severity="Low"),
+        finding("Permissions-Policy header missing", severity="Info"),
+        finding("Nuclei: Deprecated Feature-Policy Header - Detection", severity="Info", confidence="Medium"),
     ]}
     result = evaluator.evaluate_report(report, BASELINE)
     assert result["expected_signal_coverage_percent"] == 100.0

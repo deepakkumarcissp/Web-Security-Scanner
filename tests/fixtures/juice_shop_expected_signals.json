@@ -1,39 +1,49 @@
 {
   "name": "DKCISSP loopback Juice Shop Standard-profile expected-signal baseline",
-  "version": 3,
-  "scope": "Observed deterministic built-in HTTP/header checks and one reproducible safe Nuclei header-template signal on the loopback Juice Shop lab, plus required scanner-tool health.",
+  "version": 4,
+  "scope": "Observed deterministic built-in HTTP/header checks and one reproducible safe Nuclei header-template signal on the loopback Juice Shop lab, plus required scanner-tool health. Severity and confidence expectations are regression guardrails for this lab baseline, not universal risk ratings.",
   "required_tools": ["Nuclei"],
   "expected_signals": [
     {
       "id": "transport-http",
       "description": "An HTTP target should produce the scanner's transport-encryption warning.",
       "title_contains": "Target uses HTTP without transport encryption",
-      "affected_url_contains": "127.0.0.1:1003"
+      "affected_url_contains": "127.0.0.1:1003",
+      "severity": "High",
+      "confidence": "High"
     },
     {
       "id": "missing-csp",
       "description": "The current Juice Shop lab response is expected to lack Content-Security-Policy.",
       "title_contains": "Content-Security-Policy header missing",
-      "affected_url_contains": "127.0.0.1:1003"
+      "affected_url_contains": "127.0.0.1:1003",
+      "severity": "Medium",
+      "confidence": "High"
     },
     {
       "id": "missing-referrer-policy",
       "description": "The current Juice Shop lab response is expected to lack Referrer-Policy.",
       "title_contains": "Referrer-Policy header missing",
-      "affected_url_contains": "127.0.0.1:1003"
+      "affected_url_contains": "127.0.0.1:1003",
+      "severity": "Low",
+      "confidence": "High"
     },
     {
       "id": "missing-permissions-policy",
       "description": "The current Juice Shop lab response is expected to lack Permissions-Policy.",
       "title_contains": "Permissions-Policy header missing",
-      "affected_url_contains": "127.0.0.1:1003"
+      "affected_url_contains": "127.0.0.1:1003",
+      "severity": "Info",
+      "confidence": "High"
     },
     {
       "id": "deprecated-feature-policy",
       "description": "The local lab response exposes the deprecated Feature-Policy header; the safe Nuclei header template should detect it.",
       "title_contains": "Nuclei: Deprecated Feature-Policy Header",
-      "affected_url_contains": "127.0.0.1:1003"
+      "affected_url_contains": "127.0.0.1:1003",
+      "severity": "Info",
+      "confidence": "Medium"
     }
   ],
-  "coverage_boundary": "The expected-signal percentage applies only to these five observed lab configuration signals. It is not an overall vulnerability detection rate, and this baseline does not assert that all other findings are true or false positives. Revalidate these expectations if the lab configuration or selected Nuclei templates change."
+  "coverage_boundary": "The expected-signal percentage applies only to these five observed lab configuration signals. Severity and confidence are checked against this fixture's explicit expectations, not asserted as universal ratings for every deployment. This is not an overall vulnerability detection rate, and this baseline does not assert that all other findings are true or false positives. Revalidate these expectations if the lab configuration or selected Nuclei templates change."
 }

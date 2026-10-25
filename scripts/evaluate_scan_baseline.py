@@ -47,6 +47,7 @@ def evaluate_report(report: dict[str, Any], baseline: dict[str, Any]) -> dict[st
         needle = normalize(check.get("title_contains", ""))
         url_needle = normalize(check.get("affected_url_contains", ""))
         expected_severity = normalize(check.get("severity", ""))
+        expected_confidence = normalize(check.get("confidence", ""))
         matching = [
             i for i, finding in enumerate(findings)
             if isinstance(finding, dict)
@@ -54,6 +55,7 @@ def evaluate_report(report: dict[str, Any], baseline: dict[str, Any]) -> dict[st
             and needle in normalize(finding.get("title"))
             and (not url_needle or url_needle in normalize(finding.get("affected_url") or finding.get("target")))
             and (not expected_severity or expected_severity == normalize(finding.get("severity")))
+            and (not expected_confidence or expected_confidence == normalize(finding.get("confidence")))
         ]
         matched_indexes.update(matching)
         expected_results.append({
@@ -66,6 +68,7 @@ def evaluate_report(report: dict[str, Any], baseline: dict[str, Any]) -> dict[st
                 "title_contains": check.get("title_contains", ""),
                 "affected_url_contains": check.get("affected_url_contains"),
                 "severity": check.get("severity"),
+                "confidence": check.get("confidence"),
             },
         })
 
