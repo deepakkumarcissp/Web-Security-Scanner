@@ -1476,6 +1476,17 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             finding(exposure["severity"], exposure["title"], exposure["evidence"],
                     exposure["remediation"], exposure["confidence"])
 
+        # Check the supplied root response as well as discovered pages; otherwise
+        # a directory index at the initial URL can be missed because discovery skips it.
+        if is_html_document(headers.get("content-type", "")) and re.search(
+            r"<title>\s*Index of /", body, re.I
+        ):
+            finding(
+                "Medium", "Directory listing appears enabled",
+                "The supplied response title resembles a directory index. Validate manually before treating as confirmed.",
+                "Disable directory listing or restrict access.", "Medium",
+            )
+
         if final_url.startswith("https://") and "strict-transport-security" not in headers:
             finding(
                 "Medium", "Strict-Transport-Security header missing",

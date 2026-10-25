@@ -1587,6 +1587,9 @@ def test_quick_scan_against_controlled_loopback_http_fixture(monkeypatch):
             elif self.path == "/.env.example":
                 body = b"EXAMPLE_SETTING=not-a-secret"
                 content_type = "text/plain; charset=utf-8"
+            elif self.path == "/directory-listing":
+                body = b"<html><head><title>Index of /</title></head><body>fixture index</body></html>"
+                content_type = "text/html; charset=utf-8"
             else:
                 body = b"<html><head><title>DKCISSP test fixture</title></head><body>fixture</body></html>"
                 content_type = "text/html; charset=utf-8"
@@ -1711,6 +1714,22 @@ def test_quick_scan_against_controlled_loopback_http_fixture(monkeypatch):
             example_titles = {row["title"] for row in conn.execute(
                 "SELECT title FROM findings WHERE scan_id=?", (example_id,)).fetchall()}
         assert "Potentially exposed backup or configuration artifact" not in example_titles
+
+        listing_target = target + "directory-listing"
+        with app.connect() as conn:
+            listing_id = conn.execute(
+                "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+                (listing_target, "quick", "running", app.now())).lastrowid
+        app.perform_scan(listing_id, listing_target, "quick")
+        with app.connect() as conn:
+            listing_rows = conn.execute(
+                "SELECT title,severity,confidence,evidence FROM findings WHERE scan_id=?",
+                (listing_id,)).fetchall()
+        listing_signal = next(row for row in listing_rows
+                              if row["title"] == "Directory listing appears enabled")
+        assert listing_signal["severity"] == "Medium"
+        assert listing_signal["confidence"] == "Medium"
+        assert "Validate manually" in listing_signal["evidence"]
 
         redirect_target = target + "redirect-out"
         with app.connect() as conn:
