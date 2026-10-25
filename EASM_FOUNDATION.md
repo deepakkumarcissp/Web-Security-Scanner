@@ -113,3 +113,11 @@ The broader `assessments/domain_recon.py` also illustrates a wide enrichment cat
 - `discovery_runs` persists completed and failed attempts; `GET /api/assets/{id}/discovery-runs` exposes the latest 50 runs.
 - `POST /api/assets/{id}/resolve` is an explicit, authorization-gated DNS inventory action. It stores resolved address sets and status, has a short per-lookup timeout, and explicitly reports zero HTTP probes, TLS checks, or scans. Discovered candidates must be tied to an organization root.
 - The API/data layer is implemented; the Attack Surface dashboard now exposes controls to trigger DNS resolution and view discovery history; organization management now has a dashboard form/table, and asset inventory includes organization context plus posture summaries/filters. DNS resolution is inventory-only and is not proof that a web service is reachable or in scope for scanning.
+
+
+### Explainable posture and source health
+
+- GET /api/assets now returns evidence-based posture_signals and a human-readable posture_priority. Signals describe known inventory gaps (scope review, unassigned organization, passive-discovery origin, and DNS status); they are not vulnerability findings or an opaque numeric risk score.
+- GET /api/easm/source-health summarizes discovery run counts by source, the latest recorded run and error, plus DNS-resolution inventory counts. It reads persisted data only and makes no external requests.
+- The Attack Surface inventory displays posture priority and its supporting signal labels. Discovery and DNS actions remain explicit; no candidate hosts are automatically scanned.
+- Validation checkpoint: 118 tests passed; Python compilation and git diff --check passed. Two existing dependency deprecation warnings remain.

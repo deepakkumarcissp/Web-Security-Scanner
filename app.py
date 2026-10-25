@@ -1764,14 +1764,70 @@ def create_organization(request: OrganizationRequest):
         return {**dict(row), "created": True}
 
 
+def build_posture_signals(asset):
+    signals = []
+    if asset.get("scope_status") == "needs_review":
+        signals.append({"code": "scope_review_required", "label": "Scope review required"})
+    if not asset.get("organization_id"):
+        signals.append({"code": "owner_unassigned", "label": "Organization unassigned"})
+    if asset.get("discovery_source") != "manual":
+        signals.append({"code": "discovered_candidate", "label": "Discovered candidate"})
+    resolution = asset.get("resolution_status") or "unknown"
+    if resolution == "unknown":
+        signals.append({"code": "dns_not_checked", "label": "DNS not checked"})
+    elif resolution != "resolved":
+        signals.append({"code": "dns_unresolved", "label": "DNS unresolved"})
+    if asset.get("scope_status") == "needs_review":
+        priority = "Review scope"
+    elif not asset.get("organization_id"):
+        priority = "Assign organization"
+    elif resolution != "resolved":
+        priority = "Resolve DNS"
+    else:
+        priority = "Inventory recorded"
+    return signals, priority
+
+
 @app.get("/api/assets")
 def list_assets():
     with connect() as conn:
-        return [dict(row) for row in conn.execute(
+        rows = [dict(row) for row in conn.execute(
             """SELECT a.*, o.name AS organization_name, o.root_domain AS organization_root_domain
                FROM assets a LEFT JOIN organizations o ON o.id=a.organization_id
                ORDER BY a.last_seen DESC, a.id DESC"""
         )]
+    for asset in rows:
+        signals, priority = build_posture_signals(asset)
+        asset["posture_signals"] = signals
+        asset["posture_priority"] = priority
+    return rows
+
+
+@app.get("/api/easm/source-health")
+def easm_source_health():
+    with connect() as conn:
+        sources = conn.execute(
+            """SELECT source, COUNT(*) AS run_count,
+                      SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count,
+                      SUM(CASE WHEN status!='success' THEN 1 ELSE 0 END) AS failure_count
+               FROM discovery_runs GROUP BY source ORDER BY source"""
+        ).fetchall()
+        result = []
+        for source_row in sources:
+            source = dict(source_row)
+            latest = conn.execute(
+                """SELECT id, root_asset_id, started_at, finished_at, status,
+                          candidate_count, new_assets_added, error_summary
+                   FROM discovery_runs WHERE source=? ORDER BY id DESC LIMIT 1""",
+                (source["source"],),
+            ).fetchone()
+            source["latest_run"] = dict(latest) if latest else None
+            result.append(source)
+        dns = conn.execute(
+            """SELECT resolution_status, COUNT(*) AS asset_count
+               FROM assets GROUP BY resolution_status ORDER BY resolution_status"""
+        ).fetchall()
+    return {"sources": result, "dns_inventory": [dict(row) for row in dns]}
 
 
 @app.get("/api/organizations/{organization_id}/events")

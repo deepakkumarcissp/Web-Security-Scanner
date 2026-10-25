@@ -125,3 +125,6 @@ The roadmap is intentionally evidence-gated. Do not claim broad detection covera
 - **EASM audit milestone:** added per-asset append-only lifecycle events and a dashboard history viewer; test coverage verifies registration, scope change, DNS lookup, and missing-asset handling.
 
 - **EASM provenance/change-tracking milestone:** added organization event history, explicit organization reassignment with exact root-domain validation and audit events, successful-run discovery snapshots, and per-asset snapshot inspection. Missing candidates are marked `missing_from_source` only when absent from a later successful run; this is not treated as proof of removal, and failed source runs do not create disappearance records. Full regression suite: pending final validation.
+
+
+- **EASM explainability milestone:** added human-readable posture signals/priority to asset responses and inventory, plus a read-only source-health API with latest run status, success/failure counts, and DNS inventory totals. No opaque risk score introduced. Validation: 118 tests passed; Python compilation and whitespace checks passed.

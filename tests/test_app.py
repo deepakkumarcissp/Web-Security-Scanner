@@ -1807,3 +1807,29 @@ def test_asset_ownership_and_snapshot_controls_are_exposed():
     assert "showAssetSnapshots" in response.text
     assert "Save owner" in response.text
     assert "Snapshots</button>" in response.text
+
+
+
+def test_asset_posture_signals_are_explainable():
+    from uuid import uuid4
+    target = f"https://posture-{uuid4().hex}.example"
+    created = client.post("/api/assets", json={
+        "target": target, "authorized": True, "scope_status": "needs_review",
+    })
+    assert created.status_code == 200
+    asset_id = created.json()["id"]
+    asset = next(row for row in client.get("/api/assets").json() if row["id"] == asset_id)
+    codes = {signal["code"] for signal in asset["posture_signals"]}
+    assert asset["posture_priority"] == "Review scope"
+    assert {"scope_review_required", "owner_unassigned", "dns_not_checked"} <= codes
+    assert "risk_score" not in asset
+
+
+def test_easm_source_health_is_read_only_and_empty_when_no_runs():
+    response = client.get("/api/easm/source-health")
+    assert response.status_code == 200
+    payload = response.json()
+    assert isinstance(payload["sources"], list)
+    for source in payload["sources"]:
+        assert {"source", "run_count", "success_count", "failure_count", "latest_run"} <= source.keys()
+    assert isinstance(payload["dns_inventory"], list)
