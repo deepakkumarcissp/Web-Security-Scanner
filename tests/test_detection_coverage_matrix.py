@@ -46,13 +46,18 @@ def test_coverage_document_warns_against_unjustified_overall_claims():
     )
 
 
-def test_sql_injection_and_xss_remain_unverified_until_detection_benchmarks_run():
+def test_sql_injection_and_xss_statuses_match_observed_benchmark_evidence():
     matrix = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
     categories = {item["id"]: item for item in matrix["categories"]}
 
     assert categories["server-misconfiguration"]["status"] == "implemented"
-    for category_id in ("sql-injection", "cross-site-scripting"):
-        category = categories[category_id]
-        assert category["status"] == "unverified"
-        assert "tests/test_wapiti_vulnerability_signals.py" in category["evidence"]
-        assert "benchmark" in category["next_action"].lower() or "fixture" in category["next_action"].lower()
+
+    sqli = categories["sql-injection"]
+    assert sqli["status"] == "unverified"
+    assert "LOCAL_DETECTION_BENCHMARK.md" in sqli["evidence"]
+    assert "database-backed" in sqli["next_action"].lower()
+
+    xss = categories["cross-site-scripting"]
+    assert xss["status"] == "implemented"
+    assert "tests/test_local_vuln_benchmark_fixture.py" in xss["evidence"]
+    assert "stored" in " ".join(xss["known_gaps"]).lower()

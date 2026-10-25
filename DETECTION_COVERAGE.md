@@ -5,8 +5,8 @@ This document is the human-readable companion to `tests/fixtures/detection_cover
 ## Status definitions
 
 - **validated** — a named controlled regression or expected-signal test exercises the specific behavior described. This is not a claim of comprehensive coverage.
-- **implemented** — integration or detector code exists and has tests, but a category-wide controlled benchmark is incomplete.
-- **unverified** — there is not yet a dedicated repeatable expected-signal benchmark for the category.
+- **implemented** — integration or detector code exists and has tests, and at least one narrow controlled signal has been observed; category-wide coverage remains incomplete.
+- **unverified** — there is not yet a dedicated repeatable expected-positive benchmark for the category.
 - **planned** — the capability or benchmark has not been delivered as a verified feature.
 
 ## Current priorities
@@ -16,8 +16,8 @@ This document is the human-readable companion to `tests/fixtures/detection_cover
 | P0 | Detection baseline integrity | In progress | Keep each expected signal tied to a deterministic fixture and report coverage boundaries clearly. |
 | P0 | Scope enforcement | Validated | Add a scope regression test for every new external tool adapter. |
 | P1 | Web-server misconfiguration | Implemented | Root directory-listing, stock-page signatures, and bounded OPTIONS/Allow method observations have helper and scan-level regression coverage. The broader category remains incomplete pending further controlled server-configuration cases. |
-| P1 | SQL injection | Unverified | Parser normalization tests exist; run a loopback-only deliberately vulnerable fixture to prove actual detection and record misses. |
-| P1 | Cross-site scripting | Unverified | Parser normalization tests exist; run controlled loopback-only reflected/stored cases and record hits, misses, and evidence quality. |
+| P1 | SQL injection | Unverified | Establish a database-backed, expected-positive loopback fixture and verify a confirmed signal through direct Wapiti and the DKCISSP adapter. |
+| P1 | Cross-site scripting | Implemented (narrow reflected case) | Repeat adapter testing and add separate controlled contexts; stored XSS and DOM-based XSS are not established. |
 | P1 | API security | Planned | Local API fixture with explicit role, authentication, and authorization expectations. |
 | P2 | Authenticated assessment | Planned | Credential-safe login/session design with explicit scope and secret redaction. |
 | P2 | Network/infrastructure assessment | Planned | Separate authorization model and controlled host/service lab. |
@@ -33,9 +33,23 @@ This document is the human-readable companion to `tests/fixtures/detection_cover
 7. Do not claim a vulnerability class is comprehensively supported because one example was detected.
 8. Run external scans only with explicit authorization and bounded approved scope.
 
+## SQLi/XSS benchmark result (2026-10-25)
+
+Direct Wapiti 3.2.10 against the loopback fixture crawled 5 pages and reported one reflected-XSS finding on `GET /search`, parameter `q`; SQL injection findings were zero. The SQL module emitted an HTTP 500 anomaly for `/product`, parameter `id`, which is not counted as SQLi evidence.
+
+The DKCISSP Wapiti adapter was then run against the same loopback fixture. It completed with return code 0, crawled 5 pages, and normalized one finding: `Wapiti: Reflected Cross Site Scripting` on `/search`, parameter `q`. No SQLi finding was normalized. This confirms the narrow reflected-XSS path through the adapter, not broad XSS coverage.
+
+A separate bounded direct Wapiti 3.2.10 SQL-only run against local Juice Shop at `http://127.0.0.1:1003/` used a fresh session and crawled 18 pages. It reported zero SQL Injection and zero Blind SQL Injection findings, with zero SQL-related anomalies. This is a negative result for that unauthenticated crawl; it did not demonstrate coverage of a known vulnerable SQLi input.
+
+Raw reports remain local-only:
+- `/tmp/dkcissp-wapiti-benchmark.json`
+- `/tmp/dkcissp-wapiti-juice-shop-sqli-fresh.json`
+
+Reproduction parameters and interpretation are documented in `LOCAL_DETECTION_BENCHMARK.md`.
+
 ## Important distinction: parser tests versus detection benchmarks
 
-`tests/test_wapiti_vulnerability_signals.py` verifies how sample Wapiti SQL injection and XSS report records are normalized, deduplicated, scoped, and assigned severity/evidence. It does **not** prove that Wapiti discovers those vulnerabilities on a live target. SQL injection and XSS therefore remain **unverified** until a controlled loopback-only benchmark records expected hits and misses.
+`tests/test_wapiti_vulnerability_signals.py` verifies how sample Wapiti SQL injection and XSS report records are normalized, deduplicated, scoped, and assigned severity/evidence. It does **not** prove that Wapiti discovers those vulnerabilities on a live target. Direct scanner runs and DKCISSP adapter runs are separate evidence and should be recorded separately.
 
 ## Existing benchmark suites
 

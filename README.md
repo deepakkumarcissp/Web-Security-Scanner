@@ -88,7 +88,7 @@ Standard/Deep scans now discover up to 12 same-origin URLs, with a maximum link 
 
 The maintained [Detection Coverage Matrix](DETECTION_COVERAGE.md) and machine-readable [coverage fixture](tests/fixtures/detection_coverage_matrix.json) distinguish validated behaviors from implemented integrations, unverified categories, and planned work. A category is not considered broadly supported just because one test case passes. Results are reported per category; there is no single overall detection-coverage percentage. The matrix is regression-tested so that validated claims keep references to existing test or fixture evidence.
 
-For repeatable SQL injection and reflected-XSS testing, see the [Local Detection Benchmark](LOCAL_DETECTION_BENCHMARK.md) and its intentionally vulnerable, loopback-only fixture (`scripts/local_vuln_benchmark_fixture.py`). Fixture unit tests verify that the expected signals exist; they do not substitute for a Wapiti detection run. SQL injection and XSS therefore remain **unverified** in the coverage matrix until actual benchmark output is reviewed and recorded.
+For repeatable SQL injection and reflected-XSS testing, see the [Local Detection Benchmark](LOCAL_DETECTION_BENCHMARK.md) and its intentionally vulnerable, loopback-only fixture (`scripts/local_vuln_benchmark_fixture.py`). Wapiti 3.2.10 and the DKCISSP Wapiti adapter each detected the fixture’s narrow reflected-XSS case. This supports an **implemented** status for that limited XSS path, not comprehensive XSS coverage. SQL injection remains **unverified**: the simulated-error fixture and a bounded unauthenticated Juice Shop crawl did not produce a confirmed SQLi finding. A database-backed expected-positive SQLi benchmark is still required.
 
 ## Current capabilities
 

@@ -185,27 +185,32 @@
         "active"
       ],
       "evidence": [
-        "tests/test_wapiti_vulnerability_signals.py"
+        "tests/test_wapiti_vulnerability_signals.py",
+        "LOCAL_DETECTION_BENCHMARK.md"
       ],
       "known_gaps": [
-        "Parser normalization has regression coverage, but no live local fixture benchmark has demonstrated actual SQL injection detection or measured misses."
+        "Parser normalization has regression coverage, but the direct Wapiti run against the local simulated-error fixture found no SQLi vulnerability; its HTTP 500 is not a confirmed SQLi signal.",
+        "A bounded unauthenticated Wapiti run against the local Juice Shop lab found no SQLi signal; it did not demonstrate coverage of a known vulnerable SQLi input."
       ],
-      "next_action": "Run the bounded Wapiti adapter against a deliberately vulnerable loopback-only fixture and record hits, misses, evidence quality, runtime, and tool failures."
+      "next_action": "Create or configure a database-backed loopback-only expected-positive SQLi benchmark, then verify both direct Wapiti and the DKCISSP adapter against that known input."
     },
     {
       "id": "cross-site-scripting",
       "name": "Cross-site scripting detection",
-      "status": "unverified",
+      "status": "implemented",
       "profiles": [
         "active"
       ],
       "evidence": [
-        "tests/test_wapiti_vulnerability_signals.py"
+        "tests/test_local_vuln_benchmark_fixture.py",
+        "tests/test_wapiti_vulnerability_signals.py",
+        "LOCAL_DETECTION_BENCHMARK.md"
       ],
       "known_gaps": [
-        "Parser normalization has regression coverage, but no live local fixture benchmark has demonstrated actual reflected or stored XSS detection or measured misses."
+        "One reflected-XSS signal was detected by direct Wapiti and by the DKCISSP Wapiti adapter against the local fixture; this is narrow evidence, not comprehensive XSS coverage.",
+        "Stored XSS, authenticated flows, client-side DOM XSS, and broader application contexts are not covered by this benchmark."
       ],
-      "next_action": "Run the bounded Wapiti adapter against controlled loopback-only reflected and stored-XSS fixtures; record hits, misses, evidence quality, and scope behavior."
+      "next_action": "Repeat the adapter benchmark and add separate controlled XSS contexts; preserve explicit limitations for stored and DOM-based XSS."
     },
     {
       "id": "api-security",
