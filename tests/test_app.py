@@ -1405,3 +1405,59 @@ def test_nuclei_exposed_file_signal_is_normalized_and_out_of_scope_result_droppe
     assert findings[0][2] == "http://127.0.0.1:1003/.well-known/security.txt"
     assert "HTTP 200" in findings[0][3]
     assert "scope-mismatch.example" not in str(findings)
+
+
+
+def test_zap_cors_alert_preserves_credential_evidence_and_filters_other_origins(monkeypatch):
+    import json
+    from urllib.parse import urlparse
+
+    monkeypatch.setattr(app, "diagnose_zap_api", lambda: {"status": "ready", "endpoint": "http://127.0.0.1:8090"})
+    monkeypatch.setattr(app, "zap_api_settings", lambda: ("http://127.0.0.1:8090", "test-key"))
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self, _size):
+            return json.dumps(self.payload).encode()
+
+    def fake_urlopen(request, timeout=4):
+        path = urlparse(request.full_url).path
+        if path.endswith("/accessUrl/"):
+            return FakeResponse({"accessUrl": [{"Result": "OK"}]})
+        if path.endswith("/recordsToScan/"):
+            return FakeResponse({"recordsToScan": "0"})
+        if path.endswith("/alerts/"):
+            return FakeResponse({"alerts": [
+                {"risk": "Medium", "alert": "Cross-Domain Misconfiguration",
+                 "url": "http://app.example.test/api/profile",
+                 "description": "Review cross-origin access policy",
+                 "evidence": "Access-Control-Allow-Origin: *; Access-Control-Allow-Credentials: true",
+                 "solution": "Restrict allowed origins and review credential handling", "confidence": "High"},
+                {"risk": "High", "alert": "Cross-Domain Misconfiguration",
+                 "url": "http://app.example.test.attacker.invalid/api/profile",
+                 "description": "Out-of-origin alert must be ignored",
+                 "evidence": "Access-Control-Allow-Origin: *",
+                 "solution": "Ignore external alert", "confidence": "High"},
+            ]})
+        raise AssertionError(request.full_url)
+
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    findings, status = app.perform_zap_passive_check(
+        "http://app.example.test/",
+        targets=["http://app.example.test/", "http://app.example.test/api/profile"],
+    )
+
+    assert status["status"] == "completed"
+    assert status["alert_count"] == 1
+    assert status["finding_count"] == 1
+    cors = findings[0]
+    assert cors[1] == "OWASP ZAP: Cross-Domain Misconfiguration"
+    assert cors[2] == "http://app.example.test/api/profile"
+    assert "Access-Control-Allow-Origin: *" in cors[3]
+    assert "Access-Control-Allow-Credentials: true" in cors[3]
+    assert "attacker.invalid" not in str(findings)
