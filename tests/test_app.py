@@ -476,6 +476,10 @@ def test_whatweb_parses_technology_findings_with_bounded_subprocess(monkeypatch)
                 "WordPress": {"version": ["6.5"]},
                 "PHP": {"version": ["8.2"]},
                 "HTTPServer": {"string": ["nginx"]},
+                "HTML5": {"string": ["HTML5"]},
+                "Script": {"string": ["script"]},
+                "UncommonHeaders": {"string": ["Feature-Policy"]},
+                "X-Frame-Options": {"string": ["SAMEORIGIN"]},
             }}], report_file)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -487,6 +491,8 @@ def test_whatweb_parses_technology_findings_with_bounded_subprocess(monkeypatch)
         "WhatWeb technology detected: WordPress", "WhatWeb technology detected: PHP"
     }
     assert all(finding[0] == "Info" and finding[5] == "Low" for finding in findings)
+    assert not any(title.endswith(("HTML5", "Script", "UncommonHeaders", "X-Frame-Options"))
+                   for _severity, title, *_rest in findings)
 
 
 def test_whatweb_timeout_is_reported(monkeypatch):

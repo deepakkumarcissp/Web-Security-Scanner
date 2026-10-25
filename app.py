@@ -1002,7 +1002,13 @@ def perform_whatweb_check(target: str, timeout_seconds: int = 30) -> tuple[list[
             continue
         for plugin_name, plugin_data in plugins.items():
             name = str(plugin_name).strip()[:160]
-            if not name or name.lower() in {"httpserver", "ip", "country", "title", "redirectlocation"}:
+            # Suppress generic protocol/markup/header labels that add noise rather
+            # than identifying a useful application technology. Keep actual frameworks,
+            # CMSs, runtimes, and versioned components as informational inventory signals.
+            if not name or name.lower() in {
+                "httpserver", "ip", "country", "title", "redirectlocation",
+                "html5", "script", "uncommonheaders", "x-frame-options",
+            }:
                 continue
             version_values = []
             if isinstance(plugin_data, dict):
