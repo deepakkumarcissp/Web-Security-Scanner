@@ -266,6 +266,18 @@ def test_testssl_parses_findings_with_bounded_subprocess(monkeypatch):
 
 
 
+def test_testssl_timeout_is_inconclusive_and_emits_no_finding(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/testssl.sh")
+    def timeout_run(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd="testssl.sh", timeout=75)
+    monkeypatch.setattr(app.subprocess, "run", timeout_run)
+    findings, status = app.perform_testssl_check("https://example.test")
+    assert findings == []
+    assert status["status"] == "timeout"
+    assert status["timeout_seconds"] == 75
+
+
 def test_nuclei_reports_missing_binary(monkeypatch):
     monkeypatch.setattr(app.shutil, "which", lambda _binary: None)
     findings, status = app.perform_nuclei_check("https://example.test")
