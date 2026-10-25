@@ -1192,13 +1192,13 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         nikto_status = {"status": "not_run", "reason": "Nikto server checks are enabled for Deep/Active profiles only"}
         if profile in ("standard", "deep", "active"):
             nuclei_targets = discovery_status.get("urls", [target])
-            nuclei_template_cap = 60 if profile in ("deep", "active") else 30
-            # Standard runs the full bounded template set against the authorized root URL.
-            # Deep/Active expand across discovered same-origin endpoints; this avoids asset-heavy
-            # URL lists making Standard time out before Nuclei can emit its report.
+            nuclei_template_cap = 60 if profile in ("deep", "active") else 5
+            # Standard is a quick baseline: run a small category-balanced template set on the
+            # authorized root URL. Deep/Active expand to 60 templates across discovered endpoints.
+            # This keeps the default profile bounded while preserving broader coverage on demand.
             if profile == "standard":
                 nuclei_targets = [target]
-            nuclei_timeout = 240 if profile in ("deep", "active") else 60
+            nuclei_timeout = 240 if profile in ("deep", "active") else 30
             tool_status["Nuclei"] = {"status": "running", "detail": f"Running up to {nuclei_template_cap} safe templates across {len(nuclei_targets[:12])} same-origin URL(s); 5 requests/second maximum"}
             update_scan_progress(scan_id, 35, "Running Nuclei safe checks", tool_status)
             nuclei_findings, nuclei_status = perform_nuclei_check(target, timeout_seconds=nuclei_timeout,
