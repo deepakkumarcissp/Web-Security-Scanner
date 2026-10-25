@@ -14,144 +14,264 @@
       "id": "http-transport-and-headers",
       "name": "HTTP transport and security headers",
       "status": "validated",
-      "profiles": ["quick", "standard", "deep", "active"],
-      "evidence": ["tests/fixtures/controlled_http_expected_signals.json", "tests/test_app.py", "tests/test_scan_baseline.py"],
-      "known_gaps": ["Header presence checks do not prove that a policy is optimal for a specific application."],
+      "profiles": [
+        "quick",
+        "standard",
+        "deep",
+        "active"
+      ],
+      "evidence": [
+        "tests/fixtures/controlled_http_expected_signals.json",
+        "tests/test_app.py",
+        "tests/test_scan_baseline.py"
+      ],
+      "known_gaps": [
+        "Header presence checks do not prove that a policy is optimal for a specific application."
+      ],
       "next_action": "Add header-policy edge cases and verify response handling across HTML and non-HTML content."
     },
     {
       "id": "cors-observations",
       "name": "CORS configuration observations",
       "status": "validated",
-      "profiles": ["quick", "standard", "deep", "active"],
-      "evidence": ["tests/fixtures/controlled_http_expected_signals.json", "tests/test_app.py"],
-      "known_gaps": ["Wildcard origin is an observation and does not by itself prove sensitive cross-origin exposure."],
+      "profiles": [
+        "quick",
+        "standard",
+        "deep",
+        "active"
+      ],
+      "evidence": [
+        "tests/fixtures/controlled_http_expected_signals.json",
+        "tests/test_app.py"
+      ],
+      "known_gaps": [
+        "Wildcard origin is an observation and does not by itself prove sensitive cross-origin exposure."
+      ],
       "next_action": "Add controlled tests for reflected origins, Vary: Origin, preflight responses, and credential semantics without claiming exploitability from one header."
     },
     {
       "id": "exposed-file-metadata",
       "name": "Potentially exposed backup/configuration/repository artifacts",
       "status": "validated",
-      "profiles": ["quick", "standard", "deep", "active"],
-      "evidence": ["tests/test_exposure_detection.py", "tests/test_app.py", "tests/fixtures/controlled_http_expected_signals.json"],
-      "known_gaps": ["Only URLs supplied or discovered within the approved same origin are checked; arbitrary filename enumeration is not implemented.", "Filename and HTTP status alone do not confirm secrets or sensitive content."],
+      "profiles": [
+        "quick",
+        "standard",
+        "deep",
+        "active"
+      ],
+      "evidence": [
+        "tests/test_exposure_detection.py",
+        "tests/test_app.py",
+        "tests/fixtures/controlled_http_expected_signals.json"
+      ],
+      "known_gaps": [
+        "Only URLs supplied or discovered within the approved same origin are checked; arbitrary filename enumeration is not implemented.",
+        "Filename and HTTP status alone do not confirm secrets or sensitive content."
+      ],
       "next_action": "Add more deterministic path and status edge cases, then design an explicit opt-in bounded content-discovery profile separately."
     },
     {
       "id": "same-origin-discovery",
       "name": "Bounded same-origin link discovery",
       "status": "implemented",
-      "profiles": ["standard", "deep", "active"],
-      "evidence": ["tests/test_app.py"],
-      "known_gaps": ["No JavaScript execution, authenticated crawling, or comprehensive client-side route discovery."],
+      "profiles": [
+        "standard",
+        "deep",
+        "active"
+      ],
+      "evidence": [
+        "tests/test_app.py"
+      ],
+      "known_gaps": [
+        "No JavaScript execution, authenticated crawling, or comprehensive client-side route discovery."
+      ],
       "next_action": "Benchmark pagination, URL normalization, duplicate handling, depth/page caps, and cross-origin redirect rejection."
     },
     {
       "id": "technology-fingerprinting",
       "name": "Technology fingerprinting",
       "status": "implemented",
-      "profiles": ["standard", "deep", "active"],
-      "evidence": ["tests/test_app.py"],
-      "known_gaps": ["A technology fingerprint is inventory evidence, not a confirmed vulnerability; version inference may be incomplete."],
+      "profiles": [
+        "standard",
+        "deep",
+        "active"
+      ],
+      "evidence": [
+        "tests/test_app.py"
+      ],
+      "known_gaps": [
+        "A technology fingerprint is inventory evidence, not a confirmed vulnerability; version inference may be incomplete."
+      ],
       "next_action": "Add parser fixtures for version uncertainty, duplicate signals, and informational severity."
     },
     {
       "id": "nuclei-safe-templates",
       "name": "Curated Nuclei HTTP template integration",
       "status": "implemented",
-      "profiles": ["standard", "deep", "active"],
-      "evidence": ["tests/test_app.py", "tests/test_scan_baseline.py", "tests/fixtures/juice_shop_expected_signals.json"],
-      "known_gaps": ["Coverage depends on installed template version, selected templates, target behavior, and configured runtime budget."],
+      "profiles": [
+        "standard",
+        "deep",
+        "active"
+      ],
+      "evidence": [
+        "tests/test_app.py",
+        "tests/test_scan_baseline.py",
+        "tests/fixtures/juice_shop_expected_signals.json"
+      ],
+      "known_gaps": [
+        "Coverage depends on installed template version, selected templates, target behavior, and configured runtime budget."
+      ],
       "next_action": "Record template-set identity/version in scan provenance and add deterministic adapter tests for timeout and partial results."
     },
     {
       "id": "tls-assessment",
       "name": "TLS assessment via testssl.sh",
       "status": "implemented",
-      "profiles": ["standard", "deep", "active"],
-      "evidence": ["tests/test_app.py"],
-      "known_gaps": ["Existing local integration coverage does not prove all TLS scenarios or external tool versions."],
+      "profiles": [
+        "standard",
+        "deep",
+        "active"
+      ],
+      "evidence": [
+        "tests/test_app.py"
+      ],
+      "known_gaps": [
+        "Existing local integration coverage does not prove all TLS scenarios or external tool versions."
+      ],
       "next_action": "Expand controlled HTTPS fixtures and test result normalization and missing-tool behavior."
     },
     {
       "id": "zap-passive",
       "name": "OWASP ZAP passive-alert integration",
       "status": "implemented",
-      "profiles": ["quick", "standard", "deep", "active"],
-      "evidence": ["tests/test_app.py"],
-      "known_gaps": ["A configured endpoint or open port alone does not prove that a live ZAP integration was exercised."],
+      "profiles": [
+        "quick",
+        "standard",
+        "deep",
+        "active"
+      ],
+      "evidence": [
+        "tests/test_app.py"
+      ],
+      "known_gaps": [
+        "A configured endpoint or open port alone does not prove that a live ZAP integration was exercised."
+      ],
       "next_action": "Add repeatable local ZAP service integration checks and document precisely which passive alerts are retrieved."
     },
     {
       "id": "server-misconfiguration",
       "name": "Broader web-server misconfiguration checks",
       "status": "planned",
-      "profiles": ["deep"],
-      "evidence": [],
-      "known_gaps": ["Current checks and optional tool outputs do not yet constitute a complete server-misconfiguration benchmark."],
-      "next_action": "Create controlled fixtures for directory listing, default pages, risky methods, and safe server metadata observations."
+      "profiles": [
+        "deep"
+      ],
+      "evidence": [
+        "tests/test_app.py",
+        "tests/test_default_server_page_detection.py"
+      ],
+      "known_gaps": [
+        "Risky HTTP method exposure is not yet checked by a dedicated bounded OPTIONS probe.",
+        "Stock-page signatures are low-confidence inventory signals and may be intentionally deployed.",
+        "Current checks do not constitute a complete server-misconfiguration benchmark."
+      ],
+      "next_action": "Add controlled fixtures for risky methods, then validate root and discovered-page default-page observations in a scan-level test."
     },
     {
       "id": "sql-injection",
       "name": "SQL injection detection",
       "status": "unverified",
-      "profiles": ["active"],
+      "profiles": [
+        "active"
+      ],
       "evidence": [],
-      "known_gaps": ["No dedicated repeatable expected-signal benchmark is currently registered in this matrix."],
+      "known_gaps": [
+        "No dedicated repeatable expected-signal benchmark is currently registered in this matrix."
+      ],
       "next_action": "Create a local-only deliberately vulnerable fixture and validate the selected tool adapter and evidence quality before claiming support."
     },
     {
       "id": "cross-site-scripting",
       "name": "Cross-site scripting detection",
       "status": "unverified",
-      "profiles": ["active"],
+      "profiles": [
+        "active"
+      ],
       "evidence": [],
-      "known_gaps": ["A prior controlled reflected-XSS exercise does not establish broad XSS coverage across contexts or frameworks."],
+      "known_gaps": [
+        "A prior controlled reflected-XSS exercise does not establish broad XSS coverage across contexts or frameworks."
+      ],
       "next_action": "Create local controlled reflected and stored-XSS cases and measure which cases are detected, missed, or misclassified."
     },
     {
       "id": "api-security",
       "name": "API security and authorization",
       "status": "planned",
-      "profiles": ["standard", "deep", "active"],
+      "profiles": [
+        "standard",
+        "deep",
+        "active"
+      ],
       "evidence": [],
-      "known_gaps": ["No dedicated API schema, authentication, object-level authorization, or role-boundary benchmark is registered."],
+      "known_gaps": [
+        "No dedicated API schema, authentication, object-level authorization, or role-boundary benchmark is registered."
+      ],
       "next_action": "Add a controlled API fixture with documented roles and expected authentication/authorization outcomes."
     },
     {
       "id": "authenticated-assessment",
       "name": "Authenticated application assessment",
       "status": "planned",
-      "profiles": ["deep"],
+      "profiles": [
+        "deep"
+      ],
       "evidence": [],
-      "known_gaps": ["The bounded crawler does not log in, manage sessions, or cover authenticated routes."],
+      "known_gaps": [
+        "The bounded crawler does not log in, manage sessions, or cover authenticated routes."
+      ],
       "next_action": "Design a credential-safe session workflow with explicit consent, secret redaction, and scope-aware replay tests."
     },
     {
       "id": "network-infrastructure",
       "name": "Network and infrastructure vulnerability assessment",
       "status": "planned",
-      "profiles": ["deep"],
+      "profiles": [
+        "deep"
+      ],
       "evidence": [],
-      "known_gaps": ["The current matrix does not establish comprehensive host/service discovery or infrastructure vulnerability coverage."],
+      "known_gaps": [
+        "The current matrix does not establish comprehensive host/service discovery or infrastructure vulnerability coverage."
+      ],
       "next_action": "Define a separate authorized-scope model and local lab benchmark before integrating infrastructure scanners."
     },
     {
       "id": "finding-quality-and-deduplication",
       "name": "Finding normalization, deduplication, and triage",
       "status": "implemented",
-      "profiles": ["all"],
-      "evidence": ["tests/test_app.py", "tests/test_scan_baseline.py"],
-      "known_gaps": ["Different tools may describe the same root cause differently; confidence is not a calibrated probability."],
+      "profiles": [
+        "all"
+      ],
+      "evidence": [
+        "tests/test_app.py",
+        "tests/test_scan_baseline.py"
+      ],
+      "known_gaps": [
+        "Different tools may describe the same root cause differently; confidence is not a calibrated probability."
+      ],
       "next_action": "Build cross-tool duplicate fixtures and track human-adjudicated false-positive outcomes."
     },
     {
       "id": "scope-enforcement",
       "name": "Approved-origin and redirect scope enforcement",
       "status": "validated",
-      "profiles": ["all"],
-      "evidence": ["tests/test_app.py"],
-      "known_gaps": ["Every new tool adapter must independently preserve target scope and be regression-tested."],
+      "profiles": [
+        "all"
+      ],
+      "evidence": [
+        "tests/test_app.py"
+      ],
+      "known_gaps": [
+        "Every new tool adapter must independently preserve target scope and be regression-tested."
+      ],
       "next_action": "Require scope-validation tests in the checklist for every new scanner adapter."
     }
   ]

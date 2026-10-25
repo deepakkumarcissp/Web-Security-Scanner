@@ -504,6 +504,30 @@ def exposed_file_observation(url: str, status_code: int, headers: dict) -> dict 
     }
 
 
+def default_server_page_observation(body: str, content_type: str) -> dict | None:
+    """Identify well-known stock server welcome pages as low-confidence inventory signals."""
+    if not is_html_document(content_type):
+        return None
+    sample = (body or "")[:500_000].casefold()
+    signatures = (
+        ("apache2 debian default page", "Apache2 Debian Default Page"),
+        ("welcome to nginx!", "nginx welcome page"),
+        ("test page for the apache http server", "Apache HTTP Server test page"),
+        ("iis windows server", "IIS default server page"),
+        ("internet information services", "IIS default server page"),
+    )
+    for marker, label in signatures:
+        if marker in sample:
+            return {
+                "title": "Possible default web-server page",
+                "severity": "Info",
+                "confidence": "Low",
+                "evidence": f"The HTML response contains a known stock-page marker ({label}). This may be intentional or customized; validate manually.",
+                "remediation": "If this is a production service, replace or remove unused stock welcome/test pages and confirm the intended application is served. This marker alone is not proof of a vulnerability.",
+            }
+    return None
+
+
 def discover_same_origin_pages(root_url: str, root_html: str, max_pages: int = 12, max_depth: int = 2) -> dict:
     """Bounded, low-rate, same-origin page discovery; never submits forms or executes JS."""
     root = root_url.rstrip("/") or root_url
@@ -1486,6 +1510,11 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                 "The supplied response title resembles a directory index. Validate manually before treating as confirmed.",
                 "Disable directory listing or restrict access.", "Medium",
             )
+
+        default_page = default_server_page_observation(body, headers.get("content-type", ""))
+        if default_page:
+            finding(default_page["severity"], default_page["title"], default_page["evidence"],
+                    default_page["remediation"], default_page["confidence"])
 
         if final_url.startswith("https://") and "strict-transport-security" not in headers:
             finding(
