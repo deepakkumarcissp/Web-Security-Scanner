@@ -26,6 +26,7 @@ The broader `assessments/domain_recon.py` also illustrates a wide enrichment cat
 - First-class organization/root-domain registry API (`GET/POST /api/organizations`) with normalized DNS roots, owner contact/notes, explicit authorization, and asset counts.
 - Assets can associate with an organization; automatic association uses exact root-domain or dot-label subdomain boundaries, and discovered candidates inherit the root asset's organization.
 - Explicit authorization for asset registration, scope changes, and passive discovery.
+- Dashboard organization/root-domain registration form, organization inventory table, optional organization selection during asset registration, organization-aware asset rows, posture metric cards, and client-side inventory filters for scope/DNS status.
 - Opt-in Certificate Transparency lookup for an approved DNS root, normalized through a source adapter contract (`source`, timestamps, status, candidates, errors, and limit metadata).
 - Persistent per-root discovery run history, including successful runs and source failures.
 - Explicit bounded DNS resolution action for registered, organization-linked discovered candidates; stores resolution status, deduplicated A/AAAA addresses, timestamp, and error without HTTP/TLS probing or scan launch.
@@ -38,7 +39,7 @@ The broader `assessments/domain_recon.py` also illustrates a wide enrichment cat
 
 | Capability | Current scanner state | Recommended next step |
 |---|---|---|
-| Root organization/brand registry | Organization/root-domain API and exact-boundary asset association implemented; UI form remains | Add UI form and audit history |
+| Root organization/brand registry | Organization/root-domain API, management form, inventory table, asset association, and posture filters implemented | Add audit history and owner-change tracking |
 | Subdomain sources | Opt-in `crt.sh` adapter with persisted per-run status and bounded metadata; no archive/subfinder source yet | Add optional passive archive adapter and explicitly invoked subfinder integration |
 | Candidate validation | Explicit bounded DNS resolution persists deduplicated addresses, status, timestamp, and errors; no HTTP/TLS fingerprinting | Add CNAME detail and separately approved low-impact fingerprinting |
 | HTTP/TLS fingerprint | Existing web checks happen during a scan | Add a low-impact, separately reported inventory fingerprint only after scope approval, with strict origin controls and verified TLS diagnostics |
@@ -106,4 +107,4 @@ The broader `assessments/domain_recon.py` also illustrates a wide enrichment cat
 - CT discovery now uses a normalized adapter result contract with source, start/end timestamps, status, candidates, errors, and response/result limits.
 - `discovery_runs` persists completed and failed attempts; `GET /api/assets/{id}/discovery-runs` exposes the latest 50 runs.
 - `POST /api/assets/{id}/resolve` is an explicit, authorization-gated DNS inventory action. It stores resolved address sets and status, has a short per-lookup timeout, and explicitly reports zero HTTP probes, TLS checks, or scans. Discovered candidates must be tied to an organization root.
-- The API/data layer is implemented; the Attack Surface dashboard now exposes controls to trigger DNS resolution and view discovery history; organization management still needs a dedicated UI form. DNS resolution is inventory-only and is not proof that a web service is reachable or in scope for scanning.
+- The API/data layer is implemented; the Attack Surface dashboard now exposes controls to trigger DNS resolution and view discovery history; organization management now has a dashboard form/table, and asset inventory includes organization context plus posture summaries/filters. DNS resolution is inventory-only and is not proof that a web service is reachable or in scope for scanning.

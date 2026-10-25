@@ -1711,7 +1711,9 @@ def create_organization(request: OrganizationRequest):
 def list_assets():
     with connect() as conn:
         return [dict(row) for row in conn.execute(
-            "SELECT * FROM assets ORDER BY last_seen DESC, id DESC"
+            """SELECT a.*, o.name AS organization_name, o.root_domain AS organization_root_domain
+               FROM assets a LEFT JOIN organizations o ON o.id=a.organization_id
+               ORDER BY a.last_seen DESC, a.id DESC"""
         )]
 
 

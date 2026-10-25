@@ -19,7 +19,7 @@
 - [x] Review AIAgent ASM orchestration and broader domain-recon capability model.
 - [x] Document capability gaps, implementation stages, and security requirements for DKCISSP EASM.
 - [x] Expose the existing asset inventory as **Attack Surface (Beta)** while describing only capabilities that exist today.
-- [x] Add organization/root-domain records and exact-boundary asset association without losing URL/port scope boundaries (API/data layer; dashboard management UI remains to be added).
+- [x] Add organization/root-domain records and exact-boundary asset association without losing URL/port scope boundaries (API/data layer; dashboard organization form/table and inventory selector implemented).
 - [ ] Add a discovery adapter contract and persist per-source status, provenance, timestamps, limits, and errors.
 - [ ] Add bounded DNS resolution as a distinct inventory stage, not implicit permission to probe/scan.
 - [ ] Add approved-only, low-impact HTTP/TLS fingerprinting and asset-change snapshots.
@@ -115,5 +115,9 @@ The roadmap is intentionally evidence-gated. Do not claim broad detection covera
 - [x] Add bounded, explicitly invoked DNS resolution with per-asset status and deduplicated addresses; no HTTP/TLS probes or scan launch.
 - [x] Add regression tests for adapter success/failure persistence, authorization, DNS scope linkage, and no-scan behavior.
 - [x] Add dashboard controls for discovery history and DNS resolution/status.
-- [ ] Add a dedicated organization/root-domain registration UI form.
+- [x] Add a dedicated organization/root-domain registration UI form and organization table.
+- [x] Add organization-aware asset registration and inventory posture cards/filters.
 - [ ] Add additional passive discovery sources only behind the same bounded adapter contract.
+
+
+- **EASM dashboard milestone:** added organization/root-domain registration and inventory UI, optional organization assignment for assets, organization name/root domain in asset list responses, posture cards (organizations, assets, review queue, in-scope assets, DNS-resolved assets), and filters for review/scope/DNS state. Full test suite: pending final validation.

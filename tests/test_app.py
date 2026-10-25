@@ -728,6 +728,11 @@ def test_asset_inventory_ui_is_wired_to_scope_api():
     assert "Attack Surface (Beta)" in nav
     assert 'id="assetRows"' in response.text
     assert 'id="assetForm"' in response.text
+    assert 'id="organizationForm"' in response.text
+    assert 'id="assetOrganization"' in response.text
+    assert 'id="assetFilter"' in response.text
+    assert 'id="metricDnsResolved"' in response.text
+    assert "loadOrganizations()" in response.text
     assert "loadAssets()" in response.text
     assert "New assets default to Needs Review" in response.text
     assert "EASM foundation (beta)" in response.text
@@ -1705,3 +1710,18 @@ def test_attack_surface_ui_exposes_dns_and_discovery_history_controls():
     assert "showDiscoveryRuns" in response.text
     assert "Discovery / DNS" in response.text
     assert "DNS resolution is now an explicit inventory action" in response.text
+
+
+def test_asset_api_includes_organization_display_fields():
+    from uuid import uuid4
+    domain = f"inventory-{uuid4().hex}.example"
+    org = client.post("/api/organizations", json={
+        "name": f"Inventory Org {domain}", "root_domain": domain, "authorized": True,
+    }).json()
+    asset = client.post("/api/assets", json={
+        "target": f"https://api.{domain}", "organization_id": org["id"], "authorized": True,
+    }).json()
+    listed = next(row for row in client.get("/api/assets").json() if row["id"] == asset["id"])
+    assert listed["organization_name"] == org["name"]
+    assert listed["organization_root_domain"] == domain
+    assert client.get("/api/organizations").json()[0]["asset_count"] >= 0
