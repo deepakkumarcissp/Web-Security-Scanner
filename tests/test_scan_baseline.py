@@ -21,13 +21,14 @@ def test_expected_signals_all_match_and_unmatched_findings_are_triage_only():
         finding("Content-Security-Policy header missing", finding_id=2),
         finding("Referrer-Policy header missing", finding_id=3),
         finding("Permissions-Policy header missing", finding_id=4),
-        finding("WhatWeb technology detected: JQuery", finding_id=5),
+        finding("Nuclei: Deprecated Feature-Policy Header - Detection", finding_id=5),
+        finding("WhatWeb technology detected: JQuery", finding_id=6),
     ]}
     result = evaluator.evaluate_report(report, BASELINE)
     assert result["result"] == "PASS"
     assert result["expected_signal_coverage_percent"] == 100.0
     assert result["false_positive_status"] == "NOT_ASSESSED"
-    assert [f["id"] for f in result["unmatched_findings_requiring_triage"]] == [5]
+    assert [f["id"] for f in result["unmatched_findings_requiring_triage"]] == [6]
 
 
 def test_missing_expected_signal_fails_regression_baseline():
@@ -37,7 +38,7 @@ def test_missing_expected_signal_fails_regression_baseline():
     ]}
     result = evaluator.evaluate_report(report, BASELINE)
     assert result["result"] == "FAIL"
-    assert result["expected_signal_coverage_percent"] == 50.0
+    assert result["expected_signal_coverage_percent"] == 40.0
     assert "missing-referrer-policy" in result["missing_expected_signals"]
 
 
@@ -62,6 +63,7 @@ def test_tool_timeout_fails_overall_evaluation_even_when_expected_signals_match(
         finding("Content-Security-Policy header missing"),
         finding("Referrer-Policy header missing"),
         finding("Permissions-Policy header missing"),
+        finding("Nuclei: Deprecated Feature-Policy Header - Detection"),
     ]}
     result = evaluator.evaluate_report(report, BASELINE)
     assert result["expected_signal_coverage_percent"] == 100.0

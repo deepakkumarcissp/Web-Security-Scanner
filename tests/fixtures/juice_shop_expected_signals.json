@@ -1,7 +1,7 @@
 {
   "name": "DKCISSP loopback Juice Shop Standard-profile expected-signal baseline",
-  "version": 1,
-  "scope": "Deterministic built-in HTTP/header checks for a loopback HTTP target, plus required scanner-tool health.",
+  "version": 2,
+  "scope": "Observed deterministic built-in HTTP/header checks and one reproducible safe Nuclei header-template signal on the loopback Juice Shop lab, plus required scanner-tool health.",
   "required_tools": ["Nuclei"],
   "expected_signals": [
     {
@@ -23,7 +23,12 @@
       "id": "missing-permissions-policy",
       "description": "The current Juice Shop lab response is expected to lack Permissions-Policy.",
       "title_contains": "Permissions-Policy header missing"
+    },
+    {
+      "id": "deprecated-feature-policy",
+      "description": "The local lab response exposes the deprecated Feature-Policy header; the safe Nuclei header template should detect it.",
+      "title_contains": "Nuclei: Deprecated Feature-Policy Header"
     }
   ],
-  "coverage_boundary": "The expected-signal percentage applies only to these four observed lab configuration signals. It is not a vulnerability detection rate, and this baseline does not assert that all other findings are true or false positives. Revalidate these expectations if the lab configuration changes."
+  "coverage_boundary": "The expected-signal percentage applies only to these five observed lab configuration signals. It is not an overall vulnerability detection rate, and this baseline does not assert that all other findings are true or false positives. Revalidate these expectations if the lab configuration or selected Nuclei templates change."
 }
