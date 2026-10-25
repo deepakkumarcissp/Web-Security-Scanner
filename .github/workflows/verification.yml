@@ -29,8 +29,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pytest httpx
 
-      - name: Compile application and tests
-        run: python -m py_compile app.py tests/test_app.py
+      - name: Compile application, tests, and validation runner
+        run: python -m py_compile app.py tests/test_app.py tests/test_validation_runner.py scripts/validate_juice_shop.py
 
       - name: Run automated tests
         run: pytest -q
