@@ -240,3 +240,18 @@ def test_openapi_discovery_ignores_external_and_cyclic_schema_refs():
         app, "same_origin_opener", return_value=FakeOpener(fake_urlopen)
     ):
         assert app.discover_openapi_json_operations("http://127.0.0.1:1003/") == []
+
+
+def test_sqlmap_reports_timeout_instead_of_false_completed_status():
+    with patch.object(app.shutil, "which", return_value="/usr/bin/sqlmap"), patch.object(
+        app, "discover_openapi_json_operations", return_value=[{
+            "url": "http://127.0.0.1:1003/rest/user/login",
+            "method": "POST", "fields": ["email"], "body": True,
+        }]
+    ), patch.object(app.subprocess, "run", side_effect=__import__("subprocess").TimeoutExpired(cmd="sqlmap", timeout=2)):
+        findings, status = app.perform_sqlmap_check("http://127.0.0.1:1003/", timeout_seconds=5)
+
+    assert findings == []
+    assert status["status"] == "timeout"
+    assert status["parameters_tested"] == 1
+    assert status["timed_out_parameters"] == 1

@@ -1427,6 +1427,8 @@ def perform_sqlmap_check(target: str, timeout_seconds: int = 60) -> tuple[list[t
         return [], {"status": "not_found", "reason": "No same-origin OpenAPI JSON/query operations were discovered", "operations_tested": 0}
     findings: list[tuple] = []
     tested = 0
+    timed_out = 0
+    execution_errors = 0
     deadline = time.monotonic() + max(1, timeout_seconds)
     with tempfile.TemporaryDirectory(prefix="dkcissp-sqlmap-") as temp_dir:
         for index, operation in enumerate(operations):
@@ -1457,8 +1459,10 @@ def perform_sqlmap_check(target: str, timeout_seconds: int = 60) -> tuple[list[t
                                             env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"})
                     output = (result.stdout or "") + "\n" + (result.stderr or "")
                 except subprocess.TimeoutExpired:
+                    timed_out += 1
                     continue
                 except OSError:
+                    execution_errors += 1
                     continue
                 # Require SQLMap's explicit positive classification; 500 responses alone never qualify.
                 normalized_output = output.lower()
@@ -1472,8 +1476,19 @@ def perform_sqlmap_check(target: str, timeout_seconds: int = 60) -> tuple[list[t
                 findings.append(("High", "SQL Injection (SQLMap)", operation["url"],
                                  evidence[:1200], "Use parameterized queries or prepared statements; validate input and review the affected database access path.",
                                  "High"))
-    return findings, {"status": "completed", "finding_count": len(findings),
+    if timed_out and timed_out == tested:
+        status = "timeout"
+    elif timed_out:
+        status = "partial_timeout"
+    elif execution_errors and execution_errors == tested:
+        status = "error"
+    elif execution_errors:
+        status = "partial_error"
+    else:
+        status = "completed"
+    return findings, {"status": status, "finding_count": len(findings),
                       "operations_discovered": len(operations), "parameters_tested": tested,
+                      "timed_out_parameters": timed_out, "execution_errors": execution_errors,
                       "timeout_seconds": timeout_seconds,
                       "reason": "SQLMap explicit-positive output only; HTTP errors and generic response differences are not counted as SQL injection",
                       "safety": "Active profile only; same-origin OpenAPI operations; GET/POST only; bounded schema/operation/parameter counts; low risk and single thread"}

@@ -136,3 +136,8 @@ The benchmark fixture already exposes its schema at a common path, so this comma
 ## Local OpenAPI schema references
 
 The API operation discovery now resolves bounded local JSON Pointer references under `#/components/schemas/` and merges simple `allOf` properties (up to eight branches and six reference-expansion levels). External schema references are intentionally not fetched, preventing schema parsing from expanding network scope. Regression tests cover referenced request-body schemas, `allOf` properties, and rejection of external references. This improves operation discovery, but the SQLi benchmark remains validated only on the controlled SQLite JSON fixture.
+
+
+## SQLMap timeout and execution status accuracy
+
+The SQLMap adapter now distinguishes a full timeout (`timeout`), partial timeout (`partial_timeout`), complete execution failure (`error`), partial execution failure (`partial_error`), and normal completion (`completed`). Status includes counts for timed-out parameters and execution errors, rather than silently reporting completion when every parameter test times out. A regression test forces a timeout and asserts the adapter reports it accurately.
