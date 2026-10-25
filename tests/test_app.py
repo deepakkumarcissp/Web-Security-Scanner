@@ -1725,3 +1725,36 @@ def test_asset_api_includes_organization_display_fields():
     assert listed["organization_name"] == org["name"]
     assert listed["organization_root_domain"] == domain
     assert client.get("/api/organizations").json()[0]["asset_count"] >= 0
+
+
+def test_asset_events_record_registration_scope_dns_and_not_found(monkeypatch):
+    from uuid import uuid4
+    domain = f"events-{uuid4().hex}.example"
+    org = client.post("/api/organizations", json={
+        "name": f"Events Org {domain}", "root_domain": domain, "authorized": True,
+    }).json()
+    asset = client.post("/api/assets", json={
+        "target": f"https://{domain}", "organization_id": org["id"], "authorized": True,
+    }).json()
+    events = client.get(f"/api/assets/{asset['id']}/events")
+    assert events.status_code == 200
+    assert events.json()[0]["event_type"] == "asset_registered"
+    changed = client.patch(f"/api/assets/{asset['id']}/scope", json={
+        "scope_status": "in_scope", "authorized": True, "approval_reference": "CHG-TEST-1",
+    })
+    assert changed.status_code == 200
+    events = client.get(f"/api/assets/{asset['id']}/events").json()
+    assert any(event["event_type"] == "scope_changed" for event in events)
+    monkeypatch.setattr(app.socket, "getaddrinfo", lambda *args: [(None, None, None, None, ("192.0.2.10", 0))])
+    resolved = client.post(f"/api/assets/{asset['id']}/resolve", json={"authorized": True, "timeout_seconds": 1})
+    assert resolved.status_code == 200
+    events = client.get(f"/api/assets/{asset['id']}/events").json()
+    assert any(event["event_type"] == "dns_resolution" for event in events)
+    assert client.get("/api/assets/999999/events").status_code == 404
+
+
+def test_asset_history_ui_is_exposed():
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "showAssetEvents" in response.text
+    assert "Asset History" in response.text

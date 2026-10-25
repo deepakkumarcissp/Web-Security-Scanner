@@ -117,7 +117,9 @@ The roadmap is intentionally evidence-gated. Do not claim broad detection covera
 - [x] Add dashboard controls for discovery history and DNS resolution/status.
 - [x] Add a dedicated organization/root-domain registration UI form and organization table.
 - [x] Add organization-aware asset registration and inventory posture cards/filters.
+- [x] Add append-only asset event history for registration, passive discovery, scope decisions, and DNS inventory lookups.
 - [ ] Add additional passive discovery sources only behind the same bounded adapter contract.
 
 
 - **EASM dashboard milestone:** added organization/root-domain registration and inventory UI, optional organization assignment for assets, organization name/root domain in asset list responses, posture cards (organizations, assets, review queue, in-scope assets, DNS-resolved assets), and filters for review/scope/DNS state. Full test suite: pending final validation.
+- **EASM audit milestone:** added per-asset append-only lifecycle events and a dashboard history viewer; test coverage verifies registration, scope change, DNS lookup, and missing-asset handling.

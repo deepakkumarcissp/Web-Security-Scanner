@@ -126,6 +126,16 @@ def init_db() -> None:
                 FOREIGN KEY(root_asset_id) REFERENCES assets(id)
             );
             CREATE INDEX IF NOT EXISTS idx_discovery_runs_root ON discovery_runs(root_asset_id, id DESC);
+            CREATE TABLE IF NOT EXISTS asset_events(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                event_at TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(asset_id) REFERENCES assets(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_asset_events_asset ON asset_events(asset_id, id DESC);
             CREATE TABLE IF NOT EXISTS assets(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 target TEXT NOT NULL UNIQUE,
@@ -180,6 +190,14 @@ def init_db() -> None:
 
 
 init_db()
+
+
+def record_asset_event(conn, asset_id: int, event_type: str, summary: str, details: dict | None = None) -> None:
+    """Persist a small, append-only inventory event in the same DB transaction as its change."""
+    conn.execute(
+        "INSERT INTO asset_events(asset_id,event_type,event_at,summary,details_json) VALUES(?,?,?,?,?)",
+        (asset_id, event_type, now(), summary[:500], json.dumps(details or {}, sort_keys=True)[:4000]),
+    )
 
 
 def recover_stale_scans(conn=None, stale_after_minutes: int = 30) -> int:
@@ -1767,6 +1785,9 @@ def create_asset(request: AssetRequest):
              timestamp if initial_decision in {"approved", "rejected"} else None, initial_decision, organization_id),
         )
         row = conn.execute("SELECT * FROM assets WHERE id=?", (cursor.lastrowid,)).fetchone()
+        record_asset_event(conn, cursor.lastrowid, "asset_registered", "Asset registered in inventory", {
+            "scope_status": request.scope_status, "discovery_source": "manual", "organization_id": organization_id,
+        })
         return {**dict(row), "created": True}
 
 
@@ -1789,6 +1810,12 @@ def update_asset_scope(asset_id: int, request: AssetScopeUpdate):
         conn.execute("""UPDATE assets SET scope_status=?,notes=?,approval_reference=?,reviewed_at=?,
             review_decision=?,last_seen=? WHERE id=?""",
             (request.scope_status, notes, approval_reference if decision == "approved" else "", reviewed_at, decision, timestamp, asset_id))
+        if existing["scope_status"] != request.scope_status or (request.scope_status == "in_scope" and existing["approval_reference"] != approval_reference):
+            record_asset_event(conn, asset_id, "scope_changed", "Asset scope changed", {
+                "from": existing["scope_status"], "to": request.scope_status,
+                "approval_reference": approval_reference if decision == "approved" else "",
+                "review_decision": decision,
+            })
         return dict(conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone())
 
 
@@ -1898,12 +1925,15 @@ def discover_subdomains(asset_id: int, request: AssetDiscoveryRequest):
             if exists:
                 conn.execute("UPDATE assets SET last_seen=? WHERE id=?", (timestamp, exists["id"]))
                 continue
-            conn.execute(
+            inserted = conn.execute(
                 """INSERT INTO assets(target,asset_type,scope_status,discovery_source,first_seen,last_seen,notes,organization_id)
                    VALUES(?,?,?,?,?,?,?,?)""",
                 (target, "subdomain", "needs_review", "crt.sh", timestamp, timestamp,
                  "Passive certificate-transparency candidate; verify ownership and scope before scanning.", root["organization_id"]),
             )
+            record_asset_event(conn, inserted.lastrowid, "passive_discovery", "Candidate discovered via certificate transparency", {
+                "source": "crt.sh", "root_asset_id": asset_id, "scope_status": "needs_review",
+            })
             created += 1
     run_id = persist_discovery_run(asset_id, result, candidate_count=len(candidates), new_assets_added=created)
     return {"root_asset_id": asset_id, "run_id": run_id, "source": result["source"],
@@ -1912,6 +1942,16 @@ def discover_subdomains(asset_id: int, request: AssetDiscoveryRequest):
             "new_assets_added": created, "scope_status": "needs_review",
             "limit_metadata": result["limit_metadata"], "scans_started": 0,
             "message": "Candidates were added for review only; no hosts were contacted or scanned."}
+
+
+@app.get("/api/assets/{asset_id}/events")
+def list_asset_events(asset_id: int):
+    with connect() as conn:
+        if not conn.execute("SELECT 1 FROM assets WHERE id=?", (asset_id,)).fetchone():
+            raise HTTPException(404, "Asset not found")
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM asset_events WHERE asset_id=? ORDER BY id DESC LIMIT 100", (asset_id,)
+        )]
 
 
 @app.post("/api/assets/{asset_id}/resolve")
@@ -1948,6 +1988,9 @@ def resolve_asset_dns(asset_id: int, request: AssetResolveRequest):
     with connect() as conn:
         conn.execute("UPDATE assets SET resolution_status=?,resolved_addresses_json=?,resolution_checked_at=?,resolution_error=?,last_seen=? WHERE id=?",
                      (status, json.dumps(addresses), checked, error, checked, asset_id))
+        record_asset_event(conn, asset_id, "dns_resolution", "DNS inventory lookup completed", {
+            "status": status, "address_count": len(addresses), "error": error,
+        })
     return {"asset_id": asset_id, "hostname": hostname, "resolution_status": status,
             "addresses": addresses, "checked_at": checked, "error": error,
             "http_probes_started": 0, "tls_checks_started": 0, "scans_started": 0}

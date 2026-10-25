@@ -29,6 +29,7 @@ The broader `assessments/domain_recon.py` also illustrates a wide enrichment cat
 - Dashboard organization/root-domain registration form, organization inventory table, optional organization selection during asset registration, organization-aware asset rows, posture metric cards, and client-side inventory filters for scope/DNS status.
 - Opt-in Certificate Transparency lookup for an approved DNS root, normalized through a source adapter contract (`source`, timestamps, status, candidates, errors, and limit metadata).
 - Persistent per-root discovery run history, including successful runs and source failures.
+- Append-only asset event history for manual registration, passive candidate discovery, scope/approval changes, and DNS resolution; latest 100 events are available per asset and surfaced in the dashboard.
 - Explicit bounded DNS resolution action for registered, organization-linked discovered candidates; stores resolution status, deduplicated A/AAAA addresses, timestamp, and error without HTTP/TLS probing or scan launch.
 - Discovered subdomains enter `needs_review`; discovery starts zero scans.
 - Scope promotion for discovered assets requires an approval/change-ticket reference.
@@ -39,7 +40,7 @@ The broader `assessments/domain_recon.py` also illustrates a wide enrichment cat
 
 | Capability | Current scanner state | Recommended next step |
 |---|---|---|
-| Root organization/brand registry | Organization/root-domain API, management form, inventory table, asset association, and posture filters implemented | Add audit history and owner-change tracking |
+| Root organization/brand registry | Organization/root-domain API, management form, inventory table, asset association, and posture filters implemented | Extend audit coverage to organization edits, ownership changes, and asset reassignment |
 | Subdomain sources | Opt-in `crt.sh` adapter with persisted per-run status and bounded metadata; no archive/subfinder source yet | Add optional passive archive adapter and explicitly invoked subfinder integration |
 | Candidate validation | Explicit bounded DNS resolution persists deduplicated addresses, status, timestamp, and errors; no HTTP/TLS fingerprinting | Add CNAME detail and separately approved low-impact fingerprinting |
 | HTTP/TLS fingerprint | Existing web checks happen during a scan | Add a low-impact, separately reported inventory fingerprint only after scope approval, with strict origin controls and verified TLS diagnostics |
