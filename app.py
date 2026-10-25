@@ -500,9 +500,28 @@ def perform_zap_passive_check(target: str, targets: list[str] | None = None) -> 
         confidence = str(alert.get("confidence", "Medium"))
         normalized.append((severity, "OWASP ZAP: " + title, alert_url[:2048], evidence, remediation, confidence))
 
+    # Group exact same signals reported on multiple resources, but retain each URL
+    # in evidence so grouping reduces noise without hiding the affected surface.
+    grouped = {}
+    for severity, title, alert_url, evidence, remediation, confidence in normalized:
+        key = (severity, title, evidence, remediation, confidence)
+        if key not in grouped:
+            grouped[key] = {"urls": [], "finding": (severity, title, alert_url, evidence, remediation, confidence)}
+        if alert_url not in grouped[key]["urls"]:
+            grouped[key]["urls"].append(alert_url)
+
+    aggregated = []
+    for item in grouped.values():
+        severity, title, first_url, evidence, remediation, confidence = item["finding"]
+        urls = item["urls"]
+        if len(urls) > 1:
+            url_list = "\n".join("- " + url for url in urls)
+            evidence = (evidence + f"\nAffected URLs ({len(urls)}):\n" + url_list)[:1800]
+        aggregated.append((severity, title, first_url, evidence, remediation, confidence))
+
     status = "completed_with_warnings" if failures else "completed"
-    return normalized, {"status": status, "urls_requested": len(safe_targets), "urls_scanned": len(scanned),
-                       "finding_count": len(normalized), "errors": failures[:3],
+    return aggregated, {"status": status, "urls_requested": len(safe_targets), "urls_scanned": len(scanned),
+                       "alert_count": len(normalized), "finding_count": len(aggregated), "errors": failures[:3],
                        "mode": "passive only; no spider or active scan; same-origin URLs only"}
 
 def perform_testssl_check(target: str, timeout_seconds: int = 75) -> tuple[list[tuple], dict]:
@@ -1285,7 +1304,9 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         zap_targets = discovery_status.get("urls", [target])
         zap_findings, zap_status = perform_zap_passive_check(target, targets=zap_targets)
         findings.extend(zap_findings)
-        tool_status["OWASP ZAP passive"] = {"status": zap_status.get("status", "error"), "detail": f"{zap_status.get('finding_count', len(zap_findings))} alert(s) across {zap_status.get('urls_scanned', 0)} URL(s); {zap_status.get('reason', zap_status.get('mode', 'integration status recorded'))}"}
+        zap_finding_count = zap_status.get("finding_count", len(zap_findings))
+        zap_alert_count = zap_status.get("alert_count", zap_finding_count)
+        tool_status["OWASP ZAP passive"] = {"status": zap_status.get("status", "error"), "detail": f"{zap_finding_count} finding(s) from {zap_alert_count} alert(s) across {zap_status.get('urls_scanned', 0)} URL(s); {zap_status.get('reason', zap_status.get('mode', 'integration status recorded'))}"}
         wapiti_status = {"status": "not_run", "reason": "Wapiti active testing is available only in the Active profile"}
         if profile == "active":
             tool_status["Wapiti active checks"] = {"status": "running", "detail": "Active tests approved; checking common injection, file, redirect, and configuration weaknesses with bounded scope and runtime"}
@@ -1761,7 +1782,7 @@ def safe_csv_cell(value):
     """Prevent spreadsheet apps from interpreting untrusted finding text as formulas."""
     if not isinstance(value, str):
         return value
-    significant = value.lstrip(" \\t\\r\\n")
+    significant = value.lstrip(" \\t\\r\n")
     if significant.startswith(("=", "+", "-", "@", "\\t", "\\r")):
         return "'" + value
     return value

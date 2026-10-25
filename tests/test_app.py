@@ -1016,6 +1016,60 @@ def test_zap_passive_rejects_oversized_api_response(monkeypatch):
     assert "5 MB safety limit" in status["errors"][0]
 
 
+
+
+def test_zap_passive_groups_duplicate_signals_and_preserves_affected_urls(monkeypatch):
+    import json
+    from urllib.parse import urlparse
+
+    monkeypatch.setattr(app, "diagnose_zap_api", lambda: {"status": "ready", "endpoint": "http://127.0.0.1:8090"})
+    monkeypatch.setattr(app, "zap_api_settings", lambda: ("http://127.0.0.1:8090", "test-key"))
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self, _size):
+            return json.dumps(self.payload).encode()
+
+    def fake_urlopen(request, timeout=4):
+        path = urlparse(request.full_url).path
+        if path.endswith("/accessUrl/"):
+            return FakeResponse({"accessUrl": [{"Result": "OK"}]})
+        if path.endswith("/recordsToScan/"):
+            return FakeResponse({"recordsToScan": "0"})
+        if path.endswith("/alerts/"):
+            return FakeResponse({"alerts": [
+                {"risk": "Medium", "alert": "Cross-Domain Misconfiguration",
+                 "url": "http://app.example.test/runtime.js", "description": "CORS wildcard",
+                 "evidence": "Access-Control-Allow-Origin: *", "solution": "Review CORS", "confidence": "Medium"},
+                {"risk": "Medium", "alert": "Cross-Domain Misconfiguration",
+                 "url": "http://app.example.test/vendor.js", "description": "CORS wildcard",
+                 "evidence": "Access-Control-Allow-Origin: *", "solution": "Review CORS", "confidence": "Medium"},
+                {"risk": "Low", "alert": "Timestamp Disclosure - Unix",
+                 "url": "http://app.example.test/main.js", "description": "Timestamp disclosed",
+                 "evidence": "1734944650", "solution": "Review timestamp", "confidence": "Low"},
+            ]})
+        raise AssertionError(request.full_url)
+
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    findings, status = app.perform_zap_passive_check(
+        "http://app.example.test/",
+        targets=["http://app.example.test/", "http://app.example.test/runtime.js", "http://app.example.test/vendor.js"],
+    )
+    assert status["status"] == "completed"
+    assert status["alert_count"] == 3
+    assert status["finding_count"] == 2
+    cors = next(f for f in findings if "Cross-Domain Misconfiguration" in f[1])
+    assert "runtime.js" in cors[3]
+    assert "vendor.js" in cors[3]
+    assert "Affected URLs (2)" in cors[3]
+    assert any("Timestamp Disclosure" in f[1] for f in findings)
+
+
 def test_zap_passive_unavailable_status_is_not_reported_as_success(monkeypatch):
     monkeypatch.setattr(app, "diagnose_zap_api", lambda: {"status": "api_unreachable", "message": "ZAP unavailable"})
     findings, status = app.perform_zap_passive_check("https://example.test")
