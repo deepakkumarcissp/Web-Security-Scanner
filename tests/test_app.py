@@ -572,6 +572,41 @@ def test_tool_install_refuses_unverified_package_mapping():
     assert "verified" in response.json()["detail"].lower() or "conflicts" in response.json()["detail"].lower()
 
 
+def test_install_job_status_endpoint_returns_stage_and_rejects_missing_job():
+    from uuid import uuid4
+    with app.connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO install_jobs(tool_id,tool_name,status,stage,message,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            ("test-tool-" + uuid4().hex, "Test Tool", "running", "Verifying installation", "Checking executable", app.now(), app.now()),
+        )
+        job_id = cursor.lastrowid
+    response = client.get(f"/api/tools/install-jobs/{job_id}")
+    assert response.status_code == 200
+    assert response.json()["status"] == "running"
+    assert response.json()["stage"] == "Verifying installation"
+    assert response.json()["message"] == "Checking executable"
+    missing = client.get("/api/tools/install-jobs/99999999")
+    assert missing.status_code == 404
+    with app.connect() as conn:
+        conn.execute("DELETE FROM install_jobs WHERE id=?", (job_id,))
+
+
+def test_install_job_runner_reports_verification_without_running_installer(monkeypatch):
+    with app.connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO install_jobs(tool_id,tool_name,status,stage,message,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            ("curl", "curl", "running", "Queued", "Queued", app.now(), app.now()),
+        )
+        job_id = cursor.lastrowid
+    monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/curl" if binary == app.TOOL_CATALOG["curl"]["binary"] else None)
+    app.run_install_job(job_id, "curl")
+    job = client.get(f"/api/tools/install-jobs/{job_id}").json()
+    assert job["status"] == "completed"
+    assert job["stage"] == "Already installed"
+    with app.connect() as conn:
+        conn.execute("DELETE FROM install_jobs WHERE id=?", (job_id,))
+
+
 def test_tool_setup_page_is_separate_from_risk_dashboard():
     response = client.get("/")
     assert response.status_code == 200

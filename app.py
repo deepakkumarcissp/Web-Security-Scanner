@@ -58,6 +58,17 @@ def init_db() -> None:
                 current_stage TEXT NOT NULL DEFAULT 'Queued',
                 tool_status TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS install_jobs(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                finished_at TEXT
+            );
             CREATE TABLE IF NOT EXISTS scanner_activity(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 scan_id INTEGER,
@@ -2194,42 +2205,78 @@ def list_tools():
     }
 
 
+def update_install_job(job_id: int, status: str, stage: str, message: str, finished: bool = False) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE install_jobs SET status=?,stage=?,message=?,updated_at=?,finished_at=? WHERE id=?",
+            (status, stage[:160], message[:800], now(), now() if finished else None, job_id),
+        )
+
+
+def run_install_job(job_id: int, tool_id: str) -> None:
+    spec = TOOL_CATALOG[tool_id]
+    try:
+        update_install_job(job_id, "running", "Checking prerequisites", "Checking package manager and executable status.")
+        if shutil.which(spec["binary"]):
+            update_install_job(job_id, "completed", "Already installed", f"{spec['label']} is already installed and executable.", True)
+            return
+        pkexec, apt = shutil.which("pkexec"), shutil.which("apt-get")
+        if not pkexec or not apt:
+            update_install_job(job_id, "failed", "Manual installation required",
+                               f"Automatic installation is unavailable. On Kali, run: sudo apt update && sudo apt install {spec['package']}", True)
+            return
+        update_install_job(job_id, "running", "Waiting for administrator approval",
+                           "The package manager will request local administrator authentication if needed.")
+        result = subprocess.run(
+            [pkexec, apt, "install", "-y", "--no-install-recommends", spec["package"]],
+            capture_output=True, text=True, timeout=240, check=False,
+        )
+        if result.returncode != 0:
+            # Do not send raw package output to the UI; it can contain environment details.
+            detail = (result.stderr or result.stdout or "Package installation failed").strip().splitlines()[-1:]
+            message = (detail[0][:500] if detail else "Package installation failed")
+            update_install_job(job_id, "failed", "Installation failed", message, True)
+            return
+        update_install_job(job_id, "running", "Verifying installation", "Installation command completed; checking the executable and version.")
+        statuses = scanner_tools_status()
+        installed = next((item for item in statuses if item["id"] == tool_id), None)
+        ok = bool(installed and installed.get("installed"))
+        update_install_job(job_id, "completed" if ok else "failed", "Installation verified" if ok else "Verification failed",
+                           f"{spec['label']} {'is installed and verified.' if ok else 'could not be verified after installation.'}", True)
+    except subprocess.TimeoutExpired:
+        update_install_job(job_id, "failed", "Timed out", "Package installation exceeded 240 seconds. Check the package manager before retrying.", True)
+    except Exception:
+        update_install_job(job_id, "failed", "Installation error", "Installation could not be completed. Check the local package manager logs.", True)
+
+
 @app.post("/api/tools/install/{tool_id}")
 def install_tool(tool_id: str, request: ToolInstallRequest, client: FastAPIRequest):
     if tool_id not in TOOL_CATALOG:
         raise HTTPException(404, "Tool is not in the approved installer allow-list.")
     if not request.approved:
         raise HTTPException(400, "Explicit installation approval is required.")
-    # Never allow remote callers to trigger privileged package operations.
     if client.client.host not in {"127.0.0.1", "::1", "testclient"}:
         raise HTTPException(403, "Tool installation is available only from the local machine.")
     spec = TOOL_CATALOG[tool_id]
     if not spec.get("installable") or not spec.get("package"):
         raise HTTPException(400, spec.get("install_note") or "No verified package installation method is configured for this tool.")
-    if shutil.which(spec["binary"]):
-        return {"ok": True, "message": f"{spec['label']} is already installed.", "tools": scanner_tools_status()}
-    pkexec = shutil.which("pkexec")
-    apt = shutil.which("apt-get")
-    if not pkexec or not apt:
-        return {
-            "ok": False,
-            "message": f"Automatic installation is unavailable. On Kali, run: sudo apt update && sudo apt install {spec['package']}",
-            "manual_command": f"sudo apt update && sudo apt install {spec['package']}",
-        }
-    try:
-        result = subprocess.run(
-            [pkexec, apt, "install", "-y", "--no-install-recommends", spec["package"]],
-            capture_output=True, text=True, timeout=240, check=False,
+    with connect() as conn:
+        active = conn.execute("SELECT id FROM install_jobs WHERE status='running' ORDER BY id DESC LIMIT 1").fetchone()
+        if active:
+            raise HTTPException(409, "Another tool installation is already running. Wait for it to finish before starting another.")
+        cursor = conn.execute(
+            "INSERT INTO install_jobs(tool_id,tool_name,status,stage,message,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            (tool_id, spec['label'], 'running', 'Queued', 'Installation job queued; preparing package manager.', now(), now()),
         )
-    except subprocess.TimeoutExpired:
-        raise HTTPException(504, "Package installation timed out. Check the package manager before retrying.")
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "Package installation failed").strip()[-1200:]
-        return {"ok": False, "message": detail, "tools": scanner_tools_status()}
-    statuses = scanner_tools_status()
-    installed = next((t for t in statuses if t["id"] == tool_id), None)
-    return {
-        "ok": bool(installed and installed["installed"]),
-        "message": "Installation command completed; executable status was checked again.",
-        "tools": statuses,
-    }
+        job_id = cursor.lastrowid
+    threading.Thread(target=run_install_job, args=(job_id, tool_id), daemon=True).start()
+    return {"job_id": job_id, "tool_id": tool_id, "status": "running", "stage": "Queued", "message": "Installation job started."}
+
+
+@app.get("/api/tools/install-jobs/{job_id}")
+def get_install_job(job_id: int):
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM install_jobs WHERE id=?", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Installation job not found.")
+    return dict(row)
