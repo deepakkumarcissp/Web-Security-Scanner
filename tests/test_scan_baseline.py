@@ -194,3 +194,28 @@ def test_empty_expected_signal_list_fails_without_claiming_coverage():
     assert result["result"] == "FAIL"
     assert result["expected_signal_checks"] == 0
     assert result["expected_signal_coverage_percent"] is None
+
+
+def test_controlled_http_fixture_baseline_reports_header_and_transport_signals():
+    controlled = __import__("json").loads(
+        (ROOT / "tests/fixtures/controlled_http_expected_signals.json").read_text()
+    )
+    report = {
+        "scan_status": "completed",
+        "profile": "quick",
+        "tool_status": {"Built-in HTTP & headers": {"status": "completed"}},
+        "findings": [
+            finding("Target uses HTTP without transport encryption", "http://127.0.0.1:34567/", 1, "High", "High"),
+            finding("Content-Security-Policy header missing", "http://127.0.0.1:34567/missing-headers", 2, "Medium", "High"),
+            finding("Referrer-Policy header missing", "http://127.0.0.1:34567/missing-headers", 3, "Low", "High"),
+            finding("X-Content-Type-Options missing or weak", "http://127.0.0.1:34567/missing-headers", 4, "Low", "High"),
+            finding("Permissions-Policy header missing", "http://127.0.0.1:34567/missing-headers", 5, "Info", "High"),
+            finding("Unmatched observation retained for review", "http://127.0.0.1:34567/", 6, "Info", "Medium"),
+        ],
+    }
+    result = evaluator.evaluate_report(report, controlled)
+    assert result["result"] == "PASS"
+    assert result["expected_signals_matched"] == 5
+    assert result["expected_signal_coverage_percent"] == 100.0
+    assert result["false_positive_status"] == "NOT_ASSESSED"
+    assert [item["id"] for item in result["unmatched_findings_requiring_triage"]] == [6]

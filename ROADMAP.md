@@ -33,14 +33,15 @@
 - [ ] Extend the fixture with controlled CORS responses and a small set of exposed test files.
 - [ ] Generate/use a test-only certificate; never disable TLS verification in production scanner code to make tests pass.
 - [ ] Validate scanner response parsing and TLS adapter invocation against loopback only.
-- [ ] Produce a machine-readable report with expected signals, observed signals, tool statuses, and scope checks.
+- [x] Add a machine-readable controlled-HTTP expected-signal baseline and evaluator regression test; report includes expected/observed signal results, tool status, and scope checks are independently asserted.
 
 **Exit gate:** every expected fixture signal is asserted; a completed scan cannot pass solely because the API returned HTTP 200.
 
 ## Phase 3 — Detection quality and evidence
 **Status: Planned**
 
-- [ ] Expand the expected-signal baseline to distinct header, CORS, TLS, and exposure cases.
+- [x] Add a dedicated controlled-HTTP expected-signal baseline for HTTP transport and missing-header cases.
+- [ ] Expand expected-signal baselines to distinct CORS, TLS, and exposed-file cases.
 - [ ] Add tests for confidence/severity drift, duplicate suppression, URL canonicalization, and malformed tool JSON.
 - [ ] Keep unmatched findings for human triage; never auto-label them false positives.
 - [ ] Document false-negative boundaries and known unsupported coverage.
@@ -81,7 +82,8 @@
 ## Current execution checkpoint
 
 - Latest regression implementation before current working changes: `b281bee` — controlled local HTTP fixture.
-- This batch adds initial-request redirect scope enforcement and tests for present/missing security headers, pending commit.
+- Commit `0fffdcd` blocks cross-origin redirects on the initial request; tests verify a second loopback port is never contacted.
+- Current uncommitted batch adds `tests/fixtures/controlled_http_expected_signals.json` and evaluator coverage for five declared signals; full suite: **100 passed**, 2 dependency deprecation warnings.
 - Local Juice Shop Standard scan: **scan 31 PASS**, completed in 14.1 seconds; 7 same-origin URLs mapped, Nuclei completed, WhatWeb completed, and ZAP passive completed. Active Wapiti was correctly skipped.
 - Expected-signal evaluator: **PASS, 5/5 expected signals matched**, zero duplicate groups, three unmatched findings retained for human triage. This is 100% coverage of the five declared fixture signals only, not overall vulnerability detection coverage.
 - Full regression suite before the latest scope-hardening change: **98 passed**, 2 dependency deprecation warnings.
