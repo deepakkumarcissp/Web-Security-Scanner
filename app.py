@@ -693,14 +693,15 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
             "-pt", "http",
             "-severity", "info,low,medium,high,critical,unknown",
             "-rl", "5", "-c", "3", "-timeout", "4", "-retries", "0",
-            "-duc", "-disable-redirects", "-no-interactsh", "-silent",
+            "-duc", "-no-stdin", "-disable-redirects", "-no-interactsh", "-silent",
             "-jsonl-export", jsonl_path,
         ]
         timed_out = False
         try:
             result = subprocess.run(
                 command, capture_output=True, text=True, timeout=timeout_seconds,
-                check=False, env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"},
+                check=False, stdin=subprocess.DEVNULL,
+                env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"},
             )
         except subprocess.TimeoutExpired as exc:
             timed_out = True

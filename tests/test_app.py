@@ -290,6 +290,8 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
         assert command[command.index("-rl") + 1] == "5"
         assert command[command.index("-c") + 1] == "3"
         assert command[command.index("-timeout") + 1] == "4"
+        assert "-no-stdin" in command
+        assert kwargs["stdin"] is app.subprocess.DEVNULL
         assert "-disable-redirects" in command
         assert "-no-interactsh" in command
         assert "-jsonl-export" in command
