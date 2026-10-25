@@ -200,6 +200,27 @@ def validate_target(raw: str) -> str:
     return raw.rstrip("/")
 
 
+def is_same_origin_url(candidate: str, origin_url: str) -> bool:
+    """Return whether a URL belongs to the exact HTTP(S) scheme/host/port origin."""
+    try:
+        candidate_parts = urlparse(candidate)
+        origin_parts = urlparse(origin_url)
+        candidate_port = candidate_parts.port or (443 if candidate_parts.scheme.lower() == "https" else 80)
+        origin_port = origin_parts.port or (443 if origin_parts.scheme.lower() == "https" else 80)
+    except ValueError:
+        return False
+    return bool(
+        candidate_parts.scheme.lower() in {"http", "https"}
+        and origin_parts.scheme.lower() in {"http", "https"}
+        and candidate_parts.username is None and candidate_parts.password is None
+        and origin_parts.username is None and origin_parts.password is None
+        and candidate_parts.hostname and origin_parts.hostname
+        and candidate_parts.scheme.lower() == origin_parts.scheme.lower()
+        and candidate_parts.hostname.lower().rstrip(".") == origin_parts.hostname.lower().rstrip(".")
+        and candidate_port == origin_port
+    )
+
+
 class _PageLinkParser(HTMLParser):
     """Extract navigational/resource URLs without executing page scripts."""
     def __init__(self):
@@ -771,6 +792,8 @@ def parse_nikto_report(report, target: str) -> list[tuple]:
             affected = path
         else:
             affected = urljoin(target.rstrip("/") + "/", path.lstrip("/")) if path else target
+        if not is_same_origin_url(affected, target):
+            continue
         method = str(entry.get("method") or "GET").upper()[:12]
         reference = str(entry.get("OSVDB") or entry.get("osvdb") or entry.get("id") or "")[:120]
         evidence = f"Nikto reported: {message}"
@@ -827,8 +850,6 @@ def parse_wapiti_report(report, target: str) -> list[tuple]:
     """Normalize Wapiti JSON without storing raw requests, cookies, or curl commands."""
     if not isinstance(report, dict):
         return []
-    root = urlparse(target)
-    root_port = root.port or (443 if root.scheme == "https" else 80)
     classifications = report.get("classifications", {}) if isinstance(report.get("classifications"), dict) else {}
     severity_map = {0: "Info", 1: "Low", 2: "Medium", 3: "High", 4: "Critical"}
     findings = []
@@ -847,10 +868,7 @@ def parse_wapiti_report(report, target: str) -> list[tuple]:
                     continue
                 path = str(entry.get("path") or "")
                 affected = urljoin(target, path) if path else target
-                parsed = urlparse(affected)
-                port = parsed.port or (443 if parsed.scheme == "https" else 80)
-                if (parsed.scheme != root.scheme or not parsed.hostname or not root.hostname or
-                        parsed.hostname.lower().rstrip(".") != root.hostname.lower().rstrip(".") or port != root_port):
+                if not is_same_origin_url(affected, target):
                     continue
                 level = entry.get("level", 0 if group_name == "additionals" else 1)
                 try:
