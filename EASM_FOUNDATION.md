@@ -121,3 +121,10 @@ The broader `assessments/domain_recon.py` also illustrates a wide enrichment cat
 - GET /api/easm/source-health summarizes discovery run counts by source, the latest recorded run and error, plus DNS-resolution inventory counts. It reads persisted data only and makes no external requests.
 - The Attack Surface inventory displays posture priority and its supporting signal labels. Discovery and DNS actions remain explicit; no candidate hosts are automatically scanned.
 - Validation checkpoint: 118 tests passed; Python compilation and git diff --check passed. Two existing dependency deprecation warnings remain.
+
+
+### Passive discovery adapter expansion
+
+- Added an explicit Internet Archive Wayback CDX adapter alongside certificate transparency. The UI presents separate CT Discover and History Discover actions; each requires the same explicit user confirmation and an approved in-scope root.
+- The Wayback adapter queries only the public CDX index, with a 12-second timeout, 1 MB response cap, bounded record limit, hostname normalization, deduplication, and exact DNS-label boundary checks. It never fetches archived pages or contacts candidate hosts.
+- Both adapters use the shared discovery history/snapshot contract. New candidates retain Needs Review, carry their source provenance, and do not trigger scans.

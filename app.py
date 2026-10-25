@@ -295,6 +295,7 @@ class AssetScopeUpdate(BaseModel):
 class AssetDiscoveryRequest(BaseModel):
     authorized: bool = False
     max_results: int = Field(default=50, ge=1, le=100)
+    source: str = Field(default="crt.sh", pattern="^(crt.sh|wayback)$")
 
 
 class AssetResolveRequest(BaseModel):
@@ -1993,6 +1994,63 @@ def query_certificate_transparency(root_domain: str, max_results: int) -> list[s
     return sorted(name for name in candidates if name != root_domain)[:max_results]
 
 
+def query_wayback_hosts(root_domain: str, max_results: int) -> list[str]:
+    """Read a bounded Wayback CDX index response; never fetch archived pages or target hosts."""
+    endpoint = "https://web.archive.org/cdx/search/cdx?" + urlencode({
+        "url": "*." + root_domain + "/*",
+        "output": "json",
+        "fl": "original",
+        "filter": "statuscode:200",
+        "collapse": "urlkey",
+        "limit": str(min(max_results * 20, 2000)),
+    })
+    req = Request(endpoint, headers={
+        "Accept": "application/json",
+        "User-Agent": "DKCISSP-WebSecurityScanner/0.1 (passive authorized inventory)",
+    })
+    with urlopen(req, timeout=12) as response:
+        payload = response.read(1_000_001)
+    if len(payload) > 1_000_000:
+        raise HTTPException(502, "Wayback CDX response exceeded the 1 MB safety limit.")
+    try:
+        records = json.loads(payload.decode("utf-8", "replace"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(502, "Wayback CDX returned invalid JSON.")
+    if not isinstance(records, list):
+        raise HTTPException(502, "Wayback CDX returned an unexpected response.")
+    candidates = set()
+    suffix = "." + root_domain
+    for record in records:
+        if not isinstance(record, list):
+            continue
+        for raw_url in record:
+            try:
+                hostname = (urlparse(str(raw_url)).hostname or "").lower().rstrip(".")
+            except ValueError:
+                continue
+            if (hostname == root_domain or hostname.endswith(suffix)) and valid_dns_name(hostname):
+                if hostname != root_domain:
+                    candidates.add(hostname)
+    return sorted(candidates)[:max_results]
+
+
+def run_wayback_discovery_adapter(root_domain: str, max_results: int) -> dict:
+    """Normalize a bounded Wayback CDX query into the common discovery contract."""
+    started = now()
+    try:
+        candidates = query_wayback_hosts(root_domain, max_results)
+        return {"source": "wayback", "started_at": started, "finished_at": now(),
+                "status": "completed", "candidates": candidates, "errors": [],
+                "limit_metadata": {"max_results": max_results, "response_limit_bytes": 1_000_000,
+                                   "cdx_record_limit": min(max_results * 20, 2000)}}
+    except Exception as exc:
+        return {"source": "wayback", "started_at": started, "finished_at": now(),
+                "status": "failed", "candidates": [],
+                "errors": [f"{type(exc).__name__}: {str(exc)[:300]}"],
+                "limit_metadata": {"max_results": max_results, "response_limit_bytes": 1_000_000,
+                                   "cdx_record_limit": min(max_results * 20, 2000)}}
+
+
 def run_ct_discovery_adapter(root_domain: str, max_results: int) -> dict:
     """Normalize the CT source into a stable, auditable adapter result contract."""
     started = now()
@@ -2074,7 +2132,9 @@ def discover_subdomains(asset_id: int, request: AssetDiscoveryRequest):
     root_domain = (parsed.hostname or "").lower().rstrip(".")
     if not valid_dns_name(root_domain) or "." not in root_domain:
         raise HTTPException(400, "Passive subdomain discovery requires a fully qualified DNS root, not an IP address or local hostname.")
-    result = run_ct_discovery_adapter(root_domain, request.max_results)
+    result = (run_ct_discovery_adapter(root_domain, request.max_results)
+              if request.source == "crt.sh"
+              else run_wayback_discovery_adapter(root_domain, request.max_results))
     if result["status"] != "completed":
         message = result["errors"][0] if result["errors"] else "Unknown source error"
         persist_discovery_run(asset_id, result, error_summary=message)
@@ -2092,11 +2152,11 @@ def discover_subdomains(asset_id: int, request: AssetDiscoveryRequest):
             inserted = conn.execute(
                 """INSERT INTO assets(target,asset_type,scope_status,discovery_source,first_seen,last_seen,notes,organization_id)
                    VALUES(?,?,?,?,?,?,?,?)""",
-                (target, "subdomain", "needs_review", "crt.sh", timestamp, timestamp,
-                 "Passive certificate-transparency candidate; verify ownership and scope before scanning.", root["organization_id"]),
+                (target, "subdomain", "needs_review", result["source"], timestamp, timestamp,
+                 "Passive " + result["source"] + " candidate; verify ownership and scope before scanning.", root["organization_id"]),
             )
-            record_asset_event(conn, inserted.lastrowid, "passive_discovery", "Candidate discovered via certificate transparency", {
-                "source": "crt.sh", "root_asset_id": asset_id, "scope_status": "needs_review",
+            record_asset_event(conn, inserted.lastrowid, "passive_discovery", "Candidate discovered via " + result["source"], {
+                "source": result["source"], "root_asset_id": asset_id, "scope_status": "needs_review",
             })
             created += 1
     run_id = persist_discovery_run(asset_id, result, candidate_count=len(candidates), new_assets_added=created)

@@ -798,7 +798,8 @@ def test_passive_discovery_ui_warns_about_external_lookup_and_review_only():
     response = client.get("/")
     assert response.status_code == 200
     assert "Discovery / DNS" in response.text
-    assert "contacts crt.sh, not the target" in response.text
+    assert "target hosts and discovered subdomains are not contacted" in response.text
+    assert "History Discover" in response.text
     assert "discoverSubdomains" in response.text
 
 
@@ -1833,3 +1834,21 @@ def test_easm_source_health_is_read_only_and_empty_when_no_runs():
     for source in payload["sources"]:
         assert {"source", "run_count", "success_count", "failure_count", "latest_run"} <= source.keys()
     assert isinstance(payload["dns_inventory"], list)
+
+
+def test_wayback_discovery_is_bounded_passive_and_keeps_candidates_pending(monkeypatch):
+    from uuid import uuid4
+    domain = f"wayback-{uuid4().hex}.example"
+    root = client.post("/api/assets", json={"target": f"https://{domain}", "authorized": True, "scope_status": "in_scope"}).json()
+    calls = []
+    monkeypatch.setattr(app, "query_wayback_hosts", lambda host, limit: calls.append((host, limit)) or [f"archive.{host}"])
+    response = client.post(f"/api/assets/{root['id']}/discover", json={"authorized": True, "max_results": 9, "source": "wayback"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source"] == "wayback"
+    assert payload["new_assets_added"] == 1
+    assert payload["scans_started"] == 0
+    assert calls == [(domain, 9)]
+    asset = next(row for row in client.get("/api/assets").json() if row["target"] == f"https://archive.{domain}")
+    assert asset["scope_status"] == "needs_review"
+    assert asset["discovery_source"] == "wayback"

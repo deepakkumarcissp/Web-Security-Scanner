@@ -128,3 +128,6 @@ The roadmap is intentionally evidence-gated. Do not claim broad detection covera
 
 
 - **EASM explainability milestone:** added human-readable posture signals/priority to asset responses and inventory, plus a read-only source-health API with latest run status, success/failure counts, and DNS inventory totals. No opaque risk score introduced. Validation: 118 tests passed; Python compilation and whitespace checks passed.
+
+
+- **Passive discovery expansion:** added an explicit Wayback CDX source with bounded responses/timeouts and hostname boundary validation, shared run-history tracking, and a separate dashboard action. Candidate assets remain Needs Review; no archived pages or candidate hosts are fetched.
