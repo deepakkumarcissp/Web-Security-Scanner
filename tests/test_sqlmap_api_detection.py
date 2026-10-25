@@ -130,3 +130,40 @@ def test_sqlmap_normalizes_only_explicit_positive_report():
     assert findings[0][1] == "SQL Injection (SQLMap)"
     assert findings[0][0] == "High"
     assert status["finding_count"] == 1
+
+
+def test_openapi_discovery_uses_configured_same_origin_schema_path():
+    spec = {
+        "openapi": "3.0.0",
+        "paths": {
+            "/lookup": {
+                "get": {
+                    "parameters": [{"name": "term", "in": "query", "schema": {"type": "string"}}]
+                }
+            }
+        },
+    }
+
+    def fake_urlopen(request, timeout=3):
+        url = request.full_url
+        if url == "http://127.0.0.1:1003/internal/schema-v2.json":
+            return FakeResponse(spec, url)
+        raise OSError("not found")
+
+    with patch.dict(os.environ, {"DKCISSP_OPENAPI_URL": "/internal/schema-v2.json"}), patch.object(app, "same_origin_opener", return_value=FakeOpener(fake_urlopen)):
+        operations = app.discover_openapi_json_operations("http://127.0.0.1:1003/")
+    assert operations == [{
+        "url": "http://127.0.0.1:1003/lookup",
+        "method": "GET",
+        "fields": ["term"],
+        "body": False,
+    }]
+
+
+def test_openapi_discovery_ignores_configured_cross_origin_schema():
+    def fake_urlopen(request, timeout=3):
+        assert request.full_url.startswith("http://127.0.0.1:1003/")
+        raise OSError("common schema path not found")
+
+    with patch.dict(os.environ, {"DKCISSP_OPENAPI_URL": "https://evil.invalid/openapi.json"}), patch.object(app, "same_origin_opener", return_value=FakeOpener(fake_urlopen)):
+        assert app.discover_openapi_json_operations("http://127.0.0.1:1003/") == []

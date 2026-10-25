@@ -1320,12 +1320,21 @@ def discover_openapi_json_operations(target: str, max_specs: int = 4, max_operat
     """Discover a small set of same-origin OpenAPI JSON operations without following redirects."""
     from urllib.request import Request
 
-    candidates = [
+    # An explicit schema URL helps APIs whose OpenAPI document is not published at a common path.
+    # It is still constrained to the scan target's origin; configuration cannot expand scope.
+    configured_spec = os.environ.get("DKCISSP_OPENAPI_URL", "").strip()
+    candidates = []
+    if configured_spec:
+        configured_url = urljoin(target.rstrip("/") + "/", configured_spec)
+        if is_same_origin_url(configured_url, target):
+            candidates.append(configured_url)
+    candidates.extend([
         urljoin(target.rstrip("/") + "/", "openapi.json"),
         urljoin(target.rstrip("/") + "/", "swagger.json"),
         urljoin(target.rstrip("/") + "/", "api-docs"),
         urljoin(target.rstrip("/") + "/", "swagger/v1/swagger.json"),
-    ][:max_specs]
+    ])
+    candidates = list(dict.fromkeys(candidates))[:max_specs]
     operations: list[dict] = []
     seen_specs = set()
     for spec_url in candidates:

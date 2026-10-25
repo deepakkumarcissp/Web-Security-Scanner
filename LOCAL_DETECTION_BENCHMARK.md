@@ -120,3 +120,14 @@ Run from the repository root:
 Observed end-to-end result: oracle passed; OpenAPI discovery found one POST operation; SQLMap tested two JSON parameters; the DKCISSP adapter normalized two High-severity SQL Injection findings using explicit SQLMap injection-point output. The run completed in about three seconds. No live scanner database was used, and the fixture process was terminated after the run.
 
 This changes the status from unverified to **validated for one narrow JSON/SQLite training-fixture case**. It is not a claim of comprehensive SQLi coverage. Juice Shop still does not expose a raw OpenAPI JSON schema at the common discovery paths, and the adapter needs additional expected-positive cases for other database/query patterns, schema references, and authenticated API flows. Historical Juice Shop/Wapiti misses above remain accurate for those specific attempts and are not overwritten by this separate positive fixture.
+
+
+## Configurable same-origin OpenAPI discovery
+
+The SQLMap adapter now checks `DKCISSP_OPENAPI_URL` before the common schema paths. Set it to a path such as `/internal/openapi.json` for an API whose machine-readable schema is published at a non-standard location. A configured absolute URL is accepted only when it is on the target's exact origin; a cross-origin schema is ignored and never requested. The configured path does not expand scan scope, and the same bounded operation/field/runtime limits remain in force.
+
+Example for a controlled authorized test:
+```bash
+DKCISSP_OPENAPI_URL=/internal/openapi.json python3 scripts/run_sqlmap_api_benchmark.py
+```
+The benchmark fixture already exposes its schema at a common path, so this command is a configuration example rather than a separate positive-result claim. The explicit schema setting is covered by unit tests for a non-standard same-origin path and cross-origin rejection.

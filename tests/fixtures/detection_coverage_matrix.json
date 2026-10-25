@@ -198,7 +198,7 @@
         "The Juice Shop login endpoint's common Swagger paths return HTML rather than a machine-readable schema, so that separate target is not yet detected by schema discovery.",
         "Time-based SQLi, authenticated API workflows, complex nested JSON, referenced OpenAPI schemas, and additional SQL dialects remain outside the validated benchmark."
       ],
-      "next_action": "Expand expected-positive benchmarks across safe database/query patterns and schema variants, and add an explicit same-origin OpenAPI schema setting for APIs that do not publish a schema at common paths."
+      "next_action": "Expand expected-positive benchmarks across safe database/query patterns and schema variants, including referenced schemas and authenticated API flows."
     },
     {
       "id": "cross-site-scripting",
