@@ -1207,7 +1207,9 @@ def perform_wapiti_check(target: str, timeout_seconds: int = 90) -> tuple[list[t
     binary = shutil.which(TOOL_CATALOG["wapiti"]["binary"])
     if not binary:
         return [], {"status": "unavailable", "reason": "Wapiti is not installed"}
-    modules = "backup,crlf,csrf,exec,file,htaccess,ldap,methods,redirect,sql,ssl,xss,xxe"
+    # Keep the default active module set focused on common, bounded web checks.
+    # High-impact server-side execution, file access, LDAP, and XXE modules are excluded.
+    modules = "backup,crlf,csrf,htaccess,methods,redirect,sql,ssl,xss"
     with tempfile.TemporaryDirectory(prefix="dkcissp-wapiti-") as temp_dir:
         report_path = str(Path(temp_dir) / "report.json")
         command = [binary, "-u", target, "--scope", "folder", "-m", modules,

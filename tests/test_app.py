@@ -448,8 +448,8 @@ def test_wapiti_runs_bounded_active_modules_and_parses_json(monkeypatch, tmp_pat
     def fake_run(command, **kwargs):
         assert command[command.index("--scope") + 1] == "folder"
         modules = command[command.index("-m") + 1].split(",")
-        assert "sql" in modules and "xss" in modules and "exec" in modules
-        assert not ({"ssrf", "upload", "permanentxss", "timesql"} & set(modules))
+        assert "sql" in modules and "xss" in modules
+        assert not ({"exec", "file", "ldap", "xxe", "ssrf", "upload", "permanentxss", "timesql"} & set(modules))
         assert command[command.index("--max-scan-time") + 1] == "75"
         assert command[command.index("--tasks") + 1] == "1"
         assert "--no-bugreport" in command
