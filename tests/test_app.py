@@ -976,3 +976,28 @@ def test_same_origin_redirect_handler_rejects_malformed_and_credential_urls():
     request = Request("https://app.example.test/")
     assert handler.redirect_request(request, None, 302, "Found", {}, "https://app.example.test:notaport/") is None
     assert handler.redirect_request(request, None, 302, "Found", {}, "https://user:secret@app.example.test/next") is None
+
+
+def test_nikto_parser_filters_out_of_scope_absolute_urls_and_ports():
+    report = {"findings": [
+        {"url": "/admin/", "msg": "Directory indexing found"},
+        {"url": "https://evil.example.test/steal", "msg": "Out-of-scope URL"},
+        {"url": "http://app.example.test/plain", "msg": "Different scheme"},
+        {"url": "https://app.example.test:8443/admin", "msg": "Different port"},
+        {"url": "https://user:secret@app.example.test/secret", "msg": "Embedded credentials"},
+        {"url": "https://app.example.test:notaport/path", "msg": "Malformed port"},
+    ]}
+    findings = app.parse_nikto_report(report, "https://app.example.test/")
+    assert len(findings) == 1
+    assert findings[0][2] == "https://app.example.test/admin/"
+
+
+def test_shared_same_origin_validator_fails_closed():
+    assert app.is_same_origin_url("https://app.example.test/a", "https://app.example.test/")
+    assert app.is_same_origin_url("https://app.example.test./a", "https://app.example.test/")
+    for candidate in (
+        "http://app.example.test/a", "https://evil.example.test/a",
+        "https://app.example.test:8443/a", "https://user:secret@app.example.test/a",
+        "https://app.example.test:notaport/a", "javascript:alert(1)",
+    ):
+        assert not app.is_same_origin_url(candidate, "https://app.example.test/"), candidate
