@@ -19,7 +19,8 @@
 - [x] Test exposed-file normalization and cross-origin filtering.
 - [x] Test ZAP duplicate grouping while preserving affected URLs.
 - [x] Test CORS evidence preservation and exact-origin filtering.
-- [ ] Add controlled response-header fixtures for present/missing headers, malformed URLs, and redirect scope.
+- [x] Add controlled response-header fixtures for present/missing headers and malformed URL handling.
+- [x] Block cross-origin redirects on the initial request and test with two loopback servers on different ports.
 - [ ] Ensure test state is isolated and repeatable across full-suite runs.
 
 **Exit gate:** tests pass, compilation succeeds, no whitespace errors, no test touches public targets.
@@ -28,7 +29,8 @@
 **Status: Planned**
 
 - [x] Build a deterministic loopback HTTP fixture with known security headers and verify real scanner response parsing in the Quick profile.
-- [ ] Extend the fixture with controlled CORS responses, redirects, and a small set of exposed test files.
+- [x] Extend the fixture with a cross-origin redirect attempt; the second loopback server receives no request.
+- [ ] Extend the fixture with controlled CORS responses and a small set of exposed test files.
 - [ ] Generate/use a test-only certificate; never disable TLS verification in production scanner code to make tests pass.
 - [ ] Validate scanner response parsing and TLS adapter invocation against loopback only.
 - [ ] Produce a machine-readable report with expected signals, observed signals, tool statuses, and scope checks.
@@ -78,10 +80,11 @@
 
 ## Current execution checkpoint
 
-- Latest regression implementation: `a43dcdb` — CORS evidence regression coverage.
-- Latest roadmap commit: `9ea44cf` — this roadmap.
+- Latest regression implementation before current working changes: `b281bee` — controlled local HTTP fixture.
+- This batch adds initial-request redirect scope enforcement and tests for present/missing security headers, pending commit.
 - Local Juice Shop Standard scan: **scan 31 PASS**, completed in 14.1 seconds; 7 same-origin URLs mapped, Nuclei completed, WhatWeb completed, and ZAP passive completed. Active Wapiti was correctly skipped.
 - Expected-signal evaluator: **PASS, 5/5 expected signals matched**, zero duplicate groups, three unmatched findings retained for human triage. This is 100% coverage of the five declared fixture signals only, not overall vulnerability detection coverage.
-- Full regression suite: **98 passed**, 2 dependency deprecation warnings.
+- Full regression suite before the latest scope-hardening change: **98 passed**, 2 dependency deprecation warnings.
+- Latest local regression suite after blocking cross-origin redirects on the initial request: **99 passed**, 2 dependency deprecation warnings; focused loopback/redirect tests: **4 passed**.
 
 The roadmap is intentionally evidence-gated. Do not claim broad detection coverage, production readiness, or a release-ready default branch until the relevant exit gates have been demonstrated.

@@ -1472,13 +1472,19 @@ def test_quick_scan_against_controlled_loopback_http_fixture(monkeypatch):
 
     class FixtureHandler(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path == "/redirect-out":
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{other_server.server_port}/outside")
+                self.end_headers()
+                return
             body = b"<html><head><title>DKCISSP test fixture</title></head><body>fixture</body></html>"
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
-            self.send_header("Permissions-Policy", "camera=(), microphone=()")
-            self.send_header("Content-Security-Policy", "default-src 'self'")
+            if self.path != "/missing-headers":
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+                self.send_header("Permissions-Policy", "camera=(), microphone=()")
+                self.send_header("Content-Security-Policy", "default-src 'self'")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1486,6 +1492,19 @@ def test_quick_scan_against_controlled_loopback_http_fixture(monkeypatch):
         def log_message(self, *_args):
             pass
 
+    outside_requests = []
+    class OutsideHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            outside_requests.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"outside scope")
+        def log_message(self, *_args):
+            pass
+
+    other_server = ThreadingHTTPServer(("127.0.0.1", 0), OutsideHandler)
+    other_thread = threading.Thread(target=other_server.serve_forever, daemon=True)
+    other_thread.start()
     server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1512,7 +1531,40 @@ def test_quick_scan_against_controlled_loopback_http_fixture(monkeypatch):
         assert "Target uses HTTP without transport encryption" in titles
         assert all(row["affected_url"].startswith(target) for row in findings)
         assert json.loads(scan["tool_status"])["Built-in HTTP & headers"]["status"] == "completed"
+
+        missing_target = target + "missing-headers"
+        with app.connect() as conn:
+            missing_id = conn.execute(
+                "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+                (missing_target, "quick", "running", app.now())).lastrowid
+        app.perform_scan(missing_id, missing_target, "quick")
+        with app.connect() as conn:
+            missing_scan = conn.execute("SELECT status FROM scans WHERE id=?", (missing_id,)).fetchone()
+            missing_findings = conn.execute("SELECT title FROM findings WHERE scan_id=?", (missing_id,)).fetchall()
+        missing_titles = {row["title"] for row in missing_findings}
+        assert missing_scan["status"] == "completed"
+        assert "Content-Security-Policy header missing" in missing_titles
+        assert "Referrer-Policy header missing" in missing_titles
+        assert "X-Content-Type-Options missing or weak" in missing_titles
+        assert "Permissions-Policy header missing" in missing_titles
+
+        redirect_target = target + "redirect-out"
+        with app.connect() as conn:
+            redirect_id = conn.execute(
+                "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+                (redirect_target, "quick", "running", app.now())).lastrowid
+        app.perform_scan(redirect_id, redirect_target, "quick")
+        with app.connect() as conn:
+            redirect_scan = conn.execute("SELECT status,summary FROM scans WHERE id=?", (redirect_id,)).fetchone()
+        # urllib surfaces a rejected redirect as an HTTPError response; it must
+        # not follow the second server or treat its content as the scan response.
+        assert redirect_scan["status"] == "completed"
+        assert "outside scope" not in str(redirect_scan["summary"])
+        assert outside_requests == []
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+        other_server.shutdown()
+        other_server.server_close()
+        other_thread.join(timeout=2)

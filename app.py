@@ -1251,7 +1251,10 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         )
         context = ssl.create_default_context()
         try:
-            with urlopen(req, timeout=12, context=context) as response:
+            # Keep the initial request inside the exact approved origin too. urllib's
+            # default opener follows cross-origin redirects, which could otherwise send
+            # the scanner to a different host or port before any scope checks run.
+            with same_origin_opener(target).open(req, timeout=12) as response:
                 status_code = response.status
                 headers = {k.lower(): v for k, v in response.headers.items()}
                 final_url = response.geturl()
