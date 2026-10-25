@@ -222,7 +222,7 @@ Reports are written to `validation-reports/` (ignored by Git because scan output
 
 ### Evaluate expected-signal regression coverage
 
-Evaluate an existing report against the explicit baseline in `tests/fixtures/juice_shop_expected_signals.json` (four observed transport/header signals):
+Evaluate an existing report against the explicit baseline in `tests/fixtures/juice_shop_expected_signals.json` (five observed transport/header signals):
 
 ```bash
 python3 scripts/evaluate_scan_baseline.py \
@@ -230,7 +230,7 @@ python3 scripts/evaluate_scan_baseline.py \
   --output validation-reports/<scan-report>-evaluation.json
 ```
 
-The evaluator fails if an expected signal is missing, the scan is incomplete, or the required Nuclei tool did not complete. It reports duplicate findings by normalized title and affected URL, and lists unmatched findings for human triage. Unmatched findings are **not** automatically labeled false positives. The percentage covers only the four declared signals; it is not an overall vulnerability detection rate. Re-check the baseline if Juice Shop configuration or response headers change.
+The evaluator fails if an expected signal is missing, the scan is incomplete, or the required Nuclei tool did not complete. It reports duplicate findings by normalized title and affected URL, and lists unmatched findings for human triage. Unmatched findings are **not** automatically labeled false positives. The percentage covers only the five declared signals; it is not an overall vulnerability detection rate. Regression tests in `tests/test_scan_baseline.py` cover expected-signal matching, severity/confidence drift, incomplete scans, required-tool failures, duplicate reporting, and unmatched-finding triage. Re-check the baseline if Juice Shop configuration or response headers change.
 
 ## Run tests
 

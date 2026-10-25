@@ -138,3 +138,59 @@ def test_missing_tool_status_fails_overall_evaluation():
     result = evaluator.evaluate_report(report, BASELINE)
     assert result["result"] == "FAIL"
     assert result["required_tool_results"] == [{"tool": "Nuclei", "status": "missing", "result": "FAIL"}]
+
+
+def test_severity_and_confidence_drift_each_break_expected_signal_match():
+    for field, value in (("severity", "Critical"), ("confidence", "Low")):
+        report = {"scan_status": "completed", "tool_status": {"Nuclei": {"status": "completed"}}, "findings": [
+            finding("Target uses HTTP without transport encryption", severity="High"),
+            finding("Content-Security-Policy header missing", severity="Medium"),
+            finding("Referrer-Policy header missing", severity="Low"),
+            finding("Permissions-Policy header missing", severity="Info"),
+            finding("Nuclei: Deprecated Feature-Policy Header - Detection", severity="Info", confidence="Medium"),
+        ]}
+        report["findings"][0][field] = value
+        result = evaluator.evaluate_report(report, BASELINE)
+        assert result["result"] == "FAIL"
+        assert "transport-http" in result["missing_expected_signals"]
+
+
+def test_incomplete_scan_fails_even_when_expected_signals_match():
+    report = {"scan_status": "running", "tool_status": {"Nuclei": {"status": "completed"}}, "findings": [
+        finding("Target uses HTTP without transport encryption", severity="High"),
+        finding("Content-Security-Policy header missing", severity="Medium"),
+        finding("Referrer-Policy header missing", severity="Low"),
+        finding("Permissions-Policy header missing", severity="Info"),
+        finding("Nuclei: Deprecated Feature-Policy Header - Detection", severity="Info", confidence="Medium"),
+    ]}
+    result = evaluator.evaluate_report(report, BASELINE)
+    assert result["result"] == "FAIL"
+    assert result["scan_completed"] is False
+
+
+def test_duplicate_group_and_unmatched_finding_are_triage_only():
+    report = {"scan_status": "completed", "tool_status": {"Nuclei": {"status": "completed"}}, "findings": [
+        finding("Target uses HTTP without transport encryption", finding_id=1, severity="High"),
+        finding("Target uses HTTP without transport encryption", finding_id=2, severity="High"),
+        finding("Content-Security-Policy header missing", severity="Medium"),
+        finding("Referrer-Policy header missing", severity="Low"),
+        finding("Permissions-Policy header missing", severity="Info"),
+        finding("Nuclei: Deprecated Feature-Policy Header - Detection", severity="Info", confidence="Medium"),
+        finding("Synthetic unmatched finding", finding_id=100, severity="Low"),
+    ]}
+    result = evaluator.evaluate_report(report, BASELINE)
+    assert result["result"] == "PASS"
+    assert result["duplicate_finding_count"] == 1
+    assert result["duplicate_groups"][0]["finding_ids"] == [1, 2]
+    assert any(item["id"] == 100 for item in result["unmatched_findings_requiring_triage"])
+    assert result["false_positive_status"] == "NOT_ASSESSED"
+
+
+def test_empty_expected_signal_list_fails_without_claiming_coverage():
+    result = evaluator.evaluate_report(
+        {"scan_status": "completed", "tool_status": {}, "findings": []},
+        {"expected_signals": [], "required_tools": []},
+    )
+    assert result["result"] == "FAIL"
+    assert result["expected_signal_checks"] == 0
+    assert result["expected_signal_coverage_percent"] is None
