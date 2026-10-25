@@ -1316,6 +1316,33 @@ def parse_wapiti_report(report, target: str) -> list[tuple]:
     return findings
 
 
+def _openapi_schema_properties(spec: dict, schema: object, depth: int = 0, seen: set[str] | None = None) -> dict:
+    """Resolve bounded local OpenAPI schema refs and merge simple allOf properties safely."""
+    if depth > 6 or not isinstance(schema, dict):
+        return {}
+    seen = set() if seen is None else seen
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        # External refs require extra fetches and can expand scope; only local JSON pointers are supported.
+        if not ref.startswith("#/components/schemas/") or ref in seen:
+            return {}
+        pointer = ref[2:].split("/")
+        node: object = spec
+        try:
+            for part in pointer:
+                node = node[part.replace("~1", "/").replace("~0", "~")]
+        except (KeyError, TypeError):
+            return {}
+        return _openapi_schema_properties(spec, node, depth + 1, seen | {ref})
+    properties = schema.get("properties", {})
+    merged = dict(properties) if isinstance(properties, dict) else {}
+    all_of = schema.get("allOf", [])
+    if isinstance(all_of, list):
+        for part in all_of[:8]:
+            merged.update(_openapi_schema_properties(spec, part, depth + 1, seen))
+    return merged
+
+
 def discover_openapi_json_operations(target: str, max_specs: int = 4, max_operations: int = 3) -> list[dict]:
     """Discover a small set of same-origin OpenAPI JSON operations without following redirects."""
     from urllib.request import Request
@@ -1376,7 +1403,7 @@ def discover_openapi_json_operations(target: str, max_specs: int = 4, max_operat
                 request_body = operation.get("requestBody", {})
                 content = request_body.get("content", {}) if isinstance(request_body, dict) else {}
                 schema = content.get("application/json", {}).get("schema", {}) if isinstance(content, dict) else {}
-                properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+                properties = _openapi_schema_properties(spec, schema)
                 if isinstance(properties, dict):
                     body_fields = [name for name, value in properties.items()
                                    if isinstance(name, str) and isinstance(value, dict)

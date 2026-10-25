@@ -131,3 +131,8 @@ Example for a controlled authorized test:
 DKCISSP_OPENAPI_URL=/internal/openapi.json python3 scripts/run_sqlmap_api_benchmark.py
 ```
 The benchmark fixture already exposes its schema at a common path, so this command is a configuration example rather than a separate positive-result claim. The explicit schema setting is covered by unit tests for a non-standard same-origin path and cross-origin rejection.
+
+
+## Local OpenAPI schema references
+
+The API operation discovery now resolves bounded local JSON Pointer references under `#/components/schemas/` and merges simple `allOf` properties (up to eight branches and six reference-expansion levels). External schema references are intentionally not fetched, preventing schema parsing from expanding network scope. Regression tests cover referenced request-body schemas, `allOf` properties, and rejection of external references. This improves operation discovery, but the SQLi benchmark remains validated only on the controlled SQLite JSON fixture.

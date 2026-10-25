@@ -196,9 +196,9 @@
       "known_gaps": [
         "Validated on one intentionally vulnerable SQLite-backed JSON login fixture with SQLMap finding evidence; this does not establish broad coverage across database engines, query patterns, or API authentication models.",
         "The Juice Shop login endpoint's common Swagger paths return HTML rather than a machine-readable schema, so that separate target is not yet detected by schema discovery.",
-        "Time-based SQLi, authenticated API workflows, complex nested JSON, referenced OpenAPI schemas, and additional SQL dialects remain outside the validated benchmark."
+        "Time-based SQLi, authenticated API workflows, complex nested JSON, external OpenAPI schema references, and additional SQL dialects remain outside the validated benchmark."
       ],
-      "next_action": "Expand expected-positive benchmarks across safe database/query patterns and schema variants, including referenced schemas and authenticated API flows."
+      "next_action": "Expand expected-positive benchmarks across safe database/query patterns and schema variants, including nested JSON shapes, authenticated API flows, and additional SQL dialects."
     },
     {
       "id": "cross-site-scripting",

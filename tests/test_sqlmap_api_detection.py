@@ -167,3 +167,76 @@ def test_openapi_discovery_ignores_configured_cross_origin_schema():
 
     with patch.dict(os.environ, {"DKCISSP_OPENAPI_URL": "https://evil.invalid/openapi.json"}), patch.object(app, "same_origin_opener", return_value=FakeOpener(fake_urlopen)):
         assert app.discover_openapi_json_operations("http://127.0.0.1:1003/") == []
+
+
+def test_openapi_discovery_resolves_local_referenced_request_schema():
+    spec = {
+        "openapi": "3.0.0",
+        "paths": {
+            "/rest/user/login": {
+                "post": {
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/LoginRequest"}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "components": {
+            "schemas": {
+                "LoginRequest": {
+                    "allOf": [
+                        {"properties": {"email": {"type": "string"}}},
+                        {"properties": {"password": {"type": "string"}, "metadata": {"type": "object"}}},
+                    ]
+                }
+            }
+        },
+    }
+
+    def fake_urlopen(request, timeout=3):
+        url = request.full_url
+        if url == "http://127.0.0.1:1003/openapi.json":
+            return FakeResponse(spec, url)
+        raise OSError("not found")
+
+    with patch.dict(os.environ, {"DKCISSP_OPENAPI_URL": ""}), patch.object(
+        app, "same_origin_opener", return_value=FakeOpener(fake_urlopen)
+    ):
+        operations = app.discover_openapi_json_operations("http://127.0.0.1:1003/")
+
+    assert operations == [{
+        "url": "http://127.0.0.1:1003/rest/user/login",
+        "method": "POST",
+        "fields": ["email", "password"],
+        "body": True,
+    }]
+
+
+def test_openapi_discovery_ignores_external_and_cyclic_schema_refs():
+    spec = {
+        "openapi": "3.0.0",
+        "paths": {
+            "/login": {
+                "post": {
+                    "requestBody": {"content": {"application/json": {
+                        "schema": {"$ref": "https://evil.invalid/schema.json"}
+                    }}}
+                }
+            }
+        },
+    }
+
+    def fake_urlopen(request, timeout=3):
+        url = request.full_url
+        if url == "http://127.0.0.1:1003/openapi.json":
+            return FakeResponse(spec, url)
+        raise OSError("not found")
+
+    with patch.dict(os.environ, {"DKCISSP_OPENAPI_URL": ""}), patch.object(
+        app, "same_origin_opener", return_value=FakeOpener(fake_urlopen)
+    ):
+        assert app.discover_openapi_json_operations("http://127.0.0.1:1003/") == []
