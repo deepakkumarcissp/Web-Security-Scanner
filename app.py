@@ -696,9 +696,17 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
                 command, capture_output=True, text=True, timeout=timeout_seconds,
                 check=False, env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"},
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             timed_out = True
-            result = SimpleNamespace(returncode=124)
+            # Preserve bounded, useful diagnostics from the timed-out process. Python may
+            # return these as bytes even though text=True was requested.
+            timeout_stdout = exc.stdout or ""
+            timeout_stderr = exc.stderr or ""
+            if isinstance(timeout_stdout, bytes):
+                timeout_stdout = timeout_stdout.decode("utf-8", "replace")
+            if isinstance(timeout_stderr, bytes):
+                timeout_stderr = timeout_stderr.decode("utf-8", "replace")
+            result = SimpleNamespace(returncode=124, stdout=timeout_stdout, stderr=timeout_stderr)
         except OSError as exc:
             return [], {"status": "error", "reason": str(exc)[:300], "template_selection": selection_status}
 
@@ -719,6 +727,8 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
                         "timeout_seconds": timeout_seconds if timed_out else None,
                         "reason": reason, "finding_count": 0, "partial_results_retained": False,
                         "template_selection": selection_status, "target_count": len(safe_targets),
+                        "stdout_tail": str(getattr(result, "stdout", "") or "")[-1000:] if timed_out else "",
+                        "stderr_tail": str(getattr(result, "stderr", "") or "")[-1000:] if timed_out else "",
                         "rate_limit_per_second": 5, "concurrency": 3,
                         "redirects_disabled": True, "interactsh_disabled": True}
         malformed = 0
