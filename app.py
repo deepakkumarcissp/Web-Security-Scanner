@@ -1190,10 +1190,12 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         if profile in ("standard", "deep", "active"):
             nuclei_targets = discovery_status.get("urls", [target])
             nuclei_template_cap = 60 if profile in ("deep", "active") else 30
-            # Standard was timing out on realistic lab pages before Nuclei emitted its JSONL report.
-            # Keep the request rate and template caps unchanged, but allow a bounded 150s window;
-            # Deep/Active have the larger template set and receive a 240s window.
-            nuclei_timeout = 240 if profile in ("deep", "active") else 150
+            # Keep Standard responsive by scanning the root plus at most two discovered URLs.
+            # Deep/Active retain broader same-origin coverage. The rate limit and safe-template
+            # filter remain unchanged; all target URLs are revalidated by perform_nuclei_check.
+            if profile == "standard":
+                nuclei_targets = list(dict.fromkeys([target, *nuclei_targets]))[:3]
+            nuclei_timeout = 240 if profile in ("deep", "active") else 90
             tool_status["Nuclei"] = {"status": "running", "detail": f"Running up to {nuclei_template_cap} safe templates across {len(nuclei_targets[:12])} same-origin URL(s); 5 requests/second maximum"}
             update_scan_progress(scan_id, 35, "Running Nuclei safe checks", tool_status)
             nuclei_findings, nuclei_status = perform_nuclei_check(target, timeout_seconds=nuclei_timeout,
