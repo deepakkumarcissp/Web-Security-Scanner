@@ -1,8 +1,14 @@
 from datetime import datetime, timedelta, timezone
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+
+# Never let automated tests read or mutate the scanner's development/deployment database.
+_TEST_DB_DIR = tempfile.TemporaryDirectory(prefix="dkcissp-test-")
+os.environ["DKCISSP_DB"] = str(Path(_TEST_DB_DIR.name) / "test.sqlite3")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app
