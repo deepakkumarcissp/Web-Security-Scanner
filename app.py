@@ -58,6 +58,17 @@ def init_db() -> None:
                 current_stage TEXT NOT NULL DEFAULT 'Queued',
                 tool_status TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS scanner_activity(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id INTEGER,
+                category TEXT NOT NULL DEFAULT 'scan',
+                status TEXT NOT NULL DEFAULT 'info',
+                stage TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(scan_id) REFERENCES scans(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_scanner_activity_scan_id ON scanner_activity(scan_id, id);
             CREATE TABLE IF NOT EXISTS findings(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL,
                 target TEXT NOT NULL, severity TEXT NOT NULL, title TEXT NOT NULL,
@@ -1143,14 +1154,31 @@ def perform_whatweb_check(target: str, timeout_seconds: int = 30) -> tuple[list[
     return findings, {"status": "completed" if result.returncode == 0 else "completed_with_warnings",
                       "return_code": result.returncode, "finding_count": len(findings)}
 
-def update_scan_progress(scan_id: int, progress: int, stage: str, tools: dict | None = None) -> None:
-    """Persist truthful scan-stage progress so the UI can survive refreshes."""
+def record_activity(scan_id: int | None, stage: str, message: str, status: str = "info", category: str = "scan") -> None:
+    """Persist a short, secret-free event for the live activity timeline."""
+    safe_stage = str(stage)[:160]
+    safe_message = str(message)[:500]
     with connect() as conn:
+        conn.execute(
+            "INSERT INTO scanner_activity(scan_id,category,status,stage,message,created_at) VALUES(?,?,?,?,?,?)",
+            (scan_id, str(category)[:40], str(status)[:24], safe_stage, safe_message, now()),
+        )
+
+
+def update_scan_progress(scan_id: int, progress: int, stage: str, tools: dict | None = None) -> None:
+    """Persist truthful scan-stage progress and record actual stage transitions."""
+    with connect() as conn:
+        previous = conn.execute("SELECT current_stage,status FROM scans WHERE id=?", (scan_id,)).fetchone()
         if tools is None:
             conn.execute("UPDATE scans SET progress=?,current_stage=? WHERE id=?", (progress, stage, scan_id))
         else:
             conn.execute("UPDATE scans SET progress=?,current_stage=?,tool_status=? WHERE id=?",
                          (progress, stage, json.dumps(tools), scan_id))
+        if previous and previous["current_stage"] != stage:
+            conn.execute(
+                "INSERT INTO scanner_activity(scan_id,category,status,stage,message,created_at) VALUES(?,?,?,?,?,?)",
+                (scan_id, "scan", "running", str(stage)[:160], f"{int(progress)}% — {str(stage)[:300]}", now()),
+            )
 
 
 def perform_scan(scan_id: int, target: str, profile: str) -> None:
@@ -1724,6 +1752,20 @@ def create_scan(request: ScanRequest):
 def list_scans():
     with connect() as conn:
         return [dict(row) for row in conn.execute("SELECT * FROM scans ORDER BY id DESC")]
+
+
+@app.get("/api/scans/{scan_id}/activity")
+def get_scan_activity(scan_id: int, after_id: int = 0, limit: int = 100):
+    """Return persisted timeline events for a single scan, newest events last."""
+    limit = max(1, min(int(limit), 200))
+    with connect() as conn:
+        if not conn.execute("SELECT id FROM scans WHERE id=?", (scan_id,)).fetchone():
+            raise HTTPException(404, "Scan not found.")
+        rows = conn.execute(
+            "SELECT id,category,status,stage,message,created_at FROM scanner_activity WHERE scan_id=? AND id>? ORDER BY id ASC LIMIT ?",
+            (scan_id, max(0, int(after_id)), limit),
+        ).fetchall()
+    return {"events": [dict(row) for row in rows]}
 
 
 @app.get("/api/scans/{scan_id}")
