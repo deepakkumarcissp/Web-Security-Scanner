@@ -1458,6 +1458,18 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                 f"X-Powered-By: {headers['x-powered-by']}",
                 "Remove unnecessary X-Powered-By disclosure.",
             )
+        cors_origin = headers.get("access-control-allow-origin", "").strip()
+        if cors_origin == "*":
+            cors_credentials = headers.get("access-control-allow-credentials", "").strip().lower()
+            cors_evidence = "Access-Control-Allow-Origin: *"
+            if cors_credentials:
+                cors_evidence += f"; Access-Control-Allow-Credentials: {cors_credentials}"
+            cors_evidence += "; wildcard origin is an observation, not proof of sensitive cross-origin data exposure"
+            finding(
+                "Info", "Wildcard CORS origin configured", cors_evidence,
+                "Validate whether this endpoint returns sensitive data. Restrict allowed origins where appropriate; a wildcard origin alone does not prove exploitable exposure.",
+                "Medium",
+            )
         if target.startswith("http://"):
             finding(
                 "Info", "Target URL uses HTTP (HTTPS not verified)",

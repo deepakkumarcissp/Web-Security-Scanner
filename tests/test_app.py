@@ -1589,6 +1589,9 @@ def test_quick_scan_against_controlled_loopback_http_fixture(monkeypatch):
                 self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
                 self.send_header("Permissions-Policy", "camera=(), microphone=()")
                 self.send_header("Content-Security-Policy", "default-src 'self'")
+            if self.path == "/cors-wildcard":
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Credentials", "true")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1653,6 +1656,24 @@ def test_quick_scan_against_controlled_loopback_http_fixture(monkeypatch):
         assert "Referrer-Policy header missing" in missing_titles
         assert "X-Content-Type-Options missing or weak" in missing_titles
         assert "Permissions-Policy header missing" in missing_titles
+
+        cors_target = target + "cors-wildcard"
+        with app.connect() as conn:
+            cors_id = conn.execute(
+                "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+                (cors_target, "quick", "running", app.now())).lastrowid
+        app.perform_scan(cors_id, cors_target, "quick")
+        with app.connect() as conn:
+            cors_findings = conn.execute(
+                "SELECT title,severity,evidence,remediation,confidence FROM findings WHERE scan_id=?",
+                (cors_id,)).fetchall()
+        cors_signal = next(row for row in cors_findings if row["title"] == "Wildcard CORS origin configured")
+        assert cors_signal["severity"] == "Info"
+        assert cors_signal["confidence"] == "Medium"
+        assert "Access-Control-Allow-Origin: *" in cors_signal["evidence"]
+        assert "Access-Control-Allow-Credentials: true" in cors_signal["evidence"]
+        assert "not proof of sensitive cross-origin data exposure" in cors_signal["evidence"]
+        assert "does not prove exploitable exposure" in cors_signal["remediation"]
 
         redirect_target = target + "redirect-out"
         with app.connect() as conn:

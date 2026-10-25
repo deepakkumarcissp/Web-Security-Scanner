@@ -43,7 +43,15 @@
       "affected_url_contains": "missing-headers",
       "severity": "Info",
       "confidence": "High"
+    },
+    {
+      "id": "cors-wildcard-observation",
+      "description": "A controlled wildcard CORS response should be recorded as an informational observation, not a confirmed vulnerability.",
+      "title_contains": "Wildcard CORS origin configured",
+      "affected_url_contains": "cors-wildcard",
+      "severity": "Info",
+      "confidence": "Medium"
     }
   ],
-  "coverage_boundary": "This baseline covers only the five explicit loopback fixture expectations. It does not measure overall scanner coverage or prove exploitability. Redirect scope is asserted separately by a test that verifies the second local server receives no request."
+  "coverage_boundary": "This baseline covers only the six explicit loopback fixture expectations. It does not measure overall scanner coverage or prove exploitability. Redirect scope is asserted separately by a test that verifies the second local server receives no request."
 }
