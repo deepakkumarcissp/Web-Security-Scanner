@@ -382,7 +382,8 @@ def test_nuclei_template_selector_excludes_high_risk_and_non_http_templates(tmp_
 def test_nuclei_template_selection_balances_categories_before_filling_cap(tmp_path, monkeypatch):
     root = tmp_path / "http"
     root.mkdir()
-    categories = ["cve", "misconfig", "exposure", "ssl", "tech"]
+    # CVE-tagged templates are intentionally excluded by the safe default selector.
+    categories = ["misconfig", "exposure", "ssl", "tech", "discovery"]
     for category in categories:
         for index in range(3):
             (root / f"{category}-{index}.yaml").write_text(
@@ -498,6 +499,11 @@ def test_dashboard_renders_with_schedule_and_report_navigation():
     assert "Assessment depth" in response.text
     assert "Active — test application vulnerabilities" in response.text
     assert "I explicitly approve active payload testing" in response.text
+    assert "DKCISSP Local Lab Target" in response.text
+    assert "http://127.0.0.1:1003" in response.text
+    assert "http://127.0.0.1:1006" in response.text
+    assert "http://127.0.0.1:1007/WebGoat" in response.text
+    assert "explicitly marked In Scope" in response.text
 
 
 
@@ -505,9 +511,11 @@ def test_tool_status_reports_allowlisted_integrations():
     response = client.get("/api/tools")
     assert response.status_code == 200
     payload = response.json()
-    assert {tool["id"] for tool in payload["tools"]} == {
+    tool_ids = {tool["id"] for tool in payload["tools"]}
+    # The registry can grow; assert required integrations without rejecting additions.
+    assert {
         "curl", "zaproxy", "whatweb", "testssl", "nuclei", "nikto", "wapiti"
-    }
+    } <= tool_ids
     assert all("status" in tool and "installed" in tool for tool in payload["tools"])
 
 

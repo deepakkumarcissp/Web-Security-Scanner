@@ -153,10 +153,25 @@ Keep the terminal and application process running while using the dashboard and 
 2. Open the local dashboard at `http://127.0.0.1:1005`.
 3. Visit **Scanner Setup** and run the tool-status check.
 4. Install optional dependencies only when needed and only after reviewing the confirmation prompt.
-5. Use a target you own or are explicitly authorized to test. For initial validation, prefer a local training application such as OWASP Juice Shop.
-6. Create a scan and review its findings, evidence, and remediation guidance.
-7. Export findings as CSV when you need to share or analyze results.
-8. Keep scan scope, permissions, and the intended test intensity documented.
+5. For local validation, use the DKCISSP Web Application Security Lab below, or another target you own or are explicitly authorized to test.
+6. Register the exact target URL in Asset Inventory and explicitly mark it In Scope before scanning. Unregistered or unapproved targets are blocked.
+7. Create a scan and review its findings, evidence, and remediation guidance.
+8. Export findings as CSV when you need to share or analyze results.
+9. Keep scan scope, permissions, and the intended test intensity documented.
+
+### Use the DKCISSP local lab targets
+
+The separate [DKCISSP Web Application Security Lab repository](https://github.com/deepakkumarcissp/Kali-Web-Application-Security-Lab) installs three intentionally vulnerable applications with one command. On Kali, follow that repository's README and run `./install.sh`. Once the lab is running, these local targets are available:
+
+| Training target | URL |
+|---|---|
+| OWASP Juice Shop | `http://127.0.0.1:1003` |
+| DVWA | `http://127.0.0.1:1006` |
+| OWASP WebGoat | `http://127.0.0.1:1007/WebGoat` |
+
+On **Assess Website**, choose a target from the **DKCISSP Local Lab Target** selector. Then open **Asset Inventory**, register that exact URL with the authorization checkbox enabled, and select **In Scope** only for the local training targets you intend to test. Return to **Assess Website**, confirm the authorization checkbox, and start with **Standard** or a lower-impact profile. The selector fills the URL; it does not bypass scope enforcement or automatically approve assets.
+
+These apps are deliberately vulnerable. Keep them bound to localhost, do not expose them to a LAN or the Internet, and do not use production credentials or data. The Active profile can submit payloads; use it only when explicitly approved and after understanding the possible impact.
 
 ## Scheduling
 
