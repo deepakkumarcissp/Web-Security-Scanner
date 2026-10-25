@@ -678,8 +678,11 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
             template_file.write("\n".join(selected_templates) + "\n")
         with open(targets_path, "w", encoding="utf-8") as target_file:
             target_file.write("\n".join(safe_targets) + "\n")
+        # Nuclei's single-target mode is simpler and avoids list-mode overhead for Standard.
+        # Keep list mode only when Deep/Active scan multiple approved same-origin URLs.
+        target_args = ["-u", safe_targets[0]] if len(safe_targets) == 1 else ["-list", targets_path]
         command = [
-            binary, "-list", targets_path,
+            binary, *target_args,
             "-templates", templates_path,
             "-pt", "http",
             "-severity", "info,low,medium,high,critical,unknown",
