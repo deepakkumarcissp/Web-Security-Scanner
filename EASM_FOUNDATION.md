@@ -23,6 +23,8 @@ The broader `assessments/domain_recon.py` also illustrates a wide enrichment cat
 ## What DKCISSP already has
 
 - SQLite-backed asset registry with first/last seen, asset type, source, notes, scope state, review decision, and approval reference.
+- First-class organization/root-domain registry API (`GET/POST /api/organizations`) with normalized DNS roots, owner contact/notes, explicit authorization, and asset counts.
+- Assets can associate with an organization; automatic association uses exact root-domain or dot-label subdomain boundaries, and discovered candidates inherit the root asset's organization.
 - Explicit authorization for asset registration, scope changes, and passive discovery.
 - Opt-in Certificate Transparency lookup for an approved DNS root.
 - Discovered subdomains enter `needs_review`; discovery starts zero scans.

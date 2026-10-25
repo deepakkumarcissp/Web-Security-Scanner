@@ -19,7 +19,7 @@
 - [x] Review AIAgent ASM orchestration and broader domain-recon capability model.
 - [x] Document capability gaps, implementation stages, and security requirements for DKCISSP EASM.
 - [x] Expose the existing asset inventory as **Attack Surface (Beta)** while describing only capabilities that exist today.
-- [ ] Add organization/root-domain records and stronger canonical host identity without losing URL/port scope boundaries.
+- [x] Add organization/root-domain records and exact-boundary asset association without losing URL/port scope boundaries (API/data layer; dashboard management UI remains to be added).
 - [ ] Add a discovery adapter contract and persist per-source status, provenance, timestamps, limits, and errors.
 - [ ] Add bounded DNS resolution as a distinct inventory stage, not implicit permission to probe/scan.
 - [ ] Add approved-only, low-impact HTTP/TLS fingerprinting and asset-change snapshots.
@@ -99,7 +99,8 @@
 - Latest regression implementation before current working changes: `b281bee` — controlled local HTTP fixture.
 - Commit `0fffdcd` blocks cross-origin redirects on the initial request; tests verify a second loopback port is never contacted.
 - Commit `cdbb2cc` adds a controlled-HTTP expected-signal baseline and evaluator regression test; full suite: **100 passed**, 2 dependency deprecation warnings.
-- Current batch documents the AIAgent EASM reference architecture and exposes the existing inventory page as **Attack Surface (Beta)**; targeted asset/discovery tests: **7 passed**; full suite: **100 passed**; inline JavaScript syntax check passed.
+- Commit `8127966` documents the AIAgent EASM reference architecture and exposes the existing inventory page as **Attack Surface (Beta)**.
+- Current batch adds an organization/root-domain registry API, backward-compatible SQLite migration, exact-boundary asset association, and inherited organization linkage for CT candidates. Focused tests: **10 passed**; full suite: **103 passed**; Python/JavaScript syntax and diff checks passed.
 - Local Juice Shop Standard scan: **scan 31 PASS**, completed in 14.1 seconds; 7 same-origin URLs mapped, Nuclei completed, WhatWeb completed, and ZAP passive completed. Active Wapiti was correctly skipped.
 - Expected-signal evaluator: **PASS, 5/5 expected signals matched**, zero duplicate groups, three unmatched findings retained for human triage. This is 100% coverage of the five declared fixture signals only, not overall vulnerability detection coverage.
 - Full regression suite before the latest scope-hardening change: **98 passed**, 2 dependency deprecation warnings.

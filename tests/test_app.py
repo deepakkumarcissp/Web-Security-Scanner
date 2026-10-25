@@ -615,6 +615,50 @@ def test_tool_setup_page_is_separate_from_risk_dashboard():
     assert "v0.1 MVP" not in response.text
 
 
+def test_organization_registry_requires_authorization_and_normalizes_root_domain():
+    denied = client.post("/api/organizations", json={"name": "Example Org", "root_domain": "example.test"})
+    assert denied.status_code == 400
+    created = client.post("/api/organizations", json={
+        "name": "Example Org", "root_domain": "EXAMPLE.TEST.",
+        "owner_contact": "security@example.test", "authorized": True,
+    })
+    assert created.status_code == 200
+    payload = created.json()
+    assert payload["root_domain"] == "example.test"
+    assert payload["created"] is True
+    duplicate = client.post("/api/organizations", json={
+        "name": "Example Org Updated", "root_domain": "example.test",
+        "authorized": True,
+    })
+    assert duplicate.status_code == 200
+    assert duplicate.json()["id"] == payload["id"]
+    assert duplicate.json()["created"] is False
+    assert any(row["id"] == payload["id"] for row in client.get("/api/organizations").json())
+
+
+def test_organization_registry_rejects_urls_and_ip_addresses():
+    for root in ("https://example.test", "*.example.test", "127.0.0.1"):
+        response = client.post("/api/organizations", json={
+            "name": f"Invalid {root}", "root_domain": root, "authorized": True,
+        })
+        assert response.status_code == 400, (root, response.text)
+
+
+def test_assets_associate_with_organization_only_on_exact_dns_boundary():
+    org = client.post("/api/organizations", json={
+        "name": "Boundary Test Org", "root_domain": "boundary-example.test", "authorized": True,
+    }).json()
+    accepted = client.post("/api/assets", json={
+        "target": "https://api.boundary-example.test", "authorized": True,
+    })
+    assert accepted.status_code == 200
+    assert accepted.json()["organization_id"] == org["id"]
+    rejected = client.post("/api/assets", json={
+        "target": "https://boundary-example.test.attacker.invalid", "organization_id": org["id"], "authorized": True,
+    })
+    assert rejected.status_code == 400
+
+
 def test_asset_inventory_requires_explicit_authorization():
     response = client.post("/api/assets", json={
         "target": "https://Example.com", "authorized": False,

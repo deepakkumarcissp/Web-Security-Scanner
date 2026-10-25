@@ -100,6 +100,15 @@ def init_db() -> None:
                 next_run TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS organizations(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                root_domain TEXT NOT NULL,
+                owner_contact TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS assets(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 target TEXT NOT NULL UNIQUE,
@@ -135,6 +144,8 @@ def init_db() -> None:
         if "lifecycle_updated_at" not in finding_columns:
             conn.execute("ALTER TABLE findings ADD COLUMN lifecycle_updated_at TEXT")
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(assets)")}
+        if "organization_id" not in columns:
+            conn.execute("ALTER TABLE assets ADD COLUMN organization_id INTEGER REFERENCES organizations(id)")
         if "approval_reference" not in columns:
             conn.execute("ALTER TABLE assets ADD COLUMN approval_reference TEXT NOT NULL DEFAULT ''")
         if "reviewed_at" not in columns:
@@ -185,8 +196,17 @@ class ScheduleRequest(ScanRequest):
     run_at: str | None = None
 
 
+class OrganizationRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    root_domain: str = Field(min_length=3, max_length=253)
+    owner_contact: str = Field(default="", max_length=254)
+    notes: str = Field(default="", max_length=1000)
+    authorized: bool = False
+
+
 class AssetRequest(BaseModel):
     target: str = Field(min_length=8, max_length=2048)
+    organization_id: int | None = Field(default=None, ge=1)
     authorized: bool = False
     scope_status: str = Field(default="needs_review", pattern="^(in_scope|out_of_scope|needs_review)$")
     notes: str = Field(default="", max_length=1000)
@@ -1612,6 +1632,51 @@ def dashboard():
         }
 
 
+def normalize_root_domain(raw: str) -> str:
+    """Accept a DNS name only, never a URL, wildcard, IP literal, or suffix lookalike."""
+    domain = raw.strip().lower().rstrip(".")
+    if not valid_dns_name(domain) or "." not in domain or re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", domain):
+        raise HTTPException(400, "Root domain must be a valid fully qualified DNS name, not a URL or IP address.")
+    return domain
+
+
+@app.get("/api/organizations")
+def list_organizations():
+    with connect() as conn:
+        return [dict(row) for row in conn.execute(
+            """SELECT o.*, COUNT(a.id) AS asset_count FROM organizations o
+               LEFT JOIN assets a ON a.organization_id=o.id
+               GROUP BY o.id ORDER BY o.name COLLATE NOCASE"""
+        )]
+
+
+@app.post("/api/organizations")
+def create_organization(request: OrganizationRequest):
+    if not request.authorized:
+        raise HTTPException(400, "Confirm you are authorized to register this organization/root domain.")
+    name = request.name.strip()
+    if not name:
+        raise HTTPException(400, "Organization name cannot be blank.")
+    root_domain = normalize_root_domain(request.root_domain)
+    timestamp = now()
+    with connect() as conn:
+        existing = conn.execute("SELECT * FROM organizations WHERE root_domain=?", (root_domain,)).fetchone()
+        if existing:
+            conn.execute("UPDATE organizations SET name=?,owner_contact=?,notes=?,updated_at=? WHERE id=?",
+                         (name, request.owner_contact.strip(), request.notes.strip(), timestamp, existing["id"]))
+            row = conn.execute("SELECT * FROM organizations WHERE id=?", (existing["id"],)).fetchone()
+            return {**dict(row), "created": False}
+        try:
+            cursor = conn.execute(
+                "INSERT INTO organizations(name,root_domain,owner_contact,notes,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                (name, root_domain, request.owner_contact.strip(), request.notes.strip(), timestamp, timestamp),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(409, "An organization with that name already exists; use its existing record or choose a unique name.") from exc
+        row = conn.execute("SELECT * FROM organizations WHERE id=?", (cursor.lastrowid,)).fetchone()
+        return {**dict(row), "created": True}
+
+
 @app.get("/api/assets")
 def list_assets():
     with connect() as conn:
@@ -1643,18 +1708,31 @@ def create_asset(request: AssetRequest):
     timestamp = now()
     asset_type = "ip_address" if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", hostname) else "web_url"
     with connect() as conn:
+        organization_id = request.organization_id
+        if organization_id is not None:
+            organization = conn.execute("SELECT * FROM organizations WHERE id=?", (organization_id,)).fetchone()
+            if not organization:
+                raise HTTPException(404, "Organization not found")
+            root_domain = organization["root_domain"].lower().rstrip(".")
+            if hostname != root_domain and not hostname.endswith("." + root_domain):
+                raise HTTPException(400, "Asset hostname must match the organization's exact root domain or a true subdomain label boundary.")
+        else:
+            matches = conn.execute("SELECT id,root_domain FROM organizations").fetchall()
+            eligible = [row for row in matches if hostname == row["root_domain"] or hostname.endswith("." + row["root_domain"])]
+            if eligible:
+                organization_id = max(eligible, key=lambda row: len(row["root_domain"]))["id"]
         existing = conn.execute("SELECT * FROM assets WHERE target=?", (normalized,)).fetchone()
         if existing:
-            conn.execute("UPDATE assets SET last_seen=?, notes=? WHERE id=?",
-                         (timestamp, request.notes, existing["id"]))
+            conn.execute("UPDATE assets SET last_seen=?, notes=?, organization_id=COALESCE(?, organization_id) WHERE id=?",
+                         (timestamp, request.notes, organization_id, existing["id"]))
             row = conn.execute("SELECT * FROM assets WHERE id=?", (existing["id"],)).fetchone()
             return {**dict(row), "created": False}
         initial_decision = "approved" if request.scope_status == "in_scope" else ("rejected" if request.scope_status == "out_of_scope" else "pending")
         cursor = conn.execute(
-            """INSERT INTO assets(target,asset_type,scope_status,discovery_source,first_seen,last_seen,notes,reviewed_at,review_decision)
-               VALUES(?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO assets(target,asset_type,scope_status,discovery_source,first_seen,last_seen,notes,reviewed_at,review_decision,organization_id)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
             (normalized, asset_type, request.scope_status, "manual", timestamp, timestamp, request.notes,
-             timestamp if initial_decision in {"approved", "rejected"} else None, initial_decision),
+             timestamp if initial_decision in {"approved", "rejected"} else None, initial_decision, organization_id),
         )
         row = conn.execute("SELECT * FROM assets WHERE id=?", (cursor.lastrowid,)).fetchone()
         return {**dict(row), "created": True}
@@ -1754,10 +1832,10 @@ def discover_subdomains(asset_id: int, request: AssetDiscoveryRequest):
                 conn.execute("UPDATE assets SET last_seen=? WHERE id=?", (timestamp, exists["id"]))
                 continue
             conn.execute(
-                """INSERT INTO assets(target,asset_type,scope_status,discovery_source,first_seen,last_seen,notes)
-                   VALUES(?,?,?,?,?,?,?)""",
+                """INSERT INTO assets(target,asset_type,scope_status,discovery_source,first_seen,last_seen,notes,organization_id)
+                   VALUES(?,?,?,?,?,?,?,?)""",
                 (target, "subdomain", "needs_review", "crt.sh", timestamp, timestamp,
-                 "Passive certificate-transparency candidate; verify ownership and scope before scanning."),
+                 "Passive certificate-transparency candidate; verify ownership and scope before scanning.", root["organization_id"]),
             )
             created += 1
     return {"root_asset_id": asset_id, "source": "crt.sh", "candidates_found": len(candidates),

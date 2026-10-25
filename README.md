@@ -86,7 +86,7 @@ Standard/Deep scans now discover up to 12 same-origin URLs, with a maximum link 
 
 ## Current capabilities
 
-- **EASM foundation (beta):** explicit root-asset registration, passive certificate-transparency hostname discovery, source/provenance tracking, and a human-reviewed scope gate; discovered candidates do not trigger scans. DNS/ASN resolution, historical discovery, web fingerprinting, and exposure trends are not yet implemented in this scanner.
+- **EASM foundation (beta):** organization/root-domain registry API, explicit root-asset registration, passive certificate-transparency hostname discovery, source/provenance tracking, and a human-reviewed scope gate; discovered candidates do not trigger scans. Organization/root records and asset association are currently API/data-layer capabilities, not yet a dedicated management screen. DNS/ASN resolution, historical discovery, web fingerprinting, and exposure trends are not yet implemented in this scanner.
 - Risk-focused dashboard with summary cards, findings, and scan history
 - Built-in low-impact HTTP and response-header checks
 - Bounded same-origin endpoint discovery for Standard/Deep scans, followed by passive header/cookie checks across discovered URLs
