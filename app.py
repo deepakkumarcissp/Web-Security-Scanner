@@ -504,6 +504,27 @@ def exposed_file_observation(url: str, status_code: int, headers: dict) -> dict 
     }
 
 
+def risky_http_methods_observation(allow_header: str, status_code: int) -> dict | None:
+    """Report potentially risky methods only when the server explicitly advertises them."""
+    if status_code < 200 or status_code >= 500:
+        return None
+    allowed = {
+        item.strip().upper()
+        for item in (allow_header or "").split(",")
+        if item.strip()
+    }
+    risky = sorted(allowed.intersection({"TRACE", "PUT", "DELETE", "CONNECT", "PROPFIND"}))
+    if not risky:
+        return None
+    return {
+        "title": "Potentially risky HTTP methods advertised",
+        "severity": "Low",
+        "confidence": "Medium",
+        "evidence": f"HTTP response advertised methods: {', '.join(risky)}. An Allow header is an indication only; method reachability and application impact require authorized validation.",
+        "remediation": "Disable methods that the application does not require. Confirm method handling at the web server, reverse proxy, and application layers; do not rely on the Allow header alone as proof of exploitability.",
+    }
+
+
 def default_server_page_observation(body: str, content_type: str) -> dict | None:
     """Identify well-known stock server welcome pages as low-confidence inventory signals."""
     if not is_html_document(content_type):
@@ -1515,6 +1536,27 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         if default_page:
             finding(default_page["severity"], default_page["title"], default_page["evidence"],
                     default_page["remediation"], default_page["confidence"])
+
+        # OPTIONS is a low-impact capability probe. It does not submit data or
+        # execute the advertised methods, and redirect handling stays same-origin.
+        if profile in ("standard", "deep", "active"):
+            options_status = None
+            options_headers = {}
+            try:
+                options_req = Request(final_url, headers={"User-Agent": "DKCISSP-WebSecurityScanner/0.1 (+authorized passive checks)"}, method="OPTIONS")
+                with same_origin_opener(target).open(options_req, timeout=4) as options_response:
+                    options_status = options_response.status
+                    options_headers = {k.lower(): v for k, v in options_response.headers.items()}
+            except HTTPError as exc:
+                options_status = exc.code
+                options_headers = {k.lower(): v for k, v in exc.headers.items()}
+            except (URLError, TimeoutError, OSError, ssl.SSLError, ValueError):
+                pass
+            if options_status is not None:
+                method_signal = risky_http_methods_observation(options_headers.get("allow", ""), options_status)
+                if method_signal:
+                    finding(method_signal["severity"], method_signal["title"], method_signal["evidence"],
+                            method_signal["remediation"], method_signal["confidence"])
 
         if final_url.startswith("https://") and "strict-transport-security" not in headers:
             finding(

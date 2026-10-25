@@ -167,14 +167,15 @@
       ],
       "evidence": [
         "tests/test_app.py",
-        "tests/test_default_server_page_detection.py"
+        "tests/test_default_server_page_detection.py",
+        "tests/test_risky_http_methods.py"
       ],
       "known_gaps": [
-        "Risky HTTP method exposure is not yet checked by a dedicated bounded OPTIONS probe.",
+        "Risky-method signals rely on an advertised Allow header and do not prove method reachability or impact.",
         "Stock-page signatures are low-confidence inventory signals and may be intentionally deployed.",
-        "Current checks do not constitute a complete server-misconfiguration benchmark."
+        "Current checks do not yet constitute a complete server-misconfiguration benchmark."
       ],
-      "next_action": "Add controlled fixtures for risky methods, then validate root and discovered-page default-page observations in a scan-level test."
+      "next_action": "Add scan-level fixtures for default-page and OPTIONS behavior; then continue to controlled SQL injection and XSS benchmarks."
     },
     {
       "id": "sql-injection",

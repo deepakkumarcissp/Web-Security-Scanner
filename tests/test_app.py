@@ -1575,6 +1575,14 @@ def test_quick_scan_against_controlled_loopback_http_fixture(monkeypatch):
     import threading
 
     class FixtureHandler(BaseHTTPRequestHandler):
+        def do_OPTIONS(self):
+            self.send_response(204)
+            if self.path == "/risky-methods":
+                self.send_header("Allow", "GET, HEAD, OPTIONS, TRACE")
+            else:
+                self.send_header("Allow", "GET, HEAD, OPTIONS")
+            self.end_headers()
+
         def do_GET(self):
             if self.path == "/redirect-out":
                 self.send_response(302)
