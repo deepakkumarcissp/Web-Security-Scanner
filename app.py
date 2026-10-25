@@ -920,6 +920,10 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
                 title = str(info.get("name") or item.get("template-id") or "Nuclei finding")[:240]
                 template_id = str(item.get("template-id") or "unknown-template")[:160]
                 matched_at = str(item.get("matched-at") or item.get("host") or target)[:2048]
+                # Treat tool output as untrusted: only persist findings attached to the
+                # exact approved origin, even if a tool record unexpectedly names another host.
+                if not is_same_origin_url(matched_at, target):
+                    continue
                 extracted = item.get("extracted-results")
                 matcher = str(item.get("matcher-name") or "")[:160]
                 evidence_parts = [f"Template: {template_id}"]

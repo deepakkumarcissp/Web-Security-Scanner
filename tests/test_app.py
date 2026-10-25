@@ -1300,3 +1300,108 @@ def test_start_scan_enforces_capacity_atomically(monkeypatch):
     finally:
         with app.connect() as conn:
             conn.execute("DELETE FROM scans WHERE id=?", (running_id,))
+
+
+
+def test_testssl_regression_cases_map_tls_severity_and_ignore_ok_or_unknown(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/testssl.sh")
+
+    def fake_run(command, **kwargs):
+        report_path = command[command.index("--jsonfile-pretty") + 1]
+        with open(report_path, "w", encoding="utf-8") as output:
+            json.dump([
+                {"id": "TLS 1.0", "severity": "HIGH", "finding": "TLS 1.0 is offered"},
+                {"id": "Weak cipher", "severity": "WARNING", "finding": "A weak cipher is offered"},
+                {"id": "TLS 1.3", "severity": "OK", "finding": "TLS 1.3 is offered"},
+                {"id": "Unknown check", "severity": "mystery", "finding": "Unclassified result"},
+                {"id": "Empty result", "severity": "HIGH", "finding": ""},
+                "malformed entry",
+            ], output)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    findings, status = app.perform_testssl_check("https://127.0.0.1:10443")
+
+    assert status["status"] == "completed"
+    assert status["finding_count"] == 2
+    assert [(item[0], item[1]) for item in findings] == [
+        ("High", "testssl.sh: TLS 1.0"),
+        ("Medium", "testssl.sh: Weak cipher"),
+    ]
+    assert all(item[2] == "https://127.0.0.1:10443" for item in findings)
+
+
+def test_testssl_nonzero_exit_with_json_is_warning_not_silent_success(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/testssl.sh")
+
+    def fake_run(command, **kwargs):
+        report_path = command[command.index("--jsonfile-pretty") + 1]
+        with open(report_path, "w", encoding="utf-8") as output:
+            json.dump([{"id": "TLS 1.2", "severity": "LOW", "finding": "Review cipher preference"}], output)
+        return SimpleNamespace(returncode=2, stdout="", stderr="partial diagnostic")
+
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    findings, status = app.perform_testssl_check("https://127.0.0.1:10443")
+
+    assert status["status"] == "completed_with_warnings"
+    assert status["return_code"] == 2
+    assert len(findings) == 1
+    assert findings[0][0] == "Low"
+
+
+
+def test_nuclei_exposed_file_signal_is_normalized_and_out_of_scope_result_dropped(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/nuclei")
+    monkeypatch.setattr(app, "select_nuclei_templates", lambda max_templates=30: (
+        ["/tmp/safe-template.yaml"],
+        {"status": "ready", "templates_selected": 1, "max_templates": max_templates},
+    ))
+
+    def fake_run(command, **kwargs):
+        report_path = command[command.index("-jsonl-export") + 1]
+        records = [
+            {
+                "template-id": "public-contact-file",
+                "matched-at": "http://127.0.0.1:1003/.well-known/security.txt",
+                "matcher-name": "status-code",
+                "extracted-results": ["HTTP 200"],
+                "info": {
+                    "name": "Public security contact file",
+                    "severity": "info",
+                    "description": "A public security contact file was found.",
+                    "remediation": "Review whether the file contents are intended to be public.",
+                },
+            },
+            {
+                "template-id": "public-contact-file",
+                "matched-at": "https://scope-mismatch.example/public-file",
+                "matcher-name": "status-code",
+                "extracted-results": ["HTTP 200"],
+                "info": {"name": "Out-of-scope file", "severity": "high"},
+            },
+        ]
+        Path(report_path).write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    findings, status = app.perform_nuclei_check(
+        "http://127.0.0.1:1003",
+        targets=["http://127.0.0.1:1003", "http://127.0.0.1:1003/.well-known/security.txt", "https://scope-mismatch.example/public-file"],
+    )
+
+    assert status["status"] == "completed"
+    assert status["target_count"] == 2
+    assert status["finding_count"] == 1
+    assert findings[0][1] == "Nuclei: Public security contact file"
+    assert findings[0][2] == "http://127.0.0.1:1003/.well-known/security.txt"
+    assert "HTTP 200" in findings[0][3]
+    assert "scope-mismatch.example" not in str(findings)
