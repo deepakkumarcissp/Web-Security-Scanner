@@ -582,7 +582,7 @@ def test_tool_capability_registry_never_executes_inventory_only_tools_by_claim()
     tools = {tool["id"]: tool for tool in response.json()["tools"]}
     assert tools["katana"]["integration"] == "inventory_only"
     assert tools["ffuf"]["integration"] == "inventory_only"
-    assert tools["sqlmap"]["integration"] == "manual_only"
+    assert tools["sqlmap"]["integration"] == "explicit_active_profile"
 
 
 def test_zap_api_readiness_overrides_unhelpful_launcher_version(monkeypatch):

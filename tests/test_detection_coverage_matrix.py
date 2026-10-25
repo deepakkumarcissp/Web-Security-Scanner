@@ -53,11 +53,11 @@ def test_sql_injection_and_xss_statuses_match_observed_benchmark_evidence():
     assert categories["server-misconfiguration"]["status"] == "implemented"
 
     sqli = categories["sql-injection"]
-    assert sqli["status"] == "unverified"
+    assert sqli["status"] == "validated"
     assert "LOCAL_DETECTION_BENCHMARK.md" in sqli["evidence"]
-    assert "scripts/benchmark_juice_shop_sqli.py" in sqli["evidence"]
-    assert "expected-positive" in sqli["next_action"].lower()
-    assert "strict same-origin" in sqli["next_action"].lower()
+    assert "scripts/run_sqlmap_api_benchmark.py" in sqli["evidence"]
+    assert "SQLite-backed JSON login fixture" in " ".join(sqli["known_gaps"])
+    assert "schema variants" in sqli["next_action"].lower()
 
     xss = categories["cross-site-scripting"]
     assert xss["status"] == "implemented"

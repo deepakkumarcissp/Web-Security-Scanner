@@ -180,22 +180,25 @@
     {
       "id": "sql-injection",
       "name": "SQL injection detection",
-      "status": "unverified",
+      "status": "validated",
       "profiles": [
         "active"
       ],
       "evidence": [
         "tests/test_wapiti_vulnerability_signals.py",
         "tests/test_juice_shop_sqli_benchmark.py",
+        "tests/test_sqlmap_api_detection.py",
         "scripts/benchmark_juice_shop_sqli.py",
+        "scripts/local_sqli_api_benchmark_fixture.py",
+        "scripts/run_sqlmap_api_benchmark.py",
         "LOCAL_DETECTION_BENCHMARK.md"
       ],
       "known_gaps": [
-        "Parser normalization has regression coverage, but direct Wapiti and the DKCISSP adapter have not produced a confirmed SQLi finding from the known expected-positive API behavior.",
-        "A bounded sqlmap JSON API test also missed the behavior; HTTP 500 anomalies are not counted as SQLi detections.",
-        "The benchmark oracle confirms the expected behavior in the training lab but is not itself a scanner detector."
+        "Validated on one intentionally vulnerable SQLite-backed JSON login fixture with SQLMap finding evidence; this does not establish broad coverage across database engines, query patterns, or API authentication models.",
+        "The Juice Shop login endpoint's common Swagger paths return HTML rather than a machine-readable schema, so that separate target is not yet detected by schema discovery.",
+        "Time-based SQLi, authenticated API workflows, complex nested JSON, referenced OpenAPI schemas, and additional SQL dialects remain outside the validated benchmark."
       ],
-      "next_action": "Implement and validate an API-aware SQLi detector against the known loopback expected-positive case, with a negative control and strict same-origin scope checks."
+      "next_action": "Expand expected-positive benchmarks across safe database/query patterns and schema variants, and add an explicit same-origin OpenAPI schema setting for APIs that do not publish a schema at common paths."
     },
     {
       "id": "cross-site-scripting",

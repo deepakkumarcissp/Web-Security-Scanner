@@ -62,7 +62,7 @@ The scanner adapter's current Wapiti module list includes sql and xss, but its f
 - A miss is a benchmark failure to investigate, not proof the vulnerability class is unsupported everywhere.
 - A finding is not automatically confirmed solely because Wapiti reports it; review evidence and scope.
 - Do not claim broad SQLi/XSS coverage from these narrow cases. Stored XSS, blind/time-based SQLi, authenticated flows, framework contexts, and false-positive behavior remain out of scope.
-- SQLi remains **unverified** until a database-backed local fixture or a known vulnerable lab input produces a reproducible expected finding with useful evidence.
+- Historical status note: SQLi was unverified during the initial simulated-error and Juice Shop crawl runs. This was superseded by the end-to-end JSON/SQLite benchmark result recorded in the latest section below.
 - XSS has one observed reflected-XSS hit in direct Wapiti; the full DKCISSP adapter path and broader XSS contexts remain unverified.
 
 
@@ -72,16 +72,16 @@ A controlled manual request was made on 2026-10-25 to the loopback-only lab endp
 
 A targeted Wapiti attempt against that endpoint used Wapiti's `--data` option, which sends URL-encoded form data. The Juice Shop endpoint expects JSON, so this was a mismatched request format. Wapiti logged an HTTP 500 anomaly, reported no SQL Injection or Blind SQL Injection findings, and exited with code 0. This attempt is therefore **inconclusive**, not a positive detection and not a valid negative benchmark.
 
-### Next engineering step
+### Historical implementation gap
 
-The current DKCISSP Wapiti adapter crawls pages and query/form parameters; it does not currently accept an explicit JSON request body or an OpenAPI/Swagger definition. Add a safe, opt-in API test path (preferably OpenAPI-driven or an explicitly configured JSON request) with strict same-origin/loopback scope checks, then run it against this known local Juice Shop endpoint. Only mark SQLi implemented after the adapter produces a reproducible finding with the affected endpoint, parameter, and evidence, and regression tests cover both positive and control cases. Keep the general SQLi coverage status **unverified** until that is complete.
+Historical note: when this attempt was run, the DKCISSP Wapiti adapter did not accept an explicit JSON request body or OpenAPI schema. The OpenAPI-aware SQLMap adapter and the end-to-end SQLite benchmark were added later and are documented below. Juice Shop itself remains a separate unresolved schema-discovery case.
 
 
 ### OpenAPI-driven Wapiti follow-up
 
 A temporary OpenAPI 3.0 specification describing the Juice Shop login endpoint was created under `/tmp` and used with Wapiti's `--swagger` option. The targeted run did send an `application/json` POST to `/rest/user/login`, confirming that Wapiti can exercise this endpoint when given an API schema. It again logged an HTTP 500 anomaly for a generated malformed-input request and reported no SQL Injection or Blind SQL Injection finding. The same result occurred when scope was narrowed to the login URL. Temporary specifications, reports, and session databases were kept outside the repository.
 
-This narrows the gap further: OpenAPI can provide JSON endpoint coverage, but the generic Wapiti SQL module still did not detect the manually demonstrated boolean-based login bypass in this test. The adapter also does not expose the OpenAPI option today. Before adding API support to the product, build an automated expected-positive benchmark using the known boolean-based behavior and verify which detector can reliably distinguish the bypass from the invalid-credentials control. Do not treat a malformed-input 500 as proof of SQLi detection.
+Historical result: OpenAPI enabled Wapiti to send JSON requests to the Juice Shop login route, but its SQL module still did not detect the manually demonstrated bypass. The product now has a separate OpenAPI-aware SQLMap adapter. This earlier Wapiti miss remains valid evidence for that tool/run; the positive SQLMap result on the separate SQLite fixture is documented below. Do not treat a malformed-input 500 as proof of SQLi detection.
 
 
 ## Repeatable Juice Shop API expected-positive oracle
@@ -94,4 +94,29 @@ The script sends a normal invalid-login control and a known boolean-based inject
 
 Observed result on 2026-10-25: control returned HTTP 401 with the invalid-credentials response; test returned HTTP 200 with an authentication response. The oracle passed. This proves a repeatable expected-positive behavior exists in the local training app, but it does not mean a scanner detected it.
 
-A bounded sqlmap 1.10.8 run against the JSON endpoint (parameter `email`, boolean-based technique, level 2, risk 1, one thread, five-second timeout, no retries) did not identify the parameter as injectable and recorded HTTP 401/500 responses. Wapiti's OpenAPI-driven JSON attempt likewise produced a malformed-input HTTP 500 anomaly but no confirmed SQLi finding. The detection-engine benchmark therefore still fails its expected-positive assertion: the oracle works, but neither tested tool has yet detected the known behavior. SQLi remains **unverified** in the product coverage matrix.
+A bounded sqlmap 1.10.8 run against the Juice Shop JSON endpoint (parameter `email`, boolean-based technique, level 2, risk 1, one thread, five-second timeout, no retries) did not identify the parameter as injectable and recorded HTTP 401/500 responses. Wapiti's OpenAPI-driven JSON attempt likewise produced a malformed-input HTTP 500 anomaly but no confirmed SQLi finding. These historical attempts missed the Juice Shop endpoint; they do not represent the later positive SQLMap result on the dedicated SQLite fixture, documented in the latest end-to-end section below.
+
+
+## OpenAPI-aware SQLMap integration (engineering increment)
+
+The Active profile now has an optional SQLMap adapter. It looks for common OpenAPI/Swagger JSON locations on the exact same origin, accepts only a JSON object with a `paths` map, rejects cross-origin server bases and operation URLs, and tests at most two GET/POST operations and two fields per operation. It uses SQLMap's low risk/level, one thread, short per-request timeouts, no retries, and a bounded injection-test runtime. Only output containing SQLMap's explicit injection-point classification plus parameter/type evidence is normalized as a High finding. HTTP 500 responses or generic response changes are not enough. This adapter runs only in the separately approved Active profile.
+
+Regression tests cover JSON operation extraction, rejection of an external OpenAPI server base, and both negative and explicit-positive SQLMap output parsing. The adapter was also exercised against local Juice Shop; it did not discover a machine-readable OpenAPI schema at the common paths, so it did not launch SQLMap against the login endpoint. Juice Shop's Swagger UI paths returned the app's HTML fallback rather than a raw JSON schema. This is a documented coverage gap, not a positive detection.
+
+The known Juice Shop login benchmark still passes its control-vs-test oracle, but SQLMap/Wapiti have not produced a confirmed finding on that endpoint because schema discovery is unresolved. The separate SQLite-backed fixture now validates the integrated SQLMap path for one narrow case. Remaining work is explicit schema configuration and expansion to more database/query patterns.
+
+
+## Latest end-to-end SQLi result (2026-10-25): validated narrow case
+
+The database-backed fixture and one-command runner are now committed as source candidates:
+
+- `scripts/local_sqli_api_benchmark_fixture.py` — deliberately vulnerable SQLite-backed JSON login API, bound to loopback only, with a machine-readable OpenAPI document.
+- `scripts/run_sqlmap_api_benchmark.py` — starts the fixture, isolates the scanner SQLite database, verifies the control/test oracle, invokes the real DKCISSP SQLMap adapter, prints sanitized JSON evidence, and always stops the fixture.
+
+Run from the repository root:
+
+    python3 scripts/run_sqlmap_api_benchmark.py
+
+Observed end-to-end result: oracle passed; OpenAPI discovery found one POST operation; SQLMap tested two JSON parameters; the DKCISSP adapter normalized two High-severity SQL Injection findings using explicit SQLMap injection-point output. The run completed in about three seconds. No live scanner database was used, and the fixture process was terminated after the run.
+
+This changes the status from unverified to **validated for one narrow JSON/SQLite training-fixture case**. It is not a claim of comprehensive SQLi coverage. Juice Shop still does not expose a raw OpenAPI JSON schema at the common discovery paths, and the adapter needs additional expected-positive cases for other database/query patterns, schema references, and authenticated API flows. Historical Juice Shop/Wapiti misses above remain accurate for those specific attempts and are not overwritten by this separate positive fixture.

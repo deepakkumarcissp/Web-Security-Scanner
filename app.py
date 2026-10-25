@@ -1316,6 +1316,133 @@ def parse_wapiti_report(report, target: str) -> list[tuple]:
     return findings
 
 
+def discover_openapi_json_operations(target: str, max_specs: int = 4, max_operations: int = 3) -> list[dict]:
+    """Discover a small set of same-origin OpenAPI JSON operations without following redirects."""
+    from urllib.request import Request
+
+    candidates = [
+        urljoin(target.rstrip("/") + "/", "openapi.json"),
+        urljoin(target.rstrip("/") + "/", "swagger.json"),
+        urljoin(target.rstrip("/") + "/", "api-docs"),
+        urljoin(target.rstrip("/") + "/", "swagger/v1/swagger.json"),
+    ][:max_specs]
+    operations: list[dict] = []
+    seen_specs = set()
+    for spec_url in candidates:
+        if not is_same_origin_url(spec_url, target) or spec_url in seen_specs:
+            continue
+        seen_specs.add(spec_url)
+        try:
+            req = Request(spec_url, headers={"Accept": "application/json", "User-Agent": "DKCISSP-Scanner"})
+            with same_origin_opener(target).open(req, timeout=3) as response:
+                if response.geturl() != spec_url or not is_same_origin_url(response.geturl(), target):
+                    continue
+                raw = response.read(512 * 1024 + 1)
+                if len(raw) > 512 * 1024:
+                    continue
+                spec = json.loads(raw.decode("utf-8", "replace"))
+        except (OSError, ValueError, HTTPError, URLError, TimeoutError):
+            continue
+        if not isinstance(spec, dict) or not isinstance(spec.get("paths"), dict):
+            continue
+        base = spec.get("servers", [{}])[0].get("url", "") if isinstance(spec.get("servers", [{}]), list) and spec.get("servers") else ""
+        api_base = urljoin(spec_url, base) if base else target.rstrip("/") + "/"
+        if not is_same_origin_url(api_base, target):
+            continue
+        for path, path_item in spec["paths"].items():
+            if not isinstance(path, str) or not path.startswith("/") or not isinstance(path_item, dict):
+                continue
+            endpoint = urljoin(api_base.rstrip("/") + "/", path.lstrip("/"))
+            if not is_same_origin_url(endpoint, target):
+                continue
+            for method in ("get", "post"):
+                operation = path_item.get(method)
+                if not isinstance(operation, dict):
+                    continue
+                parameters = []
+                for param in operation.get("parameters", []):
+                    if isinstance(param, dict) and param.get("in") == "query" and isinstance(param.get("name"), str):
+                        parameters.append(param["name"])
+                body_fields = []
+                request_body = operation.get("requestBody", {})
+                content = request_body.get("content", {}) if isinstance(request_body, dict) else {}
+                schema = content.get("application/json", {}).get("schema", {}) if isinstance(content, dict) else {}
+                properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+                if isinstance(properties, dict):
+                    body_fields = [name for name, value in properties.items()
+                                   if isinstance(name, str) and isinstance(value, dict)
+                                   and value.get("type") in ("string", "integer", "number")]
+                if method == "post" and body_fields:
+                    operations.append({"url": endpoint, "method": "POST", "fields": body_fields[:5], "body": True})
+                elif method == "get" and parameters:
+                    operations.append({"url": endpoint, "method": "GET", "fields": parameters[:5], "body": False})
+                if len(operations) >= max_operations:
+                    return operations
+    return operations
+
+
+def perform_sqlmap_check(target: str, timeout_seconds: int = 60) -> tuple[list[tuple], dict]:
+    """Run bounded SQLMap checks only against same-origin operations declared by a discovered OpenAPI schema."""
+    binary = shutil.which(TOOL_CATALOG["sqlmap"]["binary"])
+    if not binary:
+        return [], {"status": "unavailable", "reason": "sqlmap is not installed", "operations_tested": 0}
+    operations = discover_openapi_json_operations(target, max_operations=2)
+    if not operations:
+        return [], {"status": "not_found", "reason": "No same-origin OpenAPI JSON/query operations were discovered", "operations_tested": 0}
+    findings: list[tuple] = []
+    tested = 0
+    deadline = time.monotonic() + max(1, timeout_seconds)
+    with tempfile.TemporaryDirectory(prefix="dkcissp-sqlmap-") as temp_dir:
+        for index, operation in enumerate(operations):
+            for field in operation["fields"][:2]:
+                remaining = deadline - time.monotonic()
+                if remaining <= 1:
+                    break
+                per_operation_timeout = max(2, min(15, int(remaining)))
+                if operation["body"]:
+                    payload = {name: ("dkcissp-test" if name == field else "invalid") for name in operation["fields"]}
+                    data = json.dumps(payload, separators=(",", ":"))
+                    command = [binary, "-u", operation["url"], "--method=POST", "--data=" + data,
+                               "--headers=Content-Type: application/json", "-p", field]
+                    parameter_label = "JSON " + field
+                else:
+                    command = [binary, "-u", operation["url"], "-p", field]
+                    parameter_label = field
+                report_dir = str(Path(temp_dir) / f"op-{index}-{field}")
+                command.extend([
+                    "--batch", "--level=1", "--risk=1", "--technique=BEU",
+                    "--threads=1", "--timeout=4", "--retries=0", "--ignore-code=401,403",
+                    "--flush-session", "--disable-coloring", "--output-dir=" + report_dir,
+                ])
+                tested += 1
+                try:
+                    result = subprocess.run(command, capture_output=True, text=True,
+                                            timeout=per_operation_timeout, check=False,
+                                            env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"})
+                    output = (result.stdout or "") + "\n" + (result.stderr or "")
+                except subprocess.TimeoutExpired:
+                    continue
+                except OSError:
+                    continue
+                # Require SQLMap's explicit positive classification; 500 responses alone never qualify.
+                normalized_output = output.lower()
+                explicit_positive = (
+                    "sqlmap identified the following injection point" in normalized_output
+                    or "is vulnerable" in normalized_output
+                )
+                if not explicit_positive or "parameter:" not in normalized_output or "type:" not in normalized_output:
+                    continue
+                evidence = f"SQLMap reported an injectable {parameter_label} parameter on {operation['method']} {operation['url']}."
+                findings.append(("High", "SQL Injection (SQLMap)", operation["url"],
+                                 evidence[:1200], "Use parameterized queries or prepared statements; validate input and review the affected database access path.",
+                                 "High"))
+    return findings, {"status": "completed", "finding_count": len(findings),
+                      "operations_discovered": len(operations), "parameters_tested": tested,
+                      "timeout_seconds": timeout_seconds,
+                      "reason": "SQLMap explicit-positive output only; HTTP errors and generic response differences are not counted as SQL injection",
+                      "safety": "Active profile only; same-origin OpenAPI operations; GET/POST only; bounded schema/operation/parameter counts; low risk and single thread"}
+
+
 def perform_wapiti_check(target: str, timeout_seconds: int = 90) -> tuple[list[tuple], dict]:
     """Run an explicitly approved, bounded active Wapiti assessment on the supplied URL scope."""
     binary = shutil.which(TOOL_CATALOG["wapiti"]["binary"])
@@ -1774,6 +1901,21 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         else:
             tool_status["Wapiti active checks"] = {"status": "skipped", "detail": "Requires the separate Active profile and explicit approval"}
 
+        sqlmap_status = {"status": "not_run", "reason": "SQLMap API checks require the Active profile"}
+        if profile == "active":
+            tool_status["SQLMap API SQLi checks"] = {"status": "running", "detail": "Looking for same-origin OpenAPI JSON/query operations; bounded SQL injection checks only"}
+            update_scan_progress(scan_id, 94, "Running bounded OpenAPI-aware SQL injection checks", tool_status)
+            sqlmap_findings, sqlmap_status = perform_sqlmap_check(target, timeout_seconds=60)
+            findings.extend(sqlmap_findings)
+            tool_status["SQLMap API SQLi checks"] = {
+                "status": sqlmap_status.get("status", "error"),
+                "detail": f"{sqlmap_status.get('finding_count', len(sqlmap_findings))} confirmed finding(s); "
+                          f"{sqlmap_status.get('parameters_tested', 0)} parameter(s) tested; "
+                          f"{sqlmap_status.get('reason', 'check finished')}",
+            }
+        else:
+            tool_status["SQLMap API SQLi checks"] = {"status": "skipped", "detail": "Requires the separate Active profile and explicit approval"}
+
         update_scan_progress(scan_id, 97, "Combining and deduplicating findings", tool_status)
         findings = deduplicate_findings(findings)
 
@@ -1786,9 +1928,9 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                     "completed", now(),
                     json.dumps({
                         "http_status": status_code, "final_url": final_url,
-                        "checks": "passive HTTP/header checks, bounded same-origin discovery, curated Nuclei checks, WhatWeb fingerprinting, optional TLS assessment, Deep/Active Nikto checks, optional ZAP passive alerts, and explicitly approved Active-profile Wapiti tests",
+                        "checks": "passive HTTP/header checks, bounded same-origin discovery, curated Nuclei checks, WhatWeb fingerprinting, optional TLS assessment, Deep/Active Nikto checks, optional ZAP passive alerts, and explicitly approved Active-profile Wapiti and OpenAPI-aware SQLMap tests",
                         "tls_check": tls_status, "whatweb_check": whatweb_status,
-                        "nuclei_check": nuclei_status, "nikto_check": nikto_status, "wapiti_check": wapiti_status, "zap_check": zap_status,
+                        "nuclei_check": nuclei_status, "nikto_check": nikto_status, "wapiti_check": wapiti_status, "sqlmap_check": sqlmap_status, "zap_check": zap_status,
                         "endpoint_discovery": discovery_status,
                         "finding_count": len(findings),
                     }),
@@ -2758,7 +2900,7 @@ TOOL_CATALOG = {
     "dirsearch": {"label": "Dirsearch", "binary": "dirsearch", "package": "dirsearch", "version_args": ["--version"], "purpose": "Web path and content discovery", "capabilities": ["content_discovery", "exposed_files"], "risk": "active_high_request_volume", "integration": "inventory_only", "installable": True},
     "gobuster": {"label": "Gobuster", "binary": "gobuster", "package": "gobuster", "version_args": ["version"], "purpose": "Directory and DNS discovery", "capabilities": ["content_discovery", "dns_discovery"], "risk": "active_scope_and_rate_limits_required", "integration": "inventory_only", "installable": True},
     "feroxbuster": {"label": "Feroxbuster", "binary": "feroxbuster", "package": "feroxbuster", "version_args": ["--version"], "purpose": "Recursive content discovery", "capabilities": ["content_discovery", "exposed_files"], "risk": "active_high_request_volume", "integration": "inventory_only", "installable": True},
-    "sqlmap": {"label": "sqlmap", "binary": "sqlmap", "package": "sqlmap", "version_args": ["--version"], "purpose": "Specialized SQL injection testing", "capabilities": ["sql_injection"], "risk": "intrusive_requires_explicit_approval", "integration": "manual_only", "installable": True},
+    "sqlmap": {"label": "sqlmap", "binary": "sqlmap", "package": "sqlmap", "version_args": ["--version"], "purpose": "Specialized SQL injection testing against same-origin OpenAPI operations", "capabilities": ["sql_injection", "api_security"], "risk": "intrusive_requires_explicit_approval", "integration": "explicit_active_profile", "installable": True},
     "wpscan": {"label": "WPScan", "binary": "wpscan", "package": "wpscan", "version_args": ["--version"], "purpose": "WordPress detection and vulnerability checks", "capabilities": ["wordpress", "cms_vulnerabilities", "plugin_theme_inventory"], "risk": "scoped_checks_api_token_may_be_needed", "integration": "inventory_only", "installable": True},
     "dalfox": {"label": "Dalfox", "binary": "dalfox", "package": "dalfox", "version_args": ["version"], "purpose": "Specialized XSS detection and verification", "capabilities": ["xss_testing", "parameter_testing"], "risk": "active_payloads_requires_explicit_approval", "integration": "manual_only", "installable": True},
     "arjun": {"label": "Arjun", "binary": "arjun", "package": "arjun", "version_args": ["--version"], "purpose": "HTTP parameter discovery for web and API endpoints", "capabilities": ["api_parameter_discovery", "endpoint_discovery"], "risk": "active_parameter_probing_requires_scope_limits", "integration": "inventory_only", "installable": True},
