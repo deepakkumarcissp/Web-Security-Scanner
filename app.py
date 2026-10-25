@@ -612,10 +612,19 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
     if root is None:
         return [], {"status": "unavailable", "reason": "Local HTTP Nuclei templates were not found"}
 
-    allowed_tags = {"misconfig", "misconfiguration", "exposure", "headers", "ssl", "config", "token", "tech", "cve", "vulnerability", "panel", "discovery"}
-    excluded_tags = {"dos", "fuzz", "bruteforce", "brute-force", "intrusive", "headless", "token-spray", "default-login", "default-credentials", "filefuzz", "takeover"}
+    # Default profile is deliberately limited to low-impact configuration,
+    # exposure, TLS/header, technology and discovery checks. CVE/exploit classes
+    # are not enabled merely because a template happens to carry a safe tag too.
+    allowed_tags = {"misconfig", "misconfiguration", "exposure", "headers", "ssl", "config", "tech", "discovery"}
+    excluded_tags = {
+        "dos", "fuzz", "bruteforce", "brute-force", "intrusive", "headless",
+        "token-spray", "default-login", "default-credentials", "filefuzz", "takeover",
+        "cve", "vuln", "vulnerability", "rce", "lfi", "rfi", "sqli", "sql-injection",
+        "xss", "ssrf", "ssti", "xxe", "auth-bypass", "unauth",
+        "exploit", "kev", "vkev", "edb", "oast", "interactsh", "network", "cloud",
+    }
     severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "unknown": 5}
-    category_order = ["misconfig", "misconfiguration", "exposure", "ssl", "headers", "config", "cve", "vulnerability", "token", "panel", "tech", "discovery"]
+    category_order = ["misconfig", "misconfiguration", "exposure", "ssl", "headers", "config", "tech", "discovery"]
     scanned = 0
     for path in root.rglob("*.yaml"):
         scanned += 1
@@ -640,7 +649,13 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
         if not id_match or not tags_match:
             continue
         tags = {tag.strip().lower() for tag in re.split(r"[,\s]+", tags_match.group(1).strip(" []\"'")) if tag.strip()}
+        # Reject risky aliases and mixed-tag templates before considering any
+        # positive tag; tag matching is not a substitute for a safety allowlist.
         if not (tags & allowed_tags) or tags & excluded_tags:
+            continue
+        # Keep templates that use external callback infrastructure out of the
+        # default profile even though the runtime also disables Interactsh.
+        if re.search(r"(?i)(interactsh|\boast\b|\bunsafe\b|\bcode\b)", text):
             continue
         max_requests = int(request_match.group(1)) if request_match else 1
         if max_requests > 5:
@@ -675,7 +690,7 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
         "templates_eligible": len(candidates), "templates_selected": len(selected),
         "max_templates": max_templates,
         "selected_tags": sorted(allowed_tags), "excluded_tags": sorted(excluded_tags),
-        "selection_note": "Local HTTP templates only; excludes explicit high-risk tags, flow/headless/code templates, and templates declaring over five requests.",
+        "selection_note": "Low-impact HTTP configuration, exposure, TLS/header, technology, and discovery templates only; rejects exploit/CVE classes, mixed-risk tags, external callbacks, flow/headless/code templates, state-changing methods, payload fuzzing, and templates declaring over five requests.",
     }
 
 

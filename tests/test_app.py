@@ -376,7 +376,9 @@ def test_nuclei_template_selector_excludes_high_risk_and_non_http_templates(tmp_
     root.mkdir()
     (root / "safe.yaml").write_text("id: safe-config\ninfo:\n  name: Safe config\n  severity: medium\n  metadata:\n    max-request: 2\n  tags: misconfig,headers\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n")
     (root / "intrusive.yaml").write_text("id: risky-probe\ninfo:\n  name: Risky probe\n  severity: high\n  tags: cve,intrusive\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n")
-    (root / "too-many-requests.yaml").write_text("id: noisy-probe\ninfo:\n  name: Noisy probe\n  severity: high\n  metadata:\n    max-request: 10\n  tags: cve\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n")
+    (root / "too-many-requests.yaml").write_text("id: noisy-probe\ninfo:\n  name: Noisy probe\n  severity: high\n  metadata:\n    max-request: 10\n  tags: misconfig\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n")
+    (root / "mixed-risk-tags.yaml").write_text("id: mixed-risk\ninfo:\n  name: Mixed risk\n  severity: medium\n  tags: misconfig,cve\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n")
+    (root / "callback.yaml").write_text("id: callback-check\ninfo:\n  name: Callback check\n  severity: low\n  tags: tech\n  description: uses interactsh callback\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n")
     (root / "headless.yaml").write_text("id: browser-check\ninfo:\n  name: Browser check\n  severity: low\n  tags: tech\nheadless:\n  - steps: []\n")
     (root / "nested-payloads.yaml").write_text("id: payload-probe\ninfo:\n  name: Payload probe\n  severity: medium\n  tags: cve\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n    payloads:\n      name: [admin, test]\n")
     (root / "nested-attack.yaml").write_text("id: attack-probe\ninfo:\n  name: Attack probe\n  severity: medium\n  tags: cve\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n    attack: batteringram\n")
@@ -390,7 +392,7 @@ def test_nuclei_template_selector_excludes_high_risk_and_non_http_templates(tmp_
 def test_nuclei_template_selection_balances_categories_before_filling_cap(tmp_path, monkeypatch):
     root = tmp_path / "http"
     root.mkdir()
-    categories = ["cve", "misconfig", "exposure", "ssl", "tech"]
+    categories = ["misconfig", "exposure", "ssl", "tech", "discovery"]
     for category in categories:
         for index in range(3):
             (root / f"{category}-{index}.yaml").write_text(
