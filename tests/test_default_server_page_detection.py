@@ -46,3 +46,61 @@ def test_stock_page_matching_is_case_insensitive_and_bounded():
     assert app.default_server_page_observation(
         "x" * 500_001 + "<title>Welcome to nginx!</title>", "text/html"
     ) is None
+
+
+def test_standard_scan_records_stock_page_as_informational_signal(monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"<html><head><title>Welcome to nginx!</title></head><body>stock page</body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Security-Policy", "default-src 'self'")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+            self.send_header("Permissions-Policy", "camera=(), microphone=()")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    target = f"http://127.0.0.1:{server.server_port}/"
+    empty_status = {"status": "skipped", "reason": "controlled test", "finding_count": 0}
+    monkeypatch.setattr(app, "perform_nuclei_check", lambda *_args, **_kwargs: ([], empty_status))
+    monkeypatch.setattr(app, "perform_nikto_check", lambda *_args, **_kwargs: ([], empty_status))
+    monkeypatch.setattr(app, "perform_whatweb_check", lambda *_args, **_kwargs: ([], empty_status))
+    monkeypatch.setattr(app, "perform_testssl_check", lambda *_args, **_kwargs: ([], empty_status))
+    monkeypatch.setattr(app, "perform_zap_passive_check", lambda *_args, **_kwargs: ([], {
+        "status": "skipped", "reason": "controlled test", "finding_count": 0,
+        "alert_count": 0, "urls_scanned": 0,
+    }))
+    try:
+        with app.connect() as conn:
+            scan_id = conn.execute(
+                "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+                (target, "standard", "running", app.now()),
+            ).lastrowid
+        app.perform_scan(scan_id, target, "standard")
+        with app.connect() as conn:
+            scan = conn.execute("SELECT status FROM scans WHERE id=?", (scan_id,)).fetchone()
+            rows = conn.execute(
+                "SELECT title,severity,confidence,evidence,remediation FROM findings WHERE scan_id=?",
+                (scan_id,),
+            ).fetchall()
+        assert scan["status"] == "completed"
+        signal = next(row for row in rows if row["title"] == "Possible default web-server page")
+        assert signal["severity"] == "Info"
+        assert signal["confidence"] == "Low"
+        assert "nginx welcome page" in signal["evidence"]
+        assert "not proof of a vulnerability" in signal["remediation"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
