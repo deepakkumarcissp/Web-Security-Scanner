@@ -27,7 +27,8 @@
 ## Phase 2 — Controlled local integration lab
 **Status: Planned**
 
-- [ ] Build a deterministic local HTTP/HTTPS fixture with known headers, CORS responses, redirects, and a small set of exposed test files.
+- [x] Build a deterministic loopback HTTP fixture with known security headers and verify real scanner response parsing in the Quick profile.
+- [ ] Extend the fixture with controlled CORS responses, redirects, and a small set of exposed test files.
 - [ ] Generate/use a test-only certificate; never disable TLS verification in production scanner code to make tests pass.
 - [ ] Validate scanner response parsing and TLS adapter invocation against loopback only.
 - [ ] Produce a machine-readable report with expected signals, observed signals, tool statuses, and scope checks.

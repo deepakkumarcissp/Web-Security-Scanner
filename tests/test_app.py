@@ -1461,3 +1461,58 @@ def test_zap_cors_alert_preserves_credential_evidence_and_filters_other_origins(
     assert "Access-Control-Allow-Origin: *" in cors[3]
     assert "Access-Control-Allow-Credentials: true" in cors[3]
     assert "attacker.invalid" not in str(findings)
+
+
+
+def test_quick_scan_against_controlled_loopback_http_fixture(monkeypatch):
+    """Exercise real HTTP header parsing against a deterministic local response."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import json
+    import threading
+
+    class FixtureHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"<html><head><title>DKCISSP test fixture</title></head><body>fixture</body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+            self.send_header("Permissions-Policy", "camera=(), microphone=()")
+            self.send_header("Content-Security-Policy", "default-src 'self'")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    target = f"http://127.0.0.1:{server.server_port}/"
+    monkeypatch.setattr(app, "perform_zap_passive_check",
+        lambda _target, targets=None: ([], {"status": "skipped", "reason": "fixture test",
+            "finding_count": 0, "alert_count": 0, "urls_scanned": 0}))
+    try:
+        with app.connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+                (target, "quick", "running", app.now()))
+            scan_id = cursor.lastrowid
+        app.perform_scan(scan_id, target, "quick")
+        with app.connect() as conn:
+            scan = conn.execute("SELECT status,tool_status FROM scans WHERE id=?", (scan_id,)).fetchone()
+            findings = conn.execute("SELECT title,severity,affected_url FROM findings WHERE scan_id=?", (scan_id,)).fetchall()
+        titles = {row["title"] for row in findings}
+        assert scan["status"] == "completed"
+        assert "Content-Security-Policy header missing" not in titles
+        assert "Referrer-Policy header missing" not in titles
+        assert "Permissions-Policy header missing" not in titles
+        assert "X-Content-Type-Options missing or weak" not in titles
+        assert "Target uses HTTP without transport encryption" in titles
+        assert all(row["affected_url"].startswith(target) for row in findings)
+        assert json.loads(scan["tool_status"])["Built-in HTTP & headers"]["status"] == "completed"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
