@@ -1179,6 +1179,12 @@ def parse_wapiti_report(report, target: str) -> list[tuple]:
                     level = int(level)
                 except (TypeError, ValueError):
                     level = 1
+                # Wapiti labels broad method-response behavior as an additional;
+                # generic responses are noisy and do not prove dangerous methods are enabled.
+                if group_name == "additionals" and str(category).strip().casefold() == "http methods":
+                    detail_text = str(entry.get("info") or entry.get("message") or "")
+                    if not re.search(r"\b(?:TRACE|PUT|DELETE|CONNECT|PROPFIND)\b.*\b(?:enabled|allowed|accepted|permitted)\b|\b(?:enabled|allowed|accepted|permitted)\b.*\b(?:TRACE|PUT|DELETE|CONNECT|PROPFIND)\b", detail_text, re.I):
+                        continue
                 severity = "Info" if group_name == "additionals" else severity_map.get(level, "Low")
                 title = ("Wapiti: " if group_name == "vulnerabilities" else "Wapiti observation: ") + str(category)[:220]
                 detail = str(entry.get("info") or entry.get("message") or "Scanner reported this observation.")[:1000]
@@ -1440,8 +1446,8 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             )
         if target.startswith("http://"):
             finding(
-                "High", "Target uses HTTP without transport encryption",
-                "The supplied target URL uses HTTP. This check did not test whether HTTPS is available.",
+                "Info", "Target URL uses HTTP (HTTPS not verified)",
+                "The supplied target URL uses HTTP. HTTPS availability was not tested, so this is a transport observation rather than proof that HTTPS is unavailable.",
                 "Use HTTPS and redirect HTTP traffic to HTTPS; verify sensitive endpoints and cookies.",
             )
         cookies = headers.get("set-cookie", "")

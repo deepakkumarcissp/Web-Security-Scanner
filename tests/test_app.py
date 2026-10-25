@@ -431,14 +431,13 @@ def test_wapiti_parser_normalizes_findings_and_filters_out_of_scope_urls():
         "additionals": {"HTTP Methods": [{"level": 0, "path": "/", "info": "Unexpected method response", "module": "methods"}]},
     }
     findings = app.parse_wapiti_report(report, "https://app.example.test/")
-    assert len(findings) == 2
+    assert len(findings) == 1
     sql = next(item for item in findings if "SQL Injection" in item[1])
     assert sql[0] == "High"
     assert sql[2] == "https://app.example.test/search?q=x"
     assert "Use parameterized queries" in sql[4]
     assert "SECRET" not in str(findings)
-    additional = next(item for item in findings if "HTTP Methods" in item[1])
-    assert additional[0] == "Info"
+    assert not any("HTTP Methods" in item[1] for item in findings)
 
 
 def test_wapiti_runs_bounded_active_modules_and_parses_json(monkeypatch, tmp_path):
@@ -1602,7 +1601,9 @@ def test_quick_scan_against_controlled_loopback_http_fixture(monkeypatch):
         assert "Referrer-Policy header missing" not in titles
         assert "Permissions-Policy header missing" not in titles
         assert "X-Content-Type-Options missing or weak" not in titles
-        assert "Target uses HTTP without transport encryption" in titles
+        assert "Target URL uses HTTP (HTTPS not verified)" in titles
+        http_finding = next(row for row in findings if row["title"] == "Target URL uses HTTP (HTTPS not verified)")
+        assert http_finding["severity"] == "Info"
         assert all(row["affected_url"].startswith(target) for row in findings)
         assert json.loads(scan["tool_status"])["Built-in HTTP & headers"]["status"] == "completed"
 
