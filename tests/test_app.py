@@ -1616,3 +1616,82 @@ def test_quick_scan_against_controlled_loopback_http_fixture(monkeypatch):
         other_server.shutdown()
         other_server.server_close()
         other_thread.join(timeout=2)
+
+
+def test_discovery_adapter_persists_run_metadata_and_history(monkeypatch):
+    from uuid import uuid4
+    domain = f"history-{uuid4().hex}.example"
+    root = client.post("/api/assets", json={
+        "target": f"https://{domain}", "authorized": True, "scope_status": "in_scope",
+    }).json()
+    monkeypatch.setattr(app, "query_certificate_transparency", lambda root_domain, limit: [f"api.{root_domain}"][:limit])
+    response = client.post(f"/api/assets/{root['id']}/discover", json={"authorized": True, "max_results": 7})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source_status"] == "completed"
+    assert payload["limit_metadata"]["max_results"] == 7
+    runs = client.get(f"/api/assets/{root['id']}/discovery-runs").json()
+    assert len(runs) == 1
+    assert runs[0]["status"] == "completed"
+    assert runs[0]["candidate_count"] == 1
+    assert runs[0]["new_assets_added"] == 1
+    assert runs[0]["error_summary"] == ""
+
+
+def test_discovery_adapter_records_source_failure(monkeypatch):
+    from uuid import uuid4
+    domain = f"failed-history-{uuid4().hex}.example"
+    root = client.post("/api/assets", json={
+        "target": f"https://{domain}", "authorized": True, "scope_status": "in_scope",
+    }).json()
+    def fail(*args):
+        raise OSError("mock source unavailable")
+    monkeypatch.setattr(app, "query_certificate_transparency", fail)
+    response = client.post(f"/api/assets/{root['id']}/discover", json={"authorized": True})
+    assert response.status_code == 502
+    runs = client.get(f"/api/assets/{root['id']}/discovery-runs").json()
+    assert len(runs) == 1
+    assert runs[0]["status"] == "failed"
+    assert "mock source unavailable" in runs[0]["error_summary"]
+
+
+def test_dns_resolution_is_explicit_bounded_and_does_not_scan(monkeypatch):
+    from uuid import uuid4
+    domain = f"resolve-{uuid4().hex}.example"
+    org = client.post("/api/organizations", json={"name": f"Resolve {domain}", "root_domain": domain, "authorized": True}).json()
+    asset = client.post("/api/assets", json={"target": f"https://api.{domain}", "organization_id": org["id"], "authorized": True}).json()
+    before = len(client.get("/api/scans").json())
+    denied = client.post(f"/api/assets/{asset['id']}/resolve", json={"authorized": False})
+    assert denied.status_code == 400
+    class FakeSocketRecord:
+        pass
+    monkeypatch.setattr(app.socket, "getaddrinfo", lambda *args: [
+        (2, 1, 6, "", ("192.0.2.10", 443)), (2, 1, 6, "", ("192.0.2.10", 443)),
+        (2, 1, 6, "", ("2001:db8::10", 443, 0, 0)),
+    ])
+    response = client.post(f"/api/assets/{asset['id']}/resolve", json={"authorized": True, "timeout_seconds": 1})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["resolution_status"] == "resolved"
+    assert payload["addresses"] == ["192.0.2.10", "2001:db8::10"]
+    assert payload["http_probes_started"] == payload["tls_checks_started"] == payload["scans_started"] == 0
+    row = next(row for row in client.get("/api/assets").json() if row["id"] == asset["id"])
+    assert row["resolution_status"] == "resolved"
+    assert len(client.get("/api/scans").json()) == before
+
+
+def test_dns_resolution_rejects_unregistered_discovered_candidate(monkeypatch):
+    from uuid import uuid4
+    domain = f"orphan-{uuid4().hex}.example"
+    asset = client.post("/api/assets", json={"target": f"https://api.{domain}", "authorized": True}).json()
+    with app.connect() as conn:
+        conn.execute("UPDATE assets SET discovery_source='crt.sh' WHERE id=?", (asset["id"],))
+    calls = []
+    monkeypatch.setattr(app.socket, "getaddrinfo", lambda *args: calls.append(args) or [])
+    response = client.post(f"/api/assets/{asset['id']}/resolve", json={"authorized": True})
+    assert response.status_code == 403
+    assert calls == []
+
+
+def test_discovery_history_returns_not_found_for_unknown_asset():
+    assert client.get("/api/assets/999999/discovery-runs").status_code == 404

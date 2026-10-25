@@ -107,3 +107,12 @@
 - Latest local regression suite after blocking cross-origin redirects on the initial request: **99 passed**, 2 dependency deprecation warnings; focused loopback/redirect tests: **4 passed**.
 
 The roadmap is intentionally evidence-gated. Do not claim broad detection coverage, production readiness, or a release-ready default branch until the relevant exit gates have been demonstrated.
+
+
+## EASM implementation checkpoint — adapter history and DNS inventory
+
+- [x] Add normalized CT adapter contract and persistent successful/failed discovery run history.
+- [x] Add bounded, explicitly invoked DNS resolution with per-asset status and deduplicated addresses; no HTTP/TLS probes or scan launch.
+- [x] Add regression tests for adapter success/failure persistence, authorization, DNS scope linkage, and no-scan behavior.
+- [ ] Add dashboard controls for organization registration, discovery history, and DNS resolution status.
+- [ ] Add additional passive discovery sources only behind the same bounded adapter contract.

@@ -23,6 +23,9 @@ from urllib.parse import urlparse, urlencode, urljoin, urldefrag
 from html.parser import HTMLParser
 from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler, HTTPSHandler
 
+# Shared resolver pool caps concurrent OS resolver calls across requests.
+DNS_RESOLVER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dkcissp-dns")
+
 from fastapi import FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -109,6 +112,20 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS discovery_runs(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                root_asset_id INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                candidate_count INTEGER NOT NULL DEFAULT 0,
+                new_assets_added INTEGER NOT NULL DEFAULT 0,
+                error_summary TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(root_asset_id) REFERENCES assets(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_discovery_runs_root ON discovery_runs(root_asset_id, id DESC);
             CREATE TABLE IF NOT EXISTS assets(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 target TEXT NOT NULL UNIQUE,
@@ -146,6 +163,14 @@ def init_db() -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(assets)")}
         if "organization_id" not in columns:
             conn.execute("ALTER TABLE assets ADD COLUMN organization_id INTEGER REFERENCES organizations(id)")
+        for column, definition in {
+            "resolution_status": "TEXT NOT NULL DEFAULT 'unknown'",
+            "resolved_addresses_json": "TEXT NOT NULL DEFAULT '[]'",
+            "resolution_checked_at": "TEXT",
+            "resolution_error": "TEXT NOT NULL DEFAULT ''",
+        }.items():
+            if column not in columns:
+                conn.execute(f"ALTER TABLE assets ADD COLUMN {column} {definition}")
         if "approval_reference" not in columns:
             conn.execute("ALTER TABLE assets ADD COLUMN approval_reference TEXT NOT NULL DEFAULT ''")
         if "reviewed_at" not in columns:
@@ -222,6 +247,11 @@ class AssetScopeUpdate(BaseModel):
 class AssetDiscoveryRequest(BaseModel):
     authorized: bool = False
     max_results: int = Field(default=50, ge=1, le=100)
+
+
+class AssetResolveRequest(BaseModel):
+    authorized: bool = False
+    timeout_seconds: int = Field(default=2, ge=1, le=4)
 
 
 class FindingLifecycleUpdate(BaseModel):
@@ -1802,6 +1832,41 @@ def query_certificate_transparency(root_domain: str, max_results: int) -> list[s
     return sorted(name for name in candidates if name != root_domain)[:max_results]
 
 
+def run_ct_discovery_adapter(root_domain: str, max_results: int) -> dict:
+    """Normalize the CT source into a stable, auditable adapter result contract."""
+    started = now()
+    try:
+        candidates = query_certificate_transparency(root_domain, max_results)
+        return {"source": "crt.sh", "started_at": started, "finished_at": now(),
+                "status": "completed", "candidates": candidates, "errors": [],
+                "limit_metadata": {"max_results": max_results, "response_limit_bytes": 1_000_000}}
+    except Exception as exc:
+        return {"source": "crt.sh", "started_at": started, "finished_at": now(),
+                "status": "failed", "candidates": [],
+                "errors": [f"{type(exc).__name__}: {str(exc)[:300]}"],
+                "limit_metadata": {"max_results": max_results, "response_limit_bytes": 1_000_000}}
+
+
+def persist_discovery_run(root_asset_id: int, result: dict, candidate_count: int = 0,
+                          new_assets_added: int = 0, error_summary: str = "") -> int:
+    with connect() as conn:
+        cur = conn.execute("""INSERT INTO discovery_runs
+            (root_asset_id,source,started_at,finished_at,status,candidate_count,new_assets_added,error_summary,metadata_json)
+            VALUES(?,?,?,?,?,?,?,?,?)""", (root_asset_id, result["source"], result["started_at"],
+            result["finished_at"], result["status"], candidate_count, new_assets_added,
+            error_summary[:500], json.dumps(result.get("limit_metadata", {}), sort_keys=True)))
+        return cur.lastrowid
+
+
+@app.get("/api/assets/{asset_id}/discovery-runs")
+def list_asset_discovery_runs(asset_id: int):
+    with connect() as conn:
+        if not conn.execute("SELECT id FROM assets WHERE id=?", (asset_id,)).fetchone():
+            raise HTTPException(404, "Asset not found")
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM discovery_runs WHERE root_asset_id=? ORDER BY id DESC LIMIT 50", (asset_id,))]
+
+
 @app.post("/api/assets/{asset_id}/discover")
 def discover_subdomains(asset_id: int, request: AssetDiscoveryRequest):
     if not request.authorized:
@@ -1816,12 +1881,12 @@ def discover_subdomains(asset_id: int, request: AssetDiscoveryRequest):
     root_domain = (parsed.hostname or "").lower().rstrip(".")
     if not valid_dns_name(root_domain) or "." not in root_domain:
         raise HTTPException(400, "Passive subdomain discovery requires a fully qualified DNS root, not an IP address or local hostname.")
-    try:
-        candidates = query_certificate_transparency(root_domain, request.max_results)
-    except HTTPException:
-        raise
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        raise HTTPException(502, "Passive discovery could not reach the certificate-transparency service.") from exc
+    result = run_ct_discovery_adapter(root_domain, request.max_results)
+    if result["status"] != "completed":
+        message = result["errors"][0] if result["errors"] else "Unknown source error"
+        persist_discovery_run(asset_id, result, error_summary=message)
+        raise HTTPException(502, "Passive discovery failed; source status was recorded in discovery history.")
+    candidates = result["candidates"]
     timestamp = now()
     created = 0
     with connect() as conn:
@@ -1838,9 +1903,52 @@ def discover_subdomains(asset_id: int, request: AssetDiscoveryRequest):
                  "Passive certificate-transparency candidate; verify ownership and scope before scanning.", root["organization_id"]),
             )
             created += 1
-    return {"root_asset_id": asset_id, "source": "crt.sh", "candidates_found": len(candidates),
+    run_id = persist_discovery_run(asset_id, result, candidate_count=len(candidates), new_assets_added=created)
+    return {"root_asset_id": asset_id, "run_id": run_id, "source": result["source"],
+            "source_status": result["status"], "started_at": result["started_at"],
+            "finished_at": result["finished_at"], "candidates_found": len(candidates),
             "new_assets_added": created, "scope_status": "needs_review",
-            "scans_started": 0, "message": "Candidates were added for review only; no hosts were contacted or scanned."}
+            "limit_metadata": result["limit_metadata"], "scans_started": 0,
+            "message": "Candidates were added for review only; no hosts were contacted or scanned."}
+
+
+@app.post("/api/assets/{asset_id}/resolve")
+def resolve_asset_dns(asset_id: int, request: AssetResolveRequest):
+    """Explicit, bounded DNS inventory action. Does not probe HTTP/TLS or launch scans."""
+    if not request.authorized:
+        raise HTTPException(400, "Confirm you are authorized to resolve this asset's DNS records.")
+    with connect() as conn:
+        asset = conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+        if not asset:
+            raise HTTPException(404, "Asset not found")
+        org = conn.execute("SELECT root_domain FROM organizations WHERE id=?", (asset["organization_id"],)).fetchone() if asset["organization_id"] else None
+    parsed = urlparse(asset["target"])
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if not valid_dns_name(hostname) or "." not in hostname or re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", hostname):
+        raise HTTPException(400, "DNS resolution requires a fully qualified DNS hostname, not an IP or local name.")
+    if asset["discovery_source"] != "manual" and (not org or not (hostname == org["root_domain"] or hostname.endswith("." + org["root_domain"]))):
+        raise HTTPException(403, "Discovered candidates must be linked to a registered organization root before DNS resolution.")
+    checked = now()
+    status, addresses, error = "no_records", [], ""
+    future = DNS_RESOLVER_POOL.submit(socket.getaddrinfo, hostname, None, 0, socket.SOCK_STREAM)
+    try:
+        records = future.result(timeout=request.timeout_seconds)
+        addresses = sorted({str(record[4][0]) for record in records if record and len(record) > 4 and record[4]})
+        status = "resolved" if addresses else "no_records"
+    except Exception as exc:
+        future.cancel()
+        if isinstance(exc, TimeoutError):
+            status, error = "timeout", f"DNS lookup exceeded {request.timeout_seconds}s"
+        elif isinstance(exc, socket.gaierror):
+            status, error = "no_records", str(exc)[:300]
+        else:
+            status, error = "error", f"{type(exc).__name__}: {str(exc)[:250]}"
+    with connect() as conn:
+        conn.execute("UPDATE assets SET resolution_status=?,resolved_addresses_json=?,resolution_checked_at=?,resolution_error=?,last_seen=? WHERE id=?",
+                     (status, json.dumps(addresses), checked, error, checked, asset_id))
+    return {"asset_id": asset_id, "hostname": hostname, "resolution_status": status,
+            "addresses": addresses, "checked_at": checked, "error": error,
+            "http_probes_started": 0, "tls_checks_started": 0, "scans_started": 0}
 
 
 @app.post("/api/scans")

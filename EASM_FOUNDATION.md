@@ -26,7 +26,9 @@ The broader `assessments/domain_recon.py` also illustrates a wide enrichment cat
 - First-class organization/root-domain registry API (`GET/POST /api/organizations`) with normalized DNS roots, owner contact/notes, explicit authorization, and asset counts.
 - Assets can associate with an organization; automatic association uses exact root-domain or dot-label subdomain boundaries, and discovered candidates inherit the root asset's organization.
 - Explicit authorization for asset registration, scope changes, and passive discovery.
-- Opt-in Certificate Transparency lookup for an approved DNS root.
+- Opt-in Certificate Transparency lookup for an approved DNS root, normalized through a source adapter contract (`source`, timestamps, status, candidates, errors, and limit metadata).
+- Persistent per-root discovery run history, including successful runs and source failures.
+- Explicit bounded DNS resolution action for registered, organization-linked discovered candidates; stores resolution status, deduplicated A/AAAA addresses, timestamp, and error without HTTP/TLS probing or scan launch.
 - Discovered subdomains enter `needs_review`; discovery starts zero scans.
 - Scope promotion for discovered assets requires an approval/change-ticket reference.
 - Existing scan engine supports bounded same-origin crawling, evidence-backed findings, severity/confidence, lifecycle tracking, retest comparison, exports, and tool-status reporting.
@@ -36,9 +38,9 @@ The broader `assessments/domain_recon.py` also illustrates a wide enrichment cat
 
 | Capability | Current scanner state | Recommended next step |
 |---|---|---|
-| Root organization/brand registry | Single registered asset records; no first-class organization record yet | Add organization/root-domain records and owner/contact metadata, keeping approval references and audit history |
-| Subdomain sources | Opt-in `crt.sh` only | Add source adapters behind a common interface: CT first, then optional passive archive and approved subfinder integration |
-| Candidate validation | CT name validation; no structured DNS status | Add bounded DNS resolution with A/AAAA/CNAME status, timestamps, source, and errors |
+| Root organization/brand registry | Organization/root-domain API and exact-boundary asset association implemented; UI form remains | Add UI form and audit history |
+| Subdomain sources | Opt-in `crt.sh` adapter with persisted per-run status and bounded metadata; no archive/subfinder source yet | Add optional passive archive adapter and explicitly invoked subfinder integration |
+| Candidate validation | Explicit bounded DNS resolution persists deduplicated addresses, status, timestamp, and errors; no HTTP/TLS fingerprinting | Add CNAME detail and separately approved low-impact fingerprinting |
 | HTTP/TLS fingerprint | Existing web checks happen during a scan | Add a low-impact, separately reported inventory fingerprint only after scope approval, with strict origin controls and verified TLS diagnostics |
 | Asset identity | URL-oriented unique registry | Normalize canonical host/scheme/port identities and keep multiple URLs/endpoints as observations without losing hostname provenance |
 | Risk/context | Finding severity and lifecycle | Add explainable exposure signals first; later add business criticality, internet reachability, stale/unknown owner and known findings |
@@ -67,11 +69,14 @@ The broader `assessments/domain_recon.py` also illustrates a wide enrichment cat
 - Add root-domain and subdomain normalization tests; reject false suffix matches and URL-shaped values in hostname candidates.
 
 ### EASM-2 — discovery adapter interface
-- Define a common adapter contract: `source`, `started_at`, `finished_at`, `status`, `candidates`, `errors`, `rate/limit metadata`.
-- Implement CT adapter first (current implementation), add passive historical source adapter next, and subfinder as an optional explicitly invoked source.
-- Persist source-specific observations while deduplicating the canonical asset; never overwrite source provenance.
+- [x] Define a common adapter contract: `source`, `started_at`, `finished_at`, `status`, `candidates`, `errors`, `limit_metadata`.
+- [x] Wrap CT lookup in the adapter contract and persist source-level successful and failed run history.
+- [ ] Add passive historical source adapter and subfinder as an optional explicitly invoked source.
+- [ ] Persist source-specific observations while deduplicating canonical assets without overwriting provenance.
 
 ### EASM-3 — resolution and fingerprinting
+- [x] Add an explicit bounded DNS inventory action with per-asset status, address set, timestamp, and error.
+- [x] Require discovered candidates to be linked to a registered organization root before DNS resolution.
 - Resolve only approved root-derived candidate names through bounded DNS queries.
 - Do not automatically HTTP-probe or scan unapproved candidate hosts. Provide a separate explicit action to fingerprint candidates when policy permits.
 - Separate DNS resolution state from HTTP reachability and TLS validity.
@@ -94,3 +99,11 @@ The broader `assessments/domain_recon.py` also illustrates a wide enrichment cat
 - Approved-scope scans use exact origin controls and preserve all findings/evidence/tool statuses.
 - A report distinguishes discovered candidates, resolved assets, reachable web assets, approved targets, assessed targets, and validated findings.
 - No claim of “complete external attack surface” or an overall coverage percentage until a declared benchmark supports it.
+
+
+## Current implementation checkpoint — discovery history and DNS
+
+- CT discovery now uses a normalized adapter result contract with source, start/end timestamps, status, candidates, errors, and response/result limits.
+- `discovery_runs` persists completed and failed attempts; `GET /api/assets/{id}/discovery-runs` exposes the latest 50 runs.
+- `POST /api/assets/{id}/resolve` is an explicit, authorization-gated DNS inventory action. It stores resolved address sets and status, has a short per-lookup timeout, and explicitly reports zero HTTP probes, TLS checks, or scans. Discovered candidates must be tied to an organization root.
+- The API/data layer is implemented; the dashboard still needs controls to trigger resolution and display run history/status. DNS resolution is inventory-only and is not proof that a web service is reachable or in scope for scanning.
