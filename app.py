@@ -13,6 +13,7 @@ import sqlite3
 import ssl
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2175,10 +2176,22 @@ def _tool_version(tool: dict) -> str | None:
 
 
 def scanner_tools_status() -> list[dict]:
+    # Version commands are independent; run a bounded number concurrently so a
+    # slow or noisy tool cannot serialize the entire inventory page load.
+    candidates = [(key, spec, shutil.which(spec["binary"])) for key, spec in TOOL_CATALOG.items()]
+    installed = [(key, spec, path) for key, spec, path in candidates if path]
+    versions = {}
+    if installed:
+        with ThreadPoolExecutor(max_workers=min(8, len(installed)), thread_name_prefix="tool-version") as pool:
+            futures = {key: pool.submit(_tool_version, spec) for key, spec, _ in installed}
+            for key, future in futures.items():
+                try:
+                    versions[key] = future.result(timeout=5)
+                except Exception:
+                    versions[key] = None
     tools = []
-    for key, spec in TOOL_CATALOG.items():
-        path = shutil.which(spec["binary"])
-        version = _tool_version(spec) if path else None
+    for key, spec, path in candidates:
+        version = versions.get(key) if path else None
         tools.append({
             "id": key, "name": spec["label"], "purpose": spec["purpose"],
             "installed": bool(path), "status": "ready" if path and version else ("installed_check_failed" if path else "missing"),
