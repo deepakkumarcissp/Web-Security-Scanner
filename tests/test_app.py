@@ -792,7 +792,7 @@ def test_certificate_transparency_parser_only_keeps_valid_subdomains(monkeypatch
 def test_passive_discovery_ui_warns_about_external_lookup_and_review_only():
     response = client.get("/")
     assert response.status_code == 200
-    assert "Passive Discovery" in response.text
+    assert "Discovery / DNS" in response.text
     assert "contacts crt.sh, not the target" in response.text
     assert "discoverSubdomains" in response.text
 
@@ -1695,3 +1695,13 @@ def test_dns_resolution_rejects_unregistered_discovered_candidate(monkeypatch):
 
 def test_discovery_history_returns_not_found_for_unknown_asset():
     assert client.get("/api/assets/999999/discovery-runs").status_code == 404
+
+
+
+def test_attack_surface_ui_exposes_dns_and_discovery_history_controls():
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "resolveAssetDns" in response.text
+    assert "showDiscoveryRuns" in response.text
+    assert "Discovery / DNS" in response.text
+    assert "DNS resolution is now an explicit inventory action" in response.text

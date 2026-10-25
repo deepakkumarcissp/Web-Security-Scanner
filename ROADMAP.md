@@ -114,5 +114,6 @@ The roadmap is intentionally evidence-gated. Do not claim broad detection covera
 - [x] Add normalized CT adapter contract and persistent successful/failed discovery run history.
 - [x] Add bounded, explicitly invoked DNS resolution with per-asset status and deduplicated addresses; no HTTP/TLS probes or scan launch.
 - [x] Add regression tests for adapter success/failure persistence, authorization, DNS scope linkage, and no-scan behavior.
-- [ ] Add dashboard controls for organization registration, discovery history, and DNS resolution status.
+- [x] Add dashboard controls for discovery history and DNS resolution/status.
+- [ ] Add a dedicated organization/root-domain registration UI form.
 - [ ] Add additional passive discovery sources only behind the same bounded adapter contract.
