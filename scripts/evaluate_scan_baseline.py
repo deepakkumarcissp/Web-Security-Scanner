@@ -11,7 +11,6 @@ import argparse
 import json
 import re
 import sys
-from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +27,18 @@ def evaluate_report(report: dict[str, Any], baseline: dict[str, Any]) -> dict[st
     checks = baseline.get("expected_signals", [])
     if not isinstance(checks, list):
         checks = []
+    tool_status = report.get("tool_status", {})
+    if not isinstance(tool_status, dict):
+        tool_status = {}
+    required_tools = baseline.get("required_tools", ["Nuclei"])
+    if not isinstance(required_tools, list):
+        required_tools = ["Nuclei"]
+    tool_results = []
+    for tool_name in required_tools:
+        entry = tool_status.get(str(tool_name), {})
+        status = entry.get("status", "missing") if isinstance(entry, dict) else "invalid_status"
+        tool_results.append({"tool": str(tool_name), "status": status,
+                             "result": "PASS" if status == "completed" else "FAIL"})
 
     expected_results = []
     matched_indexes: set[int] = set()
@@ -74,11 +85,17 @@ def evaluate_report(report: dict[str, Any], baseline: dict[str, Any]) -> dict[st
     missing = [item["id"] for item in expected_results if item["status"] == "MISS"]
     # Duplicate groups and unmatched findings are reported for review, not automatically
     # classified as false positives or used as hard failures.
-    passed = bool(expected_results) and not missing
+    scan_status = report.get("scan_status", report.get("status", "unknown"))
+    scan_completed = scan_status == "completed"
+    failed_tools = [item["tool"] for item in tool_results if item["result"] != "PASS"]
+    passed = bool(expected_results) and not missing and scan_completed and not failed_tools
     return {
         "evaluation": "dkcissp-expected-signal-regression-baseline",
         "result": "PASS" if passed else "FAIL",
-        "scan_status": report.get("scan_status", report.get("status", "unknown")),
+        "scan_status": scan_status,
+        "scan_completed": scan_completed,
+        "required_tool_results": tool_results,
+        "failed_required_tools": failed_tools,
         "profile": report.get("profile", "unknown"),
         "finding_count": len(findings),
         "expected_signal_checks": len(expected_results),

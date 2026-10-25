@@ -1,7 +1,8 @@
 {
   "name": "DKCISSP loopback Juice Shop Standard-profile expected-signal baseline",
   "version": 1,
-  "scope": "Deterministic built-in HTTP/header checks for a loopback HTTP target.",
+  "scope": "Deterministic built-in HTTP/header checks for a loopback HTTP target, plus required scanner-tool health.",
+  "required_tools": ["Nuclei"],
   "expected_signals": [
     {
       "id": "transport-http",
