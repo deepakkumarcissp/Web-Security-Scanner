@@ -1034,6 +1034,11 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
                 if not severity:
                     continue
                 title = str(info.get("name") or item.get("template-id") or "Nuclei finding")[:240]
+                # Legacy Feature-Policy is a deprecated predecessor to Permissions-Policy.
+                # Its presence alone is not a security vulnerability and often repeats on
+                # every static asset, so suppress this low-value template observation.
+                if "deprecated feature-policy header" in title.casefold():
+                    continue
                 template_id = str(item.get("template-id") or "unknown-template")[:160]
                 matched_at = str(item.get("matched-at") or item.get("host") or target)[:2048]
                 # Treat tool output as untrusted: only persist findings attached to the

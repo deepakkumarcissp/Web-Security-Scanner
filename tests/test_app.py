@@ -313,6 +313,8 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
             {"template-id": "tls-test", "matched-at": "https://example.test/", "matcher-name": "header-present", "extracted-results": ["strict-transport-security"], "info": {"name": "Weak TLS setting", "severity": "high", "remediation": "Enable secure TLS."}},
             {"template-id": "tls-test", "matched-at": "https://example.test/", "matcher-name": "header-present", "extracted-results": ["strict-transport-security"], "info": {"name": "Weak TLS setting", "severity": "high", "remediation": "Enable secure TLS."}},
             {"template-id": "info-test", "matched-at": "https://example.test/", "info": {"name": "Banner info", "severity": "info"}},
+            {"template-id": "deprecated-feature-policy", "matched-at": "https://example.test/assets/app.js", "info": {"name": "Deprecated Feature-Policy Header - Detection", "severity": "info"}},
+            {"template-id": "deprecated-feature-policy", "matched-at": "https://example.test/assets/vendor.js", "info": {"name": "Deprecated Feature-Policy Header - Detection", "severity": "info"}},
         ]
         with open(report_path, "w", encoding="utf-8") as report_file:
             report_file.write("not json\n")
@@ -329,6 +331,7 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
     assert status["target_count"] == 2
     assert status["finding_count"] == 2
     assert status["malformed_records"] == 1
+    assert not any("Feature-Policy" in item[1] for item in findings)
     assert status["template_selection"]["status"] == "ready"
     assert status["rate_limit_per_second"] == 5
     assert status["interactsh_disabled"] is True
