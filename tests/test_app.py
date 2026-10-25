@@ -1,8 +1,14 @@
 from datetime import datetime, timedelta, timezone
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+
+# Never let automated tests read or mutate the scanner's development/deployment database.
+_TEST_DB_DIR = tempfile.TemporaryDirectory(prefix="dkcissp-test-")
+os.environ["DKCISSP_DB"] = str(Path(_TEST_DB_DIR.name) / "test.sqlite3")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app
@@ -260,6 +266,18 @@ def test_testssl_parses_findings_with_bounded_subprocess(monkeypatch):
 
 
 
+def test_testssl_timeout_is_inconclusive_and_emits_no_finding(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/testssl.sh")
+    def timeout_run(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd="testssl.sh", timeout=75)
+    monkeypatch.setattr(app.subprocess, "run", timeout_run)
+    findings, status = app.perform_testssl_check("https://example.test")
+    assert findings == []
+    assert status["status"] == "timeout"
+    assert status["timeout_seconds"] == 75
+
+
 def test_nuclei_reports_missing_binary(monkeypatch):
     monkeypatch.setattr(app.shutil, "which", lambda _binary: None)
     findings, status = app.perform_nuclei_check("https://example.test")
@@ -284,14 +302,16 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
         assert command[command.index("-rl") + 1] == "5"
         assert command[command.index("-c") + 1] == "3"
         assert command[command.index("-timeout") + 1] == "4"
+        assert "-no-stdin" in command
+        assert kwargs["stdin"] is app.subprocess.DEVNULL
         assert "-disable-redirects" in command
         assert "-no-interactsh" in command
         assert "-jsonl-export" in command
         assert kwargs["timeout"] == 60
         report_path = command[command.index("-jsonl-export") + 1]
         records = [
-            {"template-id": "tls-test", "matched-at": "https://example.test/", "info": {"name": "Weak TLS setting", "severity": "high", "remediation": "Enable secure TLS."}},
-            {"template-id": "tls-test", "matched-at": "https://example.test/", "info": {"name": "Weak TLS setting", "severity": "high", "remediation": "Enable secure TLS."}},
+            {"template-id": "tls-test", "matched-at": "https://example.test/", "matcher-name": "header-present", "extracted-results": ["strict-transport-security"], "info": {"name": "Weak TLS setting", "severity": "high", "remediation": "Enable secure TLS."}},
+            {"template-id": "tls-test", "matched-at": "https://example.test/", "matcher-name": "header-present", "extracted-results": ["strict-transport-security"], "info": {"name": "Weak TLS setting", "severity": "high", "remediation": "Enable secure TLS."}},
             {"template-id": "info-test", "matched-at": "https://example.test/", "info": {"name": "Banner info", "severity": "info"}},
         ]
         with open(report_path, "w", encoding="utf-8") as report_file:
@@ -314,6 +334,8 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
     assert status["interactsh_disabled"] is True
     assert findings[0][0] == "High"
     assert findings[0][1] == "Nuclei: Weak TLS setting"
+    assert findings[0][5] == "High"  # matcher plus extracted response evidence
+    assert findings[1][5] == "Medium"  # bare template match without strong response evidence
     assert "template-id" not in findings[0][3]
     assert all("curl-command" not in str(item) for item in findings)
 
@@ -368,7 +390,10 @@ def test_nuclei_template_selector_excludes_high_risk_and_non_http_templates(tmp_
     root.mkdir()
     (root / "safe.yaml").write_text("id: safe-config\ninfo:\n  name: Safe config\n  severity: medium\n  metadata:\n    max-request: 2\n  tags: misconfig,headers\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n")
     (root / "intrusive.yaml").write_text("id: risky-probe\ninfo:\n  name: Risky probe\n  severity: high\n  tags: cve,intrusive\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n")
-    (root / "too-many-requests.yaml").write_text("id: noisy-probe\ninfo:\n  name: Noisy probe\n  severity: high\n  metadata:\n    max-request: 10\n  tags: cve\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n")
+    (root / "too-many-requests.yaml").write_text("id: noisy-probe\ninfo:\n  name: Noisy probe\n  severity: high\n  metadata:\n    max-request: 10\n  tags: misconfig\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n")
+    (root / "mixed-risk-tags.yaml").write_text("id: mixed-risk\ninfo:\n  name: Mixed risk\n  severity: medium\n  tags: misconfig,cve\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n")
+    (root / "callback.yaml").write_text("id: callback-check\ninfo:\n  name: Callback check\n  severity: low\n  tags: tech\n  description: uses interactsh callback\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n")
+    (root / "many-paths.yaml").write_text("id: many-paths\ninfo:\n  name: Many paths\n  severity: low\n  tags: exposure\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/a\", \"{{BaseURL}}/b\", \"{{BaseURL}}/c\"]\n  - method: GET\n    path: [\"{{BaseURL}}/d\", \"{{BaseURL}}/e\", \"{{BaseURL}}/f\"]\n")
     (root / "headless.yaml").write_text("id: browser-check\ninfo:\n  name: Browser check\n  severity: low\n  tags: tech\nheadless:\n  - steps: []\n")
     (root / "nested-payloads.yaml").write_text("id: payload-probe\ninfo:\n  name: Payload probe\n  severity: medium\n  tags: cve\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n    payloads:\n      name: [admin, test]\n")
     (root / "nested-attack.yaml").write_text("id: attack-probe\ninfo:\n  name: Attack probe\n  severity: medium\n  tags: cve\nhttp:\n  - method: GET\n    path: [\"{{BaseURL}}/\"]\n    attack: batteringram\n")
@@ -382,7 +407,7 @@ def test_nuclei_template_selector_excludes_high_risk_and_non_http_templates(tmp_
 def test_nuclei_template_selection_balances_categories_before_filling_cap(tmp_path, monkeypatch):
     root = tmp_path / "http"
     root.mkdir()
-    categories = ["cve", "misconfig", "exposure", "ssl", "tech"]
+    categories = ["misconfig", "exposure", "ssl", "tech", "discovery"]
     for category in categories:
         for index in range(3):
             (root / f"{category}-{index}.yaml").write_text(
@@ -468,6 +493,10 @@ def test_whatweb_parses_technology_findings_with_bounded_subprocess(monkeypatch)
                 "WordPress": {"version": ["6.5"]},
                 "PHP": {"version": ["8.2"]},
                 "HTTPServer": {"string": ["nginx"]},
+                "HTML5": {"string": ["HTML5"]},
+                "Script": {"string": ["script"]},
+                "UncommonHeaders": {"string": ["Feature-Policy"]},
+                "X-Frame-Options": {"string": ["SAMEORIGIN"]},
             }}], report_file)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -479,6 +508,8 @@ def test_whatweb_parses_technology_findings_with_bounded_subprocess(monkeypatch)
         "WhatWeb technology detected: WordPress", "WhatWeb technology detected: PHP"
     }
     assert all(finding[0] == "Info" and finding[5] == "Low" for finding in findings)
+    assert not any(title.endswith(("HTML5", "Script", "UncommonHeaders", "X-Frame-Options"))
+                   for _severity, title, *_rest in findings)
 
 
 def test_whatweb_timeout_is_reported(monkeypatch):
@@ -501,14 +532,29 @@ def test_dashboard_renders_with_schedule_and_report_navigation():
 
 
 
-def test_tool_status_reports_allowlisted_integrations():
+def test_tool_status_reports_expanded_capability_registry():
     response = client.get("/api/tools")
     assert response.status_code == 200
     payload = response.json()
-    assert {tool["id"] for tool in payload["tools"]} == {
-        "curl", "zaproxy", "whatweb", "testssl", "nuclei", "nikto", "wapiti"
-    }
+    tools = {tool["id"]: tool for tool in payload["tools"]}
+    assert {"curl", "zaproxy", "whatweb", "testssl", "nuclei", "nikto", "wapiti"}.issubset(tools)
+    assert {"nmap", "katana", "ffuf", "dirsearch", "gobuster", "feroxbuster", "sqlmap", "wpscan", "sslscan", "amass", "subfinder", "dnsx", "httpx", "dalfox", "arjun", "commix", "joomscan", "wafw00f", "gitleaks"}.issubset(tools)
     assert all("status" in tool and "installed" in tool for tool in payload["tools"])
+    assert all("capabilities" in tool and "risk" in tool and "integration" in tool for tool in payload["tools"])
+    assert payload["inventory_count"] == len(tools)
+    assert "known_vulnerabilities" in tools["nuclei"]["capabilities"]
+    assert "sql_injection" in payload["capability_map"]
+    assert any(item["tool_id"] == "sqlmap" for item in payload["capability_map"]["sql_injection"])
+    assert tools["sqlmap"]["risk"] == "intrusive_requires_explicit_approval"
+    assert tools["httpx"]["installable"] is False
+
+
+def test_tool_capability_registry_never_executes_inventory_only_tools_by_claim():
+    response = client.get("/api/tools")
+    tools = {tool["id"]: tool for tool in response.json()["tools"]}
+    assert tools["katana"]["integration"] == "inventory_only"
+    assert tools["ffuf"]["integration"] == "inventory_only"
+    assert tools["sqlmap"]["integration"] == "manual_only"
 
 
 def test_zap_api_readiness_overrides_unhelpful_launcher_version(monkeypatch):
@@ -532,6 +578,47 @@ def test_tool_install_requires_approval_and_allowlisted_id():
     assert unknown.status_code == 404
 
 
+def test_tool_install_refuses_unverified_package_mapping():
+    response = client.post("/api/tools/install/httpx", json={"approved": True})
+    assert response.status_code == 400
+    assert "verified" in response.json()["detail"].lower() or "conflicts" in response.json()["detail"].lower()
+
+
+def test_install_job_status_endpoint_returns_stage_and_rejects_missing_job():
+    from uuid import uuid4
+    with app.connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO install_jobs(tool_id,tool_name,status,stage,message,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            ("test-tool-" + uuid4().hex, "Test Tool", "running", "Verifying installation", "Checking executable", app.now(), app.now()),
+        )
+        job_id = cursor.lastrowid
+    response = client.get(f"/api/tools/install-jobs/{job_id}")
+    assert response.status_code == 200
+    assert response.json()["status"] == "running"
+    assert response.json()["stage"] == "Verifying installation"
+    assert response.json()["message"] == "Checking executable"
+    missing = client.get("/api/tools/install-jobs/99999999")
+    assert missing.status_code == 404
+    with app.connect() as conn:
+        conn.execute("DELETE FROM install_jobs WHERE id=?", (job_id,))
+
+
+def test_install_job_runner_reports_verification_without_running_installer(monkeypatch):
+    with app.connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO install_jobs(tool_id,tool_name,status,stage,message,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            ("curl", "curl", "running", "Queued", "Queued", app.now(), app.now()),
+        )
+        job_id = cursor.lastrowid
+    monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/curl" if binary == app.TOOL_CATALOG["curl"]["binary"] else None)
+    app.run_install_job(job_id, "curl")
+    job = client.get(f"/api/tools/install-jobs/{job_id}").json()
+    assert job["status"] == "completed"
+    assert job["stage"] == "Already installed"
+    with app.connect() as conn:
+        conn.execute("DELETE FROM install_jobs WHERE id=?", (job_id,))
+
+
 def test_tool_setup_page_is_separate_from_risk_dashboard():
     response = client.get("/")
     assert response.status_code == 200
@@ -540,12 +627,64 @@ def test_tool_setup_page_is_separate_from_risk_dashboard():
     assert "v0.1 MVP" not in response.text
 
 
+def test_organization_registry_requires_authorization_and_normalizes_root_domain():
+    denied = client.post("/api/organizations", json={"name": "Example Org", "root_domain": "example.test"})
+    assert denied.status_code == 400
+    created = client.post("/api/organizations", json={
+        "name": "Example Org", "root_domain": "EXAMPLE.TEST.",
+        "owner_contact": "security@example.test", "authorized": True,
+    })
+    assert created.status_code == 200
+    payload = created.json()
+    assert payload["root_domain"] == "example.test"
+    assert payload["created"] is True
+    duplicate = client.post("/api/organizations", json={
+        "name": "Example Org Updated", "root_domain": "example.test",
+        "authorized": True,
+    })
+    assert duplicate.status_code == 200
+    assert duplicate.json()["id"] == payload["id"]
+    assert duplicate.json()["created"] is False
+    assert any(row["id"] == payload["id"] for row in client.get("/api/organizations").json())
+
+
+def test_organization_registry_rejects_urls_and_ip_addresses():
+    for root in ("https://example.test", "*.example.test", "127.0.0.1"):
+        response = client.post("/api/organizations", json={
+            "name": f"Invalid {root}", "root_domain": root, "authorized": True,
+        })
+        assert response.status_code == 400, (root, response.text)
+
+
+def test_assets_associate_with_organization_only_on_exact_dns_boundary():
+    org = client.post("/api/organizations", json={
+        "name": "Boundary Test Org", "root_domain": "boundary-example.test", "authorized": True,
+    }).json()
+    accepted = client.post("/api/assets", json={
+        "target": "https://api.boundary-example.test", "authorized": True,
+    })
+    assert accepted.status_code == 200
+    assert accepted.json()["organization_id"] == org["id"]
+    rejected = client.post("/api/assets", json={
+        "target": "https://boundary-example.test.attacker.invalid", "organization_id": org["id"], "authorized": True,
+    })
+    assert rejected.status_code == 400
+
+
 def test_asset_inventory_requires_explicit_authorization():
     response = client.post("/api/assets", json={
         "target": "https://Example.com", "authorized": False,
     })
     assert response.status_code == 400
     assert "authorized" in response.json()["detail"].lower()
+
+
+def test_finding_deduplication_preserves_distinct_evidence_and_urls():
+    base = ("Medium", "Missing header", "https://example.test/", "Header absent", "Add header", "Medium")
+    whitespace_duplicate = (" medium ", "Missing header", "https://example.test/", " Header absent ", "Add header", "Medium")
+    different_evidence = ("Medium", "Missing header", "https://example.test/", "Header absent on second response", "Add header", "Medium")
+    different_url = ("Medium", "Missing header", "https://example.test/account", "Header absent", "Add header", "Medium")
+    assert app.deduplicate_findings([base, whitespace_duplicate, different_evidence, different_url]) == [base, different_evidence, different_url]
 
 
 def test_asset_inventory_normalizes_and_deduplicates_target():
@@ -604,10 +743,19 @@ def test_asset_inventory_ui_is_wired_to_scope_api():
     response = client.get("/")
     assert response.status_code == 200
     assert 'data-page="assets"' in response.text
+    nav = response.text.split('<nav class="nav">', 1)[1].split('</nav>', 1)[0]
+    assert '<button data-page="assets">' in nav
+    assert "Attack Surface (Beta)" in nav
     assert 'id="assetRows"' in response.text
     assert 'id="assetForm"' in response.text
+    assert 'id="organizationForm"' in response.text
+    assert 'id="assetOrganization"' in response.text
+    assert 'id="assetFilter"' in response.text
+    assert 'id="metricDnsResolved"' in response.text
+    assert "loadOrganizations()" in response.text
     assert "loadAssets()" in response.text
     assert "New assets default to Needs Review" in response.text
+    assert "EASM foundation (beta)" in response.text
 
 
 
@@ -669,8 +817,9 @@ def test_certificate_transparency_parser_only_keeps_valid_subdomains(monkeypatch
 def test_passive_discovery_ui_warns_about_external_lookup_and_review_only():
     response = client.get("/")
     assert response.status_code == 200
-    assert "Passive Discovery" in response.text
-    assert "contacts crt.sh, not the target" in response.text
+    assert "Discovery / DNS" in response.text
+    assert "target hosts and discovered subdomains are not contacted" in response.text
+    assert "History Discover" in response.text
     assert "discoverSubdomains" in response.text
 
 
@@ -842,6 +991,15 @@ def test_zap_diagnostics_rejects_invalid_endpoint(monkeypatch):
     assert result["status"] == "configuration_error"
 
 
+def test_is_html_document_only_accepts_html_document_media_types():
+    assert app.is_html_document("text/html; charset=utf-8") is True
+    assert app.is_html_document("application/xhtml+xml") is True
+    assert app.is_html_document("text/css") is False
+    assert app.is_html_document("application/javascript") is False
+    assert app.is_html_document("image/x-icon") is False
+    assert app.is_html_document("") is False
+
+
 def test_endpoint_discovery_extracts_only_same_origin_http_urls():
     base = "https://app.example.test/home"
     html = '''<html><a href="/account">Account</a><a href="https://app.example.test/search?q=x#top">Search</a>
@@ -917,6 +1075,134 @@ def test_zap_passive_scans_only_same_origin_urls_and_reports_status(monkeypatch)
     assert len(findings) == 1
     assert findings[0][1] == "OWASP ZAP: CSP header missing"
     assert all("evil.example.test" not in url for url in seen)
+
+
+def test_zap_passive_handles_large_valid_access_url_response(monkeypatch):
+    import json
+    from urllib.parse import urlparse
+
+    monkeypatch.setattr(app, "diagnose_zap_api", lambda: {"status": "ready", "endpoint": "http://127.0.0.1:8090"})
+    monkeypatch.setattr(app, "zap_api_settings", lambda: ("http://127.0.0.1:8090", "test-key"))
+
+    class FakeResponse:
+        def __init__(self, body):
+            self.body = body
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self, size):
+            return self.body[:size]
+
+    def fake_urlopen(request, timeout=4):
+        path = urlparse(request.full_url).path
+        if path.endswith("/accessUrl/"):
+            # Real ZAP accessUrl wraps the fetched body in JSON; large JS bundles
+            # can make the API response exceed the previous 1 MB read cap.
+            body = json.dumps({"accessUrl": [{"responseBody": "x" * 1_100_000}]}).encode()
+            return FakeResponse(body)
+        if path.endswith("/recordsToScan/"):
+            return FakeResponse(b'{"recordsToScan":"0"}')
+        if path.endswith("/alerts/"):
+            return FakeResponse(b'{"alerts":[]}')
+        raise AssertionError(request.full_url)
+
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    findings, status = app.perform_zap_passive_check(
+        "http://app.example.test/",
+        targets=["http://app.example.test/", "http://app.example.test/vendor.js"],
+    )
+    assert findings == []
+    assert status["status"] == "completed"
+    assert status["urls_scanned"] == 2
+
+
+def test_zap_passive_rejects_oversized_api_response(monkeypatch):
+    import json
+    from urllib.parse import urlparse
+
+    monkeypatch.setattr(app, "diagnose_zap_api", lambda: {"status": "ready", "endpoint": "http://127.0.0.1:8090"})
+    monkeypatch.setattr(app, "zap_api_settings", lambda: ("http://127.0.0.1:8090", "test-key"))
+
+    class FakeResponse:
+        def __init__(self, body):
+            self.body = body
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self, size):
+            return self.body[:size]
+
+    def fake_urlopen(request, timeout=4):
+        path = urlparse(request.full_url).path
+        if path.endswith("/accessUrl/"):
+            body = json.dumps({"accessUrl": [{"responseBody": "x" * 5_100_000}]}).encode()
+            return FakeResponse(body)
+        raise AssertionError(request.full_url)
+
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    findings, status = app.perform_zap_passive_check(
+        "http://app.example.test/",
+        targets=["http://app.example.test/"],
+    )
+    assert findings == []
+    assert status["status"] == "error"
+    assert "5 MB safety limit" in status["errors"][0]
+
+
+
+
+def test_zap_passive_groups_duplicate_signals_and_preserves_affected_urls(monkeypatch):
+    import json
+    from urllib.parse import urlparse
+
+    monkeypatch.setattr(app, "diagnose_zap_api", lambda: {"status": "ready", "endpoint": "http://127.0.0.1:8090"})
+    monkeypatch.setattr(app, "zap_api_settings", lambda: ("http://127.0.0.1:8090", "test-key"))
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self, _size):
+            return json.dumps(self.payload).encode()
+
+    def fake_urlopen(request, timeout=4):
+        path = urlparse(request.full_url).path
+        if path.endswith("/accessUrl/"):
+            return FakeResponse({"accessUrl": [{"Result": "OK"}]})
+        if path.endswith("/recordsToScan/"):
+            return FakeResponse({"recordsToScan": "0"})
+        if path.endswith("/alerts/"):
+            return FakeResponse({"alerts": [
+                {"risk": "Medium", "alert": "Cross-Domain Misconfiguration",
+                 "url": "http://app.example.test/runtime.js", "description": "CORS wildcard",
+                 "evidence": "Access-Control-Allow-Origin: *", "solution": "Review CORS", "confidence": "Medium"},
+                {"risk": "Medium", "alert": "Cross-Domain Misconfiguration",
+                 "url": "http://app.example.test/vendor.js", "description": "CORS wildcard",
+                 "evidence": "Access-Control-Allow-Origin: *", "solution": "Review CORS", "confidence": "Medium"},
+                {"risk": "Low", "alert": "Timestamp Disclosure - Unix",
+                 "url": "http://app.example.test/main.js", "description": "Timestamp disclosed",
+                 "evidence": "1734944650", "solution": "Review timestamp", "confidence": "Low"},
+            ]})
+        raise AssertionError(request.full_url)
+
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    findings, status = app.perform_zap_passive_check(
+        "http://app.example.test/",
+        targets=["http://app.example.test/", "http://app.example.test/runtime.js", "http://app.example.test/vendor.js"],
+    )
+    assert status["status"] == "completed"
+    assert status["alert_count"] == 3
+    assert status["finding_count"] == 2
+    cors = next(f for f in findings if "Cross-Domain Misconfiguration" in f[1])
+    assert "runtime.js" in cors[3]
+    assert "vendor.js" in cors[3]
+    assert "Affected URLs (2)" in cors[3]
+    assert any("Timestamp Disclosure" in f[1] for f in findings)
 
 
 def test_zap_passive_unavailable_status_is_not_reported_as_success(monkeypatch):
@@ -1010,9 +1296,7 @@ def test_shared_same_origin_validator_fails_closed():
 def test_scan_creation_rejects_when_concurrency_limit_is_reached(monkeypatch):
     from uuid import uuid4
     target = f"https://capacity-{uuid4().hex}.example"
-    started = []
     monkeypatch.setenv("DKCISSP_MAX_CONCURRENT_SCANS", "1")
-    monkeypatch.setattr(app, "start_scan", lambda target, profile: started.append((target, profile)) or 777)
     with app.connect() as conn:
         cursor = conn.execute(
             "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
@@ -1023,10 +1307,45 @@ def test_scan_creation_rejects_when_concurrency_limit_is_reached(monkeypatch):
         response = client.post("/api/scans", json={"target": target, "profile": "quick", "authorized": True})
         assert response.status_code == 429
         assert "capacity reached" in response.json()["detail"].lower()
-        assert started == []
     finally:
         with app.connect() as conn:
             conn.execute("DELETE FROM scans WHERE id=?", (running_id,))
+
+
+def test_stale_scan_recovery_preserves_history_and_keeps_recent_scans_running():
+    from uuid import uuid4
+    stale_time = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(timespec="seconds")
+    with app.connect() as conn:
+        stale_id = conn.execute(
+            "INSERT INTO scans(target,profile,status,created_at,heartbeat_at,progress,current_stage) VALUES(?,?,?,?,?,?,?)",
+            (f"https://stale-{uuid4().hex}.example", "standard", "running", stale_time, stale_time, 35, "Running Nuclei safe checks"),
+        ).lastrowid
+        recent_id = conn.execute(
+            "INSERT INTO scans(target,profile,status,created_at,heartbeat_at,progress,current_stage) VALUES(?,?,?,?,?,?,?)",
+            (f"https://recent-{uuid4().hex}.example", "standard", "running", app.now(), app.now(), 35, "Running Nuclei safe checks"),
+        ).lastrowid
+        finding_id = conn.execute(
+            """INSERT INTO findings
+            (scan_id,target,severity,title,affected_url,evidence,remediation,confidence,discovered_at)
+            VALUES(?,?,?,?,?,?,?,?,?)""",
+            (stale_id, "https://stale.example", "Low", "Preserved test finding", "https://stale.example/", "evidence", "fix", "Medium", app.now()),
+        ).lastrowid
+    try:
+        recovered = app.recover_stale_scans(stale_after_minutes=30)
+        assert recovered >= 1
+        with app.connect() as conn:
+            stale = conn.execute("SELECT status,finished_at,current_stage,summary FROM scans WHERE id=?", (stale_id,)).fetchone()
+            recent = conn.execute("SELECT status FROM scans WHERE id=?", (recent_id,)).fetchone()
+            preserved = conn.execute("SELECT id FROM findings WHERE id=? AND scan_id=?", (finding_id, stale_id)).fetchone()
+        assert stale["status"] == "failed"
+        assert stale["finished_at"]
+        assert "heartbeat expired" in stale["current_stage"].lower()
+        assert recent["status"] == "running"
+        assert preserved is not None
+    finally:
+        with app.connect() as conn:
+            conn.execute("DELETE FROM findings WHERE scan_id IN (?,?)", (stale_id, recent_id))
+            conn.execute("DELETE FROM scans WHERE id IN (?,?)", (stale_id, recent_id))
 
 
 def test_concurrency_limit_is_bounded_and_has_safe_fallback(monkeypatch):
@@ -1055,3 +1374,501 @@ def test_start_scan_enforces_capacity_atomically(monkeypatch):
     finally:
         with app.connect() as conn:
             conn.execute("DELETE FROM scans WHERE id=?", (running_id,))
+
+
+
+def test_testssl_regression_cases_map_tls_severity_and_ignore_ok_or_unknown(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/testssl.sh")
+
+    def fake_run(command, **kwargs):
+        report_path = command[command.index("--jsonfile-pretty") + 1]
+        with open(report_path, "w", encoding="utf-8") as output:
+            json.dump([
+                {"id": "TLS 1.0", "severity": "HIGH", "finding": "TLS 1.0 is offered"},
+                {"id": "Weak cipher", "severity": "WARNING", "finding": "A weak cipher is offered"},
+                {"id": "TLS 1.3", "severity": "OK", "finding": "TLS 1.3 is offered"},
+                {"id": "Unknown check", "severity": "mystery", "finding": "Unclassified result"},
+                {"id": "Empty result", "severity": "HIGH", "finding": ""},
+                "malformed entry",
+            ], output)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    findings, status = app.perform_testssl_check("https://127.0.0.1:10443")
+
+    assert status["status"] == "completed"
+    assert status["finding_count"] == 2
+    assert [(item[0], item[1]) for item in findings] == [
+        ("High", "testssl.sh: TLS 1.0"),
+        ("Medium", "testssl.sh: Weak cipher"),
+    ]
+    assert all(item[2] == "https://127.0.0.1:10443" for item in findings)
+
+
+def test_testssl_nonzero_exit_with_json_is_warning_not_silent_success(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/testssl.sh")
+
+    def fake_run(command, **kwargs):
+        report_path = command[command.index("--jsonfile-pretty") + 1]
+        with open(report_path, "w", encoding="utf-8") as output:
+            json.dump([{"id": "TLS 1.2", "severity": "LOW", "finding": "Review cipher preference"}], output)
+        return SimpleNamespace(returncode=2, stdout="", stderr="partial diagnostic")
+
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    findings, status = app.perform_testssl_check("https://127.0.0.1:10443")
+
+    assert status["status"] == "completed_with_warnings"
+    assert status["return_code"] == 2
+    assert len(findings) == 1
+    assert findings[0][0] == "Low"
+
+
+
+def test_nuclei_exposed_file_signal_is_normalized_and_out_of_scope_result_dropped(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(app.shutil, "which", lambda _binary: "/usr/bin/nuclei")
+    monkeypatch.setattr(app, "select_nuclei_templates", lambda max_templates=30: (
+        ["/tmp/safe-template.yaml"],
+        {"status": "ready", "templates_selected": 1, "max_templates": max_templates},
+    ))
+
+    def fake_run(command, **kwargs):
+        report_path = command[command.index("-jsonl-export") + 1]
+        records = [
+            {
+                "template-id": "public-contact-file",
+                "matched-at": "http://127.0.0.1:1003/.well-known/security.txt",
+                "matcher-name": "status-code",
+                "extracted-results": ["HTTP 200"],
+                "info": {
+                    "name": "Public security contact file",
+                    "severity": "info",
+                    "description": "A public security contact file was found.",
+                    "remediation": "Review whether the file contents are intended to be public.",
+                },
+            },
+            {
+                "template-id": "public-contact-file",
+                "matched-at": "https://scope-mismatch.example/public-file",
+                "matcher-name": "status-code",
+                "extracted-results": ["HTTP 200"],
+                "info": {"name": "Out-of-scope file", "severity": "high"},
+            },
+        ]
+        Path(report_path).write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    findings, status = app.perform_nuclei_check(
+        "http://127.0.0.1:1003",
+        targets=["http://127.0.0.1:1003", "http://127.0.0.1:1003/.well-known/security.txt", "https://scope-mismatch.example/public-file"],
+    )
+
+    assert status["status"] == "completed"
+    assert status["target_count"] == 2
+    assert status["finding_count"] == 1
+    assert findings[0][1] == "Nuclei: Public security contact file"
+    assert findings[0][2] == "http://127.0.0.1:1003/.well-known/security.txt"
+    assert "HTTP 200" in findings[0][3]
+    assert "scope-mismatch.example" not in str(findings)
+
+
+
+def test_zap_cors_alert_preserves_credential_evidence_and_filters_other_origins(monkeypatch):
+    import json
+    from urllib.parse import urlparse
+
+    monkeypatch.setattr(app, "diagnose_zap_api", lambda: {"status": "ready", "endpoint": "http://127.0.0.1:8090"})
+    monkeypatch.setattr(app, "zap_api_settings", lambda: ("http://127.0.0.1:8090", "test-key"))
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self, _size):
+            return json.dumps(self.payload).encode()
+
+    def fake_urlopen(request, timeout=4):
+        path = urlparse(request.full_url).path
+        if path.endswith("/accessUrl/"):
+            return FakeResponse({"accessUrl": [{"Result": "OK"}]})
+        if path.endswith("/recordsToScan/"):
+            return FakeResponse({"recordsToScan": "0"})
+        if path.endswith("/alerts/"):
+            return FakeResponse({"alerts": [
+                {"risk": "Medium", "alert": "Cross-Domain Misconfiguration",
+                 "url": "http://app.example.test/api/profile",
+                 "description": "Review cross-origin access policy",
+                 "evidence": "Access-Control-Allow-Origin: *; Access-Control-Allow-Credentials: true",
+                 "solution": "Restrict allowed origins and review credential handling", "confidence": "High"},
+                {"risk": "High", "alert": "Cross-Domain Misconfiguration",
+                 "url": "http://app.example.test.attacker.invalid/api/profile",
+                 "description": "Out-of-origin alert must be ignored",
+                 "evidence": "Access-Control-Allow-Origin: *",
+                 "solution": "Ignore external alert", "confidence": "High"},
+            ]})
+        raise AssertionError(request.full_url)
+
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    findings, status = app.perform_zap_passive_check(
+        "http://app.example.test/",
+        targets=["http://app.example.test/", "http://app.example.test/api/profile"],
+    )
+
+    assert status["status"] == "completed"
+    assert status["alert_count"] == 1
+    assert status["finding_count"] == 1
+    cors = findings[0]
+    assert cors[1] == "OWASP ZAP: Cross-Domain Misconfiguration"
+    assert cors[2] == "http://app.example.test/api/profile"
+    assert "Access-Control-Allow-Origin: *" in cors[3]
+    assert "Access-Control-Allow-Credentials: true" in cors[3]
+    assert "attacker.invalid" not in str(findings)
+
+
+
+def test_quick_scan_against_controlled_loopback_http_fixture(monkeypatch):
+    """Exercise real HTTP header parsing against a deterministic local response."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import json
+    import threading
+
+    class FixtureHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/redirect-out":
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{other_server.server_port}/outside")
+                self.end_headers()
+                return
+            body = b"<html><head><title>DKCISSP test fixture</title></head><body>fixture</body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            if self.path != "/missing-headers":
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+                self.send_header("Permissions-Policy", "camera=(), microphone=()")
+                self.send_header("Content-Security-Policy", "default-src 'self'")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    outside_requests = []
+    class OutsideHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            outside_requests.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"outside scope")
+        def log_message(self, *_args):
+            pass
+
+    other_server = ThreadingHTTPServer(("127.0.0.1", 0), OutsideHandler)
+    other_thread = threading.Thread(target=other_server.serve_forever, daemon=True)
+    other_thread.start()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    target = f"http://127.0.0.1:{server.server_port}/"
+    monkeypatch.setattr(app, "perform_zap_passive_check",
+        lambda _target, targets=None: ([], {"status": "skipped", "reason": "fixture test",
+            "finding_count": 0, "alert_count": 0, "urls_scanned": 0}))
+    try:
+        with app.connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+                (target, "quick", "running", app.now()))
+            scan_id = cursor.lastrowid
+        app.perform_scan(scan_id, target, "quick")
+        with app.connect() as conn:
+            scan = conn.execute("SELECT status,tool_status FROM scans WHERE id=?", (scan_id,)).fetchone()
+            findings = conn.execute("SELECT title,severity,affected_url FROM findings WHERE scan_id=?", (scan_id,)).fetchall()
+        titles = {row["title"] for row in findings}
+        assert scan["status"] == "completed"
+        assert "Content-Security-Policy header missing" not in titles
+        assert "Referrer-Policy header missing" not in titles
+        assert "Permissions-Policy header missing" not in titles
+        assert "X-Content-Type-Options missing or weak" not in titles
+        assert "Target uses HTTP without transport encryption" in titles
+        assert all(row["affected_url"].startswith(target) for row in findings)
+        assert json.loads(scan["tool_status"])["Built-in HTTP & headers"]["status"] == "completed"
+
+        missing_target = target + "missing-headers"
+        with app.connect() as conn:
+            missing_id = conn.execute(
+                "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+                (missing_target, "quick", "running", app.now())).lastrowid
+        app.perform_scan(missing_id, missing_target, "quick")
+        with app.connect() as conn:
+            missing_scan = conn.execute("SELECT status FROM scans WHERE id=?", (missing_id,)).fetchone()
+            missing_findings = conn.execute("SELECT title FROM findings WHERE scan_id=?", (missing_id,)).fetchall()
+        missing_titles = {row["title"] for row in missing_findings}
+        assert missing_scan["status"] == "completed"
+        assert "Content-Security-Policy header missing" in missing_titles
+        assert "Referrer-Policy header missing" in missing_titles
+        assert "X-Content-Type-Options missing or weak" in missing_titles
+        assert "Permissions-Policy header missing" in missing_titles
+
+        redirect_target = target + "redirect-out"
+        with app.connect() as conn:
+            redirect_id = conn.execute(
+                "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+                (redirect_target, "quick", "running", app.now())).lastrowid
+        app.perform_scan(redirect_id, redirect_target, "quick")
+        with app.connect() as conn:
+            redirect_scan = conn.execute("SELECT status,summary FROM scans WHERE id=?", (redirect_id,)).fetchone()
+        # urllib surfaces a rejected redirect as an HTTPError response; it must
+        # not follow the second server or treat its content as the scan response.
+        assert redirect_scan["status"] == "completed"
+        assert "outside scope" not in str(redirect_scan["summary"])
+        assert outside_requests == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        other_server.shutdown()
+        other_server.server_close()
+        other_thread.join(timeout=2)
+
+
+def test_discovery_adapter_persists_run_metadata_and_history(monkeypatch):
+    from uuid import uuid4
+    domain = f"history-{uuid4().hex}.example"
+    root = client.post("/api/assets", json={
+        "target": f"https://{domain}", "authorized": True, "scope_status": "in_scope",
+    }).json()
+    monkeypatch.setattr(app, "query_certificate_transparency", lambda root_domain, limit: [f"api.{root_domain}"][:limit])
+    response = client.post(f"/api/assets/{root['id']}/discover", json={"authorized": True, "max_results": 7})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source_status"] == "completed"
+    assert payload["limit_metadata"]["max_results"] == 7
+    runs = client.get(f"/api/assets/{root['id']}/discovery-runs").json()
+    assert len(runs) == 1
+    assert runs[0]["status"] == "completed"
+    assert runs[0]["candidate_count"] == 1
+    assert runs[0]["new_assets_added"] == 1
+    assert runs[0]["error_summary"] == ""
+
+
+def test_discovery_adapter_records_source_failure(monkeypatch):
+    from uuid import uuid4
+    domain = f"failed-history-{uuid4().hex}.example"
+    root = client.post("/api/assets", json={
+        "target": f"https://{domain}", "authorized": True, "scope_status": "in_scope",
+    }).json()
+    def fail(*args):
+        raise OSError("mock source unavailable")
+    monkeypatch.setattr(app, "query_certificate_transparency", fail)
+    response = client.post(f"/api/assets/{root['id']}/discover", json={"authorized": True})
+    assert response.status_code == 502
+    runs = client.get(f"/api/assets/{root['id']}/discovery-runs").json()
+    assert len(runs) == 1
+    assert runs[0]["status"] == "failed"
+    assert "mock source unavailable" in runs[0]["error_summary"]
+
+
+def test_dns_resolution_is_explicit_bounded_and_does_not_scan(monkeypatch):
+    from uuid import uuid4
+    domain = f"resolve-{uuid4().hex}.example"
+    org = client.post("/api/organizations", json={"name": f"Resolve {domain}", "root_domain": domain, "authorized": True}).json()
+    asset = client.post("/api/assets", json={"target": f"https://api.{domain}", "organization_id": org["id"], "authorized": True}).json()
+    before = len(client.get("/api/scans").json())
+    denied = client.post(f"/api/assets/{asset['id']}/resolve", json={"authorized": False})
+    assert denied.status_code == 400
+    class FakeSocketRecord:
+        pass
+    monkeypatch.setattr(app.socket, "getaddrinfo", lambda *args: [
+        (2, 1, 6, "", ("192.0.2.10", 443)), (2, 1, 6, "", ("192.0.2.10", 443)),
+        (2, 1, 6, "", ("2001:db8::10", 443, 0, 0)),
+    ])
+    response = client.post(f"/api/assets/{asset['id']}/resolve", json={"authorized": True, "timeout_seconds": 1})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["resolution_status"] == "resolved"
+    assert payload["addresses"] == ["192.0.2.10", "2001:db8::10"]
+    assert payload["http_probes_started"] == payload["tls_checks_started"] == payload["scans_started"] == 0
+    row = next(row for row in client.get("/api/assets").json() if row["id"] == asset["id"])
+    assert row["resolution_status"] == "resolved"
+    assert len(client.get("/api/scans").json()) == before
+
+
+def test_dns_resolution_rejects_unregistered_discovered_candidate(monkeypatch):
+    from uuid import uuid4
+    domain = f"orphan-{uuid4().hex}.example"
+    asset = client.post("/api/assets", json={"target": f"https://api.{domain}", "authorized": True}).json()
+    with app.connect() as conn:
+        conn.execute("UPDATE assets SET discovery_source='crt.sh' WHERE id=?", (asset["id"],))
+    calls = []
+    monkeypatch.setattr(app.socket, "getaddrinfo", lambda *args: calls.append(args) or [])
+    response = client.post(f"/api/assets/{asset['id']}/resolve", json={"authorized": True})
+    assert response.status_code == 403
+    assert calls == []
+
+
+def test_discovery_history_returns_not_found_for_unknown_asset():
+    assert client.get("/api/assets/999999/discovery-runs").status_code == 404
+
+
+
+def test_attack_surface_ui_exposes_dns_and_discovery_history_controls():
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "resolveAssetDns" in response.text
+    assert "showDiscoveryRuns" in response.text
+    assert "Discovery / DNS" in response.text
+    assert "DNS resolution is now an explicit inventory action" in response.text
+
+
+def test_asset_api_includes_organization_display_fields():
+    from uuid import uuid4
+    domain = f"inventory-{uuid4().hex}.example"
+    org = client.post("/api/organizations", json={
+        "name": f"Inventory Org {domain}", "root_domain": domain, "authorized": True,
+    }).json()
+    asset = client.post("/api/assets", json={
+        "target": f"https://api.{domain}", "organization_id": org["id"], "authorized": True,
+    }).json()
+    listed = next(row for row in client.get("/api/assets").json() if row["id"] == asset["id"])
+    assert listed["organization_name"] == org["name"]
+    assert listed["organization_root_domain"] == domain
+    assert client.get("/api/organizations").json()[0]["asset_count"] >= 0
+
+
+def test_asset_events_record_registration_scope_dns_and_not_found(monkeypatch):
+    from uuid import uuid4
+    domain = f"events-{uuid4().hex}.example"
+    org = client.post("/api/organizations", json={
+        "name": f"Events Org {domain}", "root_domain": domain, "authorized": True,
+    }).json()
+    asset = client.post("/api/assets", json={
+        "target": f"https://{domain}", "organization_id": org["id"], "authorized": True,
+    }).json()
+    events = client.get(f"/api/assets/{asset['id']}/events")
+    assert events.status_code == 200
+    assert events.json()[0]["event_type"] == "asset_registered"
+    changed = client.patch(f"/api/assets/{asset['id']}/scope", json={
+        "scope_status": "in_scope", "authorized": True, "approval_reference": "CHG-TEST-1",
+    })
+    assert changed.status_code == 200
+    events = client.get(f"/api/assets/{asset['id']}/events").json()
+    assert any(event["event_type"] == "scope_changed" for event in events)
+    monkeypatch.setattr(app.socket, "getaddrinfo", lambda *args: [(None, None, None, None, ("192.0.2.10", 0))])
+    resolved = client.post(f"/api/assets/{asset['id']}/resolve", json={"authorized": True, "timeout_seconds": 1})
+    assert resolved.status_code == 200
+    events = client.get(f"/api/assets/{asset['id']}/events").json()
+    assert any(event["event_type"] == "dns_resolution" for event in events)
+    assert client.get("/api/assets/999999/events").status_code == 404
+
+
+def test_asset_history_ui_is_exposed():
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "showAssetEvents" in response.text
+    assert "Asset History" in response.text
+
+
+def test_asset_organization_reassignment_requires_auth_and_exact_domain():
+    from uuid import uuid4
+    first_domain = f"owner-a-{uuid4().hex}.example"
+    second_domain = f"owner-b-{uuid4().hex}.example"
+    first = client.post("/api/organizations", json={"name": f"Owner A {first_domain}", "root_domain": first_domain, "authorized": True}).json()
+    second = client.post("/api/organizations", json={"name": f"Owner B {second_domain}", "root_domain": second_domain, "authorized": True}).json()
+    asset = client.post("/api/assets", json={"target": f"https://api.{first_domain}", "organization_id": first["id"], "authorized": True}).json()
+    assert client.patch(f"/api/assets/{asset['id']}/organization", json={"organization_id": second["id"]}).status_code == 400
+    assert client.patch(f"/api/assets/{asset['id']}/organization", json={"organization_id": second["id"], "authorized": True}).status_code == 400
+    changed = client.patch(f"/api/assets/{asset['id']}/organization", json={"organization_id": None, "notes": "ownership review", "authorized": True})
+    assert changed.status_code == 200 and changed.json()["changed"] is True
+    assert any(e["event_type"] == "organization_reassigned" for e in client.get(f"/api/assets/{asset['id']}/events").json())
+
+
+def test_discovery_snapshots_compare_successful_runs_only(monkeypatch):
+    from uuid import uuid4
+    domain = f"snapshots-{uuid4().hex}.example"
+    org = client.post("/api/organizations", json={"name": f"Snapshots {domain}", "root_domain": domain, "authorized": True}).json()
+    root = client.post("/api/assets", json={"target": f"https://{domain}", "organization_id": org["id"], "scope_status": "in_scope", "authorized": True}).json()
+    current = {"items": [f"api.{domain}", f"login.{domain}"]}
+    monkeypatch.setattr(app, "query_certificate_transparency", lambda root_domain, max_results: list(current["items"]))
+    assert client.post(f"/api/assets/{root['id']}/discover", json={"authorized": True}).status_code == 200
+    current["items"] = [f"api.{domain}"]
+    assert client.post(f"/api/assets/{root['id']}/discover", json={"authorized": True}).status_code == 200
+    login = next(a for a in client.get("/api/assets").json() if a["target"] == f"https://login.{domain}")
+    snapshots = client.get(f"/api/assets/{login['id']}/snapshots").json()
+    assert any(row["state"] == "new" for row in snapshots)
+    assert any(row["state"] == "missing_from_source" for row in snapshots)
+    assert client.get("/api/assets/999999/snapshots").status_code == 404
+
+
+def test_organization_event_history_records_edits():
+    from uuid import uuid4
+    domain = f"org-events-{uuid4().hex}.example"
+    created = client.post("/api/organizations", json={"name": f"Org {domain}", "root_domain": domain, "owner_contact": "old@example.test", "authorized": True}).json()
+    updated = client.post("/api/organizations", json={"name": f"Org Updated {domain}", "root_domain": domain, "owner_contact": "new@example.test", "authorized": True})
+    assert updated.status_code == 200
+    assert any(row["event_type"] == "organization_updated" for row in client.get(f"/api/organizations/{created['id']}/events").json())
+
+
+def test_asset_ownership_and_snapshot_controls_are_exposed():
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "changeAssetOrganization" in response.text
+    assert "showAssetSnapshots" in response.text
+    assert "Save owner" in response.text
+    assert "Snapshots</button>" in response.text
+
+
+
+def test_asset_posture_signals_are_explainable():
+    from uuid import uuid4
+    target = f"https://posture-{uuid4().hex}.example"
+    created = client.post("/api/assets", json={
+        "target": target, "authorized": True, "scope_status": "needs_review",
+    })
+    assert created.status_code == 200
+    asset_id = created.json()["id"]
+    asset = next(row for row in client.get("/api/assets").json() if row["id"] == asset_id)
+    codes = {signal["code"] for signal in asset["posture_signals"]}
+    assert asset["posture_priority"] == "Review scope"
+    assert {"scope_review_required", "owner_unassigned", "dns_not_checked"} <= codes
+    assert "risk_score" not in asset
+
+
+def test_easm_source_health_is_read_only_and_empty_when_no_runs():
+    response = client.get("/api/easm/source-health")
+    assert response.status_code == 200
+    payload = response.json()
+    assert isinstance(payload["sources"], list)
+    for source in payload["sources"]:
+        assert {"source", "run_count", "success_count", "failure_count", "latest_run"} <= source.keys()
+    assert isinstance(payload["dns_inventory"], list)
+
+
+def test_wayback_discovery_is_bounded_passive_and_keeps_candidates_pending(monkeypatch):
+    from uuid import uuid4
+    domain = f"wayback-{uuid4().hex}.example"
+    root = client.post("/api/assets", json={"target": f"https://{domain}", "authorized": True, "scope_status": "in_scope"}).json()
+    calls = []
+    monkeypatch.setattr(app, "query_wayback_hosts", lambda host, limit: calls.append((host, limit)) or [f"archive.{host}"])
+    response = client.post(f"/api/assets/{root['id']}/discover", json={"authorized": True, "max_results": 9, "source": "wayback"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source"] == "wayback"
+    assert payload["new_assets_added"] == 1
+    assert payload["scans_started"] == 0
+    assert calls == [(domain, 9)]
+    asset = next(row for row in client.get("/api/assets").json() if row["target"] == f"https://archive.{domain}")
+    assert asset["scope_status"] == "needs_review"
+    assert asset["discovery_source"] == "wayback"

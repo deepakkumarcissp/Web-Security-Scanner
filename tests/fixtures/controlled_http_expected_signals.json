@@ -1,0 +1,49 @@
+{
+  "name": "DKCISSP controlled loopback HTTP regression baseline",
+  "version": 1,
+  "scope": "Deterministic local fixture signals for HTTP transport, missing security headers, and optional tool evidence. This validates parser behavior only; it is not a vulnerability detection-rate estimate.",
+  "required_tools": ["Built-in HTTP & headers"],
+  "expected_signals": [
+    {
+      "id": "http-transport-warning",
+      "description": "An HTTP fixture target should produce the transport-encryption warning.",
+      "title_contains": "Target uses HTTP without transport encryption",
+      "affected_url_contains": "127.0.0.1",
+      "severity": "High",
+      "confidence": "High"
+    },
+    {
+      "id": "missing-csp",
+      "description": "A response without CSP should be identified.",
+      "title_contains": "Content-Security-Policy header missing",
+      "affected_url_contains": "missing-headers",
+      "severity": "Medium",
+      "confidence": "High"
+    },
+    {
+      "id": "missing-referrer-policy",
+      "description": "A response without Referrer-Policy should be identified.",
+      "title_contains": "Referrer-Policy header missing",
+      "affected_url_contains": "missing-headers",
+      "severity": "Low",
+      "confidence": "High"
+    },
+    {
+      "id": "missing-x-content-type-options",
+      "description": "A response without X-Content-Type-Options should be identified.",
+      "title_contains": "X-Content-Type-Options missing or weak",
+      "affected_url_contains": "missing-headers",
+      "severity": "Low",
+      "confidence": "High"
+    },
+    {
+      "id": "missing-permissions-policy",
+      "description": "A response without Permissions-Policy should be identified.",
+      "title_contains": "Permissions-Policy header missing",
+      "affected_url_contains": "missing-headers",
+      "severity": "Info",
+      "confidence": "High"
+    }
+  ],
+  "coverage_boundary": "This baseline covers only the five explicit loopback fixture expectations. It does not measure overall scanner coverage or prove exploitability. Redirect scope is asserted separately by a test that verifies the second local server receives no request."
+}

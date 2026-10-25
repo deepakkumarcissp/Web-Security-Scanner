@@ -13,6 +13,7 @@ import sqlite3
 import ssl
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,16 +23,20 @@ from urllib.parse import urlparse, urlencode, urljoin, urldefrag
 from html.parser import HTMLParser
 from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler, HTTPSHandler
 
+# Shared resolver pool caps concurrent OS resolver calls across requests.
+DNS_RESOLVER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dkcissp-dns")
+
 from fastapi import FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
+import yaml
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("DKCISSP_DB", ROOT / "data.sqlite3"))
 app = FastAPI(
-    title="DKCISSP Web Security Scanner",
+    title="DKCISSP External Attack Surface & Web Security Scanner",
     version="0.1.0",
-    description="Local-first web security checks, schedules, and CSV reports",
+    description="Local-first asset inventory, passive EASM discovery, and scoped web security assessment",
 )
 
 
@@ -55,8 +60,31 @@ def init_db() -> None:
                 created_at TEXT NOT NULL, finished_at TEXT, summary TEXT,
                 progress INTEGER NOT NULL DEFAULT 0,
                 current_stage TEXT NOT NULL DEFAULT 'Queued',
-                tool_status TEXT NOT NULL DEFAULT '{}'
+                tool_status TEXT NOT NULL DEFAULT '{}',
+                heartbeat_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS install_jobs(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                finished_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS scanner_activity(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id INTEGER,
+                category TEXT NOT NULL DEFAULT 'scan',
+                status TEXT NOT NULL DEFAULT 'info',
+                stage TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(scan_id) REFERENCES scans(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_scanner_activity_scan_id ON scanner_activity(scan_id, id);
             CREATE TABLE IF NOT EXISTS findings(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL,
                 target TEXT NOT NULL, severity TEXT NOT NULL, title TEXT NOT NULL,
@@ -75,6 +103,63 @@ def init_db() -> None:
                 next_run TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS organizations(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                root_domain TEXT NOT NULL,
+                owner_contact TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS organization_events(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                organization_id INTEGER NOT NULL,
+                event_at TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(organization_id) REFERENCES organizations(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_organization_events_org ON organization_events(organization_id, id DESC);
+            CREATE TABLE IF NOT EXISTS discovery_runs(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                root_asset_id INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                candidate_count INTEGER NOT NULL DEFAULT 0,
+                new_assets_added INTEGER NOT NULL DEFAULT 0,
+                error_summary TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(root_asset_id) REFERENCES assets(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_discovery_runs_root ON discovery_runs(root_asset_id, id DESC);
+            CREATE TABLE IF NOT EXISTS asset_events(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                event_at TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(asset_id) REFERENCES assets(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_asset_events_asset ON asset_events(asset_id, id DESC);
+            CREATE TABLE IF NOT EXISTS asset_snapshots(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                root_asset_id INTEGER NOT NULL,
+                discovery_run_id INTEGER NOT NULL,
+                asset_id INTEGER,
+                target TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('new','present','missing_from_source')),
+                observed_at TEXT NOT NULL,
+                FOREIGN KEY(root_asset_id) REFERENCES assets(id),
+                FOREIGN KEY(discovery_run_id) REFERENCES discovery_runs(id),
+                FOREIGN KEY(asset_id) REFERENCES assets(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_asset_snapshots_run ON asset_snapshots(discovery_run_id, id);
+            CREATE INDEX IF NOT EXISTS idx_asset_snapshots_root ON asset_snapshots(root_asset_id, id DESC);
             CREATE TABLE IF NOT EXISTS assets(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 target TEXT NOT NULL UNIQUE,
@@ -99,6 +184,9 @@ def init_db() -> None:
             conn.execute("ALTER TABLE scans ADD COLUMN current_stage TEXT NOT NULL DEFAULT 'Queued'")
         if "tool_status" not in scan_columns:
             conn.execute("ALTER TABLE scans ADD COLUMN tool_status TEXT NOT NULL DEFAULT '{}'")
+        if "heartbeat_at" not in scan_columns:
+            conn.execute("ALTER TABLE scans ADD COLUMN heartbeat_at TEXT")
+        conn.execute("UPDATE scans SET heartbeat_at=created_at WHERE heartbeat_at IS NULL")
         finding_columns = {row["name"] for row in conn.execute("PRAGMA table_info(findings)")}
         if "lifecycle_status" not in finding_columns:
             conn.execute("ALTER TABLE findings ADD COLUMN lifecycle_status TEXT NOT NULL DEFAULT 'open'")
@@ -107,6 +195,16 @@ def init_db() -> None:
         if "lifecycle_updated_at" not in finding_columns:
             conn.execute("ALTER TABLE findings ADD COLUMN lifecycle_updated_at TEXT")
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(assets)")}
+        if "organization_id" not in columns:
+            conn.execute("ALTER TABLE assets ADD COLUMN organization_id INTEGER REFERENCES organizations(id)")
+        for column, definition in {
+            "resolution_status": "TEXT NOT NULL DEFAULT 'unknown'",
+            "resolved_addresses_json": "TEXT NOT NULL DEFAULT '[]'",
+            "resolution_checked_at": "TEXT",
+            "resolution_error": "TEXT NOT NULL DEFAULT ''",
+        }.items():
+            if column not in columns:
+                conn.execute(f"ALTER TABLE assets ADD COLUMN {column} {definition}")
         if "approval_reference" not in columns:
             conn.execute("ALTER TABLE assets ADD COLUMN approval_reference TEXT NOT NULL DEFAULT ''")
         if "reviewed_at" not in columns:
@@ -116,6 +214,40 @@ def init_db() -> None:
 
 
 init_db()
+
+
+def record_asset_event(conn, asset_id: int, event_type: str, summary: str, details: dict | None = None) -> None:
+    """Persist a small, append-only inventory event in the same DB transaction as its change."""
+    conn.execute(
+        "INSERT INTO asset_events(asset_id,event_type,event_at,summary,details_json) VALUES(?,?,?,?,?)",
+        (asset_id, event_type, now(), summary[:500], json.dumps(details or {}, sort_keys=True)[:4000]),
+    )
+
+
+def recover_stale_scans(conn=None, stale_after_minutes: int = 30) -> int:
+    """Fail scans with no worker heartbeat after a conservative timeout; keep all findings/history."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max(1, stale_after_minutes))).isoformat(timespec="seconds")
+    owns_connection = conn is None
+    if owns_connection:
+        conn = connect()
+    try:
+        cursor = conn.execute(
+            """UPDATE scans
+               SET status='failed', finished_at=?, current_stage='Failed: worker heartbeat expired',
+                   summary=?, heartbeat_at=?
+               WHERE status='running' AND COALESCE(heartbeat_at, created_at) < ?""",
+            (now(), json.dumps({"error": "Scan worker heartbeat expired; scan marked failed by stale-worker recovery. Existing findings and scan history were preserved."}), now(), cutoff),
+        )
+        recovered = cursor.rowcount
+        if owns_connection:
+            conn.commit()
+        return recovered
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+recover_stale_scans()
 
 
 class ScanRequest(BaseModel):
@@ -131,11 +263,26 @@ class ScheduleRequest(ScanRequest):
     run_at: str | None = None
 
 
+class OrganizationRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    root_domain: str = Field(min_length=3, max_length=253)
+    owner_contact: str = Field(default="", max_length=254)
+    notes: str = Field(default="", max_length=1000)
+    authorized: bool = False
+
+
 class AssetRequest(BaseModel):
     target: str = Field(min_length=8, max_length=2048)
+    organization_id: int | None = Field(default=None, ge=1)
     authorized: bool = False
     scope_status: str = Field(default="needs_review", pattern="^(in_scope|out_of_scope|needs_review)$")
     notes: str = Field(default="", max_length=1000)
+
+
+class AssetOrganizationUpdate(BaseModel):
+    authorized: bool = False
+    organization_id: int | None = Field(default=None, ge=1)
+    notes: str = Field(default="", max_length=500)
 
 
 class AssetScopeUpdate(BaseModel):
@@ -148,6 +295,12 @@ class AssetScopeUpdate(BaseModel):
 class AssetDiscoveryRequest(BaseModel):
     authorized: bool = False
     max_results: int = Field(default=50, ge=1, le=100)
+    source: str = Field(default="crt.sh", pattern="^(crt.sh|wayback)$")
+
+
+class AssetResolveRequest(BaseModel):
+    authorized: bool = False
+    timeout_seconds: int = Field(default=2, ge=1, le=4)
 
 
 class FindingLifecycleUpdate(BaseModel):
@@ -233,6 +386,12 @@ class _PageLinkParser(HTMLParser):
             value = values.get(key)
             if value:
                 self.links.append(value.strip())
+
+
+def is_html_document(content_type: str) -> bool:
+    """Return whether response headers apply to a browser document rather than an asset."""
+    media_type = (content_type or "").split(";", 1)[0].strip().lower()
+    return media_type in {"text/html", "application/xhtml+xml"}
 
 
 def extract_same_origin_links(base_url: str, html: str) -> list[str]:
@@ -342,6 +501,23 @@ def discover_same_origin_pages(root_url: str, root_html: str, max_pages: int = 1
             "mode": "same-origin passive links only; forms not submitted; JavaScript not executed"}
 
 
+def deduplicate_findings(findings):
+    """Remove exact duplicate observations without discarding distinct evidence."""
+    deduped = []
+    seen = set()
+    for item in findings:
+        if len(item) < 6:
+            key = ("legacy", repr(item))
+        else:
+            severity, title, affected_url, evidence, remediation, confidence = item[:6]
+            normalize = lambda value: " ".join(str(value or "").split()).casefold()
+            key = tuple(normalize(value) for value in (severity, title, affected_url, evidence, remediation, confidence))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(item)
+    return deduped
+
+
 def add_finding(conn, scan_id, target, severity, title, url, evidence, remediation, confidence="High"):
     conn.execute(
         """INSERT INTO findings
@@ -425,8 +601,18 @@ def perform_zap_passive_check(target: str, targets: list[str] | None = None) -> 
             query["apikey"] = api_key
         req = Request(api_root + path + "?" + urlencode(query),
                       headers={"Accept": "application/json", "User-Agent": "DKCISSP-WebSecurityScanner/0.1"})
+        # ZAP's accessUrl response embeds the fetched responseBody as a JSON string.
+        # Bundled JavaScript can exceed 1 MB, so the old cap truncated valid JSON.
+        # Keep a finite 5 MB limit and detect oversize responses explicitly.
+        max_response_bytes = 5_000_000
         with urlopen(req, timeout=4) as response:
-            return json.loads(response.read(1_000_000).decode("utf-8", "replace"))
+            raw = response.read(max_response_bytes + 1)
+        if len(raw) > max_response_bytes:
+            raise ValueError("ZAP API response exceeded the 5 MB safety limit")
+        payload = json.loads(raw.decode("utf-8", "replace"))
+        if not isinstance(payload, dict):
+            raise ValueError("ZAP API returned an unexpected JSON response shape")
+        return payload
 
     scanned = []
     failures = []
@@ -484,9 +670,28 @@ def perform_zap_passive_check(target: str, targets: list[str] | None = None) -> 
         confidence = str(alert.get("confidence", "Medium"))
         normalized.append((severity, "OWASP ZAP: " + title, alert_url[:2048], evidence, remediation, confidence))
 
+    # Group exact same signals reported on multiple resources, but retain each URL
+    # in evidence so grouping reduces noise without hiding the affected surface.
+    grouped = {}
+    for severity, title, alert_url, evidence, remediation, confidence in normalized:
+        key = (severity, title, evidence, remediation, confidence)
+        if key not in grouped:
+            grouped[key] = {"urls": [], "finding": (severity, title, alert_url, evidence, remediation, confidence)}
+        if alert_url not in grouped[key]["urls"]:
+            grouped[key]["urls"].append(alert_url)
+
+    aggregated = []
+    for item in grouped.values():
+        severity, title, first_url, evidence, remediation, confidence = item["finding"]
+        urls = item["urls"]
+        if len(urls) > 1:
+            url_list = "\n".join("- " + url for url in urls)
+            evidence = (evidence + f"\nAffected URLs ({len(urls)}):\n" + url_list)[:1800]
+        aggregated.append((severity, title, first_url, evidence, remediation, confidence))
+
     status = "completed_with_warnings" if failures else "completed"
-    return normalized, {"status": status, "urls_requested": len(safe_targets), "urls_scanned": len(scanned),
-                       "finding_count": len(normalized), "errors": failures[:3],
+    return aggregated, {"status": status, "urls_requested": len(safe_targets), "urls_scanned": len(scanned),
+                       "alert_count": len(normalized), "finding_count": len(aggregated), "errors": failures[:3],
                        "mode": "passive only; no spider or active scan; same-origin URLs only"}
 
 def perform_testssl_check(target: str, timeout_seconds: int = 75) -> tuple[list[tuple], dict]:
@@ -577,46 +782,123 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
     if root is None:
         return [], {"status": "unavailable", "reason": "Local HTTP Nuclei templates were not found"}
 
-    allowed_tags = {"misconfig", "misconfiguration", "exposure", "headers", "ssl", "config", "token", "tech", "cve", "vulnerability", "panel", "discovery"}
-    excluded_tags = {"dos", "fuzz", "bruteforce", "brute-force", "intrusive", "headless", "token-spray", "default-login", "default-credentials", "filefuzz", "takeover"}
+    # Default profile is deliberately limited to low-impact configuration,
+    # exposure, TLS/header, technology and discovery checks. CVE/exploit classes
+    # are not enabled merely because a template happens to carry a safe tag too.
+    allowed_tags = {"misconfig", "misconfiguration", "exposure", "headers", "ssl", "config", "tech", "discovery"}
+    excluded_tags = {
+        "dos", "fuzz", "bruteforce", "brute-force", "intrusive", "headless",
+        "token-spray", "default-login", "default-credentials", "filefuzz", "takeover",
+        "cve", "vuln", "vulnerability", "rce", "lfi", "rfi", "sqli", "sql-injection",
+        "xss", "ssrf", "ssti", "xxe", "auth-bypass", "unauth",
+        "exploit", "kev", "vkev", "edb", "oast", "interactsh", "network", "cloud",
+    }
     severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "unknown": 5}
-    category_order = ["misconfig", "misconfiguration", "exposure", "ssl", "headers", "config", "cve", "vulnerability", "token", "panel", "tech", "discovery"]
+    category_order = ["misconfig", "misconfiguration", "exposure", "ssl", "headers", "config", "tech", "discovery"]
     scanned = 0
     for path in root.rglob("*.yaml"):
         scanned += 1
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")[:12000]
+            # Avoid parsing oversized/unrelated community templates. The quick
+            # checks are only a prefilter; accepted templates are still parsed.
+            if path.stat().st_size > 65536:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        # Restrict to HTTP templates; reject flow/headless/code and templates
-        # carrying explicit high-risk tags or excessive request counts.
-        if not re.search(r"(?m)^http\s*:", text) or re.search(r"(?m)^(flow|headless|javascript|code)\s*:", text):
+        if not re.search(r"(?m)^http\s*:", text):
             continue
-        # Do not execute state-changing HTTP methods, raw handcrafted requests,
-        # or payload-driven fuzzing in this bounded default profile.
+        if re.search(r"(?m)^(flow|headless|javascript|code|tcp|network|file|websocket|ssl)\s*:", text):
+            continue
+        if re.search(r"(?i)(interactsh|\boast\b|\bunsafe\b)", text):
+            continue
         if re.search(r"(?im)^\s*method\s*:\s*['\"]?(POST|PUT|PATCH|DELETE|OPTIONS)\b", text):
             continue
         if re.search(r"(?m)^\s*(payloads|attack|raw)\s*:", text):
             continue
-        id_match = re.search(r"(?m)^id\s*:\s*['\"]?([^\s'\"]+)", text)
-        tags_match = re.search(r"(?m)^\s*tags\s*:\s*([^\n]+)", text)
-        severity_match = re.search(r"(?m)^\s*severity\s*:\s*([^\s#]+)", text)
-        request_match = re.search(r"(?m)^\s*max-request\s*:\s*(\d+)", text)
-        if not id_match or not tags_match:
+        quick_tags = re.search(r"(?im)^\s*tags\s*:\s*([^\n]+)", text)
+        if not quick_tags:
             continue
-        tags = {tag.strip().lower() for tag in re.split(r"[,\s]+", tags_match.group(1).strip(" []\"'")) if tag.strip()}
+        pre_tags = {tag.strip().lower() for tag in re.split(r"[,\s]+", quick_tags.group(1).strip(" []\"'")) if tag.strip()}
+        if not (pre_tags & allowed_tags) or pre_tags & excluded_tags:
+            continue
+        try:
+            # safe_load reads template structure without constructing arbitrary Python objects.
+            template = yaml.safe_load(text)
+        except (yaml.YAMLError, RecursionError):
+            continue
+        if not isinstance(template, dict):
+            continue
+        info = template.get("info") if isinstance(template.get("info"), dict) else {}
+        template_id = str(template.get("id") or "").strip()
+        raw_tags = info.get("tags", [])
+        if isinstance(raw_tags, str):
+            tags = {tag.strip().lower() for tag in re.split(r"[,\s]+", raw_tags) if tag.strip()}
+        elif isinstance(raw_tags, list):
+            tags = {str(tag).strip().lower() for tag in raw_tags if str(tag).strip()}
+        else:
+            continue
+        if not template_id or not tags:
+            continue
+        # Only ordinary HTTP templates are in the default profile. Reject all
+        # alternate execution engines and request forms that are hard to bound.
+        if not isinstance(template.get("http"), list) or not template["http"]:
+            continue
+        if any(key in template for key in ("flow", "headless", "javascript", "code", "tcp", "network", "file", "websocket", "ssl")):
+            continue
+        if re.search(r"(?i)(interactsh|\boast\b|\bunsafe\b)", text):
+            continue
+        # A state-changing method or raw/payload-driven request is out of scope
+        # for the default profile, regardless of how benign its tags look.
+        if re.search(r"(?im)^\s*method\s*:\s*['\"]?(POST|PUT|PATCH|DELETE|OPTIONS)\b", text):
+            continue
+        if re.search(r"(?m)^\s*(payloads|attack|raw)\s*:", text):
+            continue
         if not (tags & allowed_tags) or tags & excluded_tags:
             continue
-        max_requests = int(request_match.group(1)) if request_match else 1
-        if max_requests > 5:
-            continue
-        severity = (severity_match.group(1).strip("'\"").lower() if severity_match else "unknown")
-        primary_category = next((tag for tag in category_order if tag in tags), "other")
-        candidates.append((primary_category, severity_rank.get(severity, 5), id_match.group(1), str(path), tags))
 
-    # Balance categories first so a large number of CVE templates cannot crowd out
-    # configuration, exposure, TLS/header, and technology checks. Within each group,
-    # higher-severity templates are selected first and identifiers keep selection stable.
+        metadata = info.get("metadata") if isinstance(info.get("metadata"), dict) else {}
+        declared_max = metadata.get("max-request", metadata.get("max-request-count", 0))
+        try:
+            declared_max = int(declared_max or 0)
+        except (TypeError, ValueError):
+            continue
+        if declared_max > 5:
+            continue
+
+        # Estimate requests from the parsed HTTP blocks and path lists. Templates
+        # with more than five possible path requests are excluded even if they omit
+        # Nuclei's optional max-request metadata.
+        request_estimate = 0
+        request_shape_safe = True
+        for request in template["http"]:
+            if not isinstance(request, dict):
+                request_shape_safe = False
+                break
+            paths = request.get("path", [])
+            if isinstance(paths, str):
+                path_count = 1
+            elif isinstance(paths, list):
+                path_count = len(paths)
+            else:
+                request_shape_safe = False
+                break
+            if path_count < 1:
+                request_shape_safe = False
+                break
+            request_estimate += path_count
+            if request_estimate > 5:
+                break
+        if not request_shape_safe or request_estimate > 5:
+            continue
+
+        severity = str(info.get("severity", "unknown")).strip().lower()
+        primary_category = next((tag for tag in category_order if tag in tags), "other")
+        candidates.append((primary_category, severity_rank.get(severity, 5), template_id, str(path), tags))
+
+    # Balance allowed low-impact categories so one large family cannot crowd out
+    # configuration, exposure, TLS/header, technology, and discovery checks. Within
+    # each group, higher-severity templates are selected first with stable IDs.
     groups = {}
     for candidate in candidates:
         groups.setdefault(candidate[0], []).append(candidate)
@@ -640,7 +922,7 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
         "templates_eligible": len(candidates), "templates_selected": len(selected),
         "max_templates": max_templates,
         "selected_tags": sorted(allowed_tags), "excluded_tags": sorted(excluded_tags),
-        "selection_note": "Local HTTP templates only; excludes explicit high-risk tags, flow/headless/code templates, and templates declaring over five requests.",
+        "selection_note": "Parsed YAML HTTP templates for low-impact configuration, exposure, TLS/header, technology, and discovery only; rejects exploit/CVE classes, mixed-risk tags, external callbacks, alternate execution engines, state-changing methods, payload fuzzing, and templates with over five estimated path requests.",
     }
 
 
@@ -678,24 +960,36 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
             template_file.write("\n".join(selected_templates) + "\n")
         with open(targets_path, "w", encoding="utf-8") as target_file:
             target_file.write("\n".join(safe_targets) + "\n")
+        # Nuclei's single-target mode is simpler and avoids list-mode overhead for Standard.
+        # Keep list mode only when Deep/Active scan multiple approved same-origin URLs.
+        target_args = ["-u", safe_targets[0]] if len(safe_targets) == 1 else ["-list", targets_path]
         command = [
-            binary, "-list", targets_path,
+            binary, *target_args,
             "-templates", templates_path,
             "-pt", "http",
             "-severity", "info,low,medium,high,critical,unknown",
             "-rl", "5", "-c", "3", "-timeout", "4", "-retries", "0",
-            "-duc", "-disable-redirects", "-no-interactsh", "-silent",
+            "-duc", "-no-stdin", "-disable-redirects", "-no-interactsh", "-silent",
             "-jsonl-export", jsonl_path,
         ]
         timed_out = False
         try:
             result = subprocess.run(
                 command, capture_output=True, text=True, timeout=timeout_seconds,
-                check=False, env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"},
+                check=False, stdin=subprocess.DEVNULL,
+                env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"},
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             timed_out = True
-            result = SimpleNamespace(returncode=124)
+            # Preserve bounded, useful diagnostics from the timed-out process. Python may
+            # return these as bytes even though text=True was requested.
+            timeout_stdout = exc.stdout or ""
+            timeout_stderr = exc.stderr or ""
+            if isinstance(timeout_stdout, bytes):
+                timeout_stdout = timeout_stdout.decode("utf-8", "replace")
+            if isinstance(timeout_stderr, bytes):
+                timeout_stderr = timeout_stderr.decode("utf-8", "replace")
+            result = SimpleNamespace(returncode=124, stdout=timeout_stdout, stderr=timeout_stderr)
         except OSError as exc:
             return [], {"status": "error", "reason": str(exc)[:300], "template_selection": selection_status}
 
@@ -716,6 +1010,8 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
                         "timeout_seconds": timeout_seconds if timed_out else None,
                         "reason": reason, "finding_count": 0, "partial_results_retained": False,
                         "template_selection": selection_status, "target_count": len(safe_targets),
+                        "stdout_tail": str(getattr(result, "stdout", "") or "")[-1000:] if timed_out else "",
+                        "stderr_tail": str(getattr(result, "stderr", "") or "")[-1000:] if timed_out else "",
                         "rate_limit_per_second": 5, "concurrency": 3,
                         "redirects_disabled": True, "interactsh_disabled": True}
         malformed = 0
@@ -740,6 +1036,10 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
                 title = str(info.get("name") or item.get("template-id") or "Nuclei finding")[:240]
                 template_id = str(item.get("template-id") or "unknown-template")[:160]
                 matched_at = str(item.get("matched-at") or item.get("host") or target)[:2048]
+                # Treat tool output as untrusted: only persist findings attached to the
+                # exact approved origin, even if a tool record unexpectedly names another host.
+                if not is_same_origin_url(matched_at, target):
+                    continue
                 extracted = item.get("extracted-results")
                 matcher = str(item.get("matcher-name") or "")[:160]
                 evidence_parts = [f"Template: {template_id}"]
@@ -750,7 +1050,11 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
                 if item.get("curl-command"):
                     evidence_parts.append("Request details omitted from stored evidence for safety.")
                 remediation = str(info.get("remediation") or "Review the template evidence, validate applicability, and apply the vendor-recommended fix.")[:1800]
-                findings.append((severity, "Nuclei: " + title, matched_at, "; ".join(evidence_parts)[:1800], remediation, "Medium"))
+                # Confidence reflects the evidence actually emitted by Nuclei,
+                # not the template's severity label. A named matcher plus extracted
+                # response evidence is stronger than a bare template match.
+                confidence = "High" if matcher and isinstance(extracted, list) and any(str(x).strip() for x in extracted) else "Medium"
+                findings.append((severity, "Nuclei: " + title, matched_at, "; ".join(evidence_parts)[:1800], remediation, confidence))
 
     deduped = []
     seen = set()
@@ -982,7 +1286,13 @@ def perform_whatweb_check(target: str, timeout_seconds: int = 30) -> tuple[list[
             continue
         for plugin_name, plugin_data in plugins.items():
             name = str(plugin_name).strip()[:160]
-            if not name or name.lower() in {"httpserver", "ip", "country", "title", "redirectlocation"}:
+            # Suppress generic protocol/markup/header labels that add noise rather
+            # than identifying a useful application technology. Keep actual frameworks,
+            # CMSs, runtimes, and versioned components as informational inventory signals.
+            if not name or name.lower() in {
+                "httpserver", "ip", "country", "title", "redirectlocation",
+                "html5", "script", "uncommonheaders", "x-frame-options",
+            }:
                 continue
             version_values = []
             if isinstance(plugin_data, dict):
@@ -1006,14 +1316,31 @@ def perform_whatweb_check(target: str, timeout_seconds: int = 30) -> tuple[list[
     return findings, {"status": "completed" if result.returncode == 0 else "completed_with_warnings",
                       "return_code": result.returncode, "finding_count": len(findings)}
 
-def update_scan_progress(scan_id: int, progress: int, stage: str, tools: dict | None = None) -> None:
-    """Persist truthful scan-stage progress so the UI can survive refreshes."""
+def record_activity(scan_id: int | None, stage: str, message: str, status: str = "info", category: str = "scan") -> None:
+    """Persist a short, secret-free event for the live activity timeline."""
+    safe_stage = str(stage)[:160]
+    safe_message = str(message)[:500]
     with connect() as conn:
+        conn.execute(
+            "INSERT INTO scanner_activity(scan_id,category,status,stage,message,created_at) VALUES(?,?,?,?,?,?)",
+            (scan_id, str(category)[:40], str(status)[:24], safe_stage, safe_message, now()),
+        )
+
+
+def update_scan_progress(scan_id: int, progress: int, stage: str, tools: dict | None = None) -> None:
+    """Persist truthful scan-stage progress and record actual stage transitions."""
+    with connect() as conn:
+        previous = conn.execute("SELECT current_stage,status FROM scans WHERE id=?", (scan_id,)).fetchone()
         if tools is None:
-            conn.execute("UPDATE scans SET progress=?,current_stage=? WHERE id=?", (progress, stage, scan_id))
+            conn.execute("UPDATE scans SET progress=?,current_stage=?,heartbeat_at=? WHERE id=?", (progress, stage, now(), scan_id))
         else:
-            conn.execute("UPDATE scans SET progress=?,current_stage=?,tool_status=? WHERE id=?",
-                         (progress, stage, json.dumps(tools), scan_id))
+            conn.execute("UPDATE scans SET progress=?,current_stage=?,tool_status=?,heartbeat_at=? WHERE id=?",
+                         (progress, stage, json.dumps(tools), now(), scan_id))
+        if previous and previous["current_stage"] != stage:
+            conn.execute(
+                "INSERT INTO scanner_activity(scan_id,category,status,stage,message,created_at) VALUES(?,?,?,?,?,?)",
+                (scan_id, "scan", "running", str(stage)[:160], f"{int(progress)}% — {str(stage)[:300]}", now()),
+            )
 
 
 def perform_scan(scan_id: int, target: str, profile: str) -> None:
@@ -1040,7 +1367,10 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         )
         context = ssl.create_default_context()
         try:
-            with urlopen(req, timeout=12, context=context) as response:
+            # Keep the initial request inside the exact approved origin too. urllib's
+            # default opener follows cross-origin redirects, which could otherwise send
+            # the scanner to a different host or port before any scope checks run.
+            with same_origin_opener(target).open(req, timeout=12) as response:
                 status_code = response.status
                 headers = {k.lower(): v for k, v in response.headers.items()}
                 final_url = response.geturl()
@@ -1053,8 +1383,8 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         except (URLError, TimeoutError, ssl.SSLError, socket.timeout) as exc:
             with connect() as conn:
                 conn.execute(
-                    "UPDATE scans SET status=?,finished_at=?,summary=? WHERE id=?",
-                    ("failed", now(), json.dumps({"error": str(exc)}), scan_id),
+                    "UPDATE scans SET status=?,finished_at=?,summary=?,heartbeat_at=? WHERE id=?",
+                    ("failed", now(), json.dumps({"error": str(exc)}), now(), scan_id),
                 )
             return
 
@@ -1159,6 +1489,10 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                         if page_final.scheme != root_parsed.scheme or page_final.hostname != root_parsed.hostname or page_port != root_port:
                             continue
                         page_headers = {k.lower(): v for k, v in page_response.headers.items()}
+                        # Document security policies should be assessed on HTML/XHTML
+                        # documents, not every linked JS, CSS, image, or favicon asset.
+                        if not is_html_document(page_headers.get("content-type", "")):
+                            continue
                         page_body = page_response.read(100_000).decode("utf-8", "replace")
                         page_url_final = page_response.geturl()
                     if page_url_final.startswith("https://") and "strict-transport-security" not in page_headers:
@@ -1189,8 +1523,13 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         nikto_status = {"status": "not_run", "reason": "Nikto server checks are enabled for Deep/Active profiles only"}
         if profile in ("standard", "deep", "active"):
             nuclei_targets = discovery_status.get("urls", [target])
-            nuclei_template_cap = 60 if profile in ("deep", "active") else 30
-            nuclei_timeout = 150 if profile in ("deep", "active") else 75
+            nuclei_template_cap = 60 if profile in ("deep", "active") else 5
+            # Standard is a quick baseline: run a small category-balanced template set on the
+            # authorized root URL. Deep/Active expand to 60 templates across discovered endpoints.
+            # This keeps the default profile bounded while preserving broader coverage on demand.
+            if profile == "standard":
+                nuclei_targets = [target]
+            nuclei_timeout = 240 if profile in ("deep", "active") else 30
             tool_status["Nuclei"] = {"status": "running", "detail": f"Running up to {nuclei_template_cap} safe templates across {len(nuclei_targets[:12])} same-origin URL(s); 5 requests/second maximum"}
             update_scan_progress(scan_id, 35, "Running Nuclei safe checks", tool_status)
             nuclei_findings, nuclei_status = perform_nuclei_check(target, timeout_seconds=nuclei_timeout,
@@ -1240,7 +1579,9 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         zap_targets = discovery_status.get("urls", [target])
         zap_findings, zap_status = perform_zap_passive_check(target, targets=zap_targets)
         findings.extend(zap_findings)
-        tool_status["OWASP ZAP passive"] = {"status": zap_status.get("status", "error"), "detail": f"{zap_status.get('finding_count', len(zap_findings))} alert(s) across {zap_status.get('urls_scanned', 0)} URL(s); {zap_status.get('reason', zap_status.get('mode', 'integration status recorded'))}"}
+        zap_finding_count = zap_status.get("finding_count", len(zap_findings))
+        zap_alert_count = zap_status.get("alert_count", zap_finding_count)
+        tool_status["OWASP ZAP passive"] = {"status": zap_status.get("status", "error"), "detail": f"{zap_finding_count} finding(s) from {zap_alert_count} alert(s) across {zap_status.get('urls_scanned', 0)} URL(s); {zap_status.get('reason', zap_status.get('mode', 'integration status recorded'))}"}
         wapiti_status = {"status": "not_run", "reason": "Wapiti active testing is available only in the Active profile"}
         if profile == "active":
             tool_status["Wapiti active checks"] = {"status": "running", "detail": "Active tests approved; checking common injection, file, redirect, and configuration weaknesses with bounded scope and runtime"}
@@ -1252,20 +1593,13 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             tool_status["Wapiti active checks"] = {"status": "skipped", "detail": "Requires the separate Active profile and explicit approval"}
 
         update_scan_progress(scan_id, 97, "Combining and deduplicating findings", tool_status)
-        deduped = []
-        seen = set()
-        for item in findings:
-            key = (item[0], item[1], item[2])
-            if key not in seen:
-                seen.add(key)
-                deduped.append(item)
-        findings = deduped
+        findings = deduplicate_findings(findings)
 
         with connect() as conn:
             for item in findings:
                 add_finding(conn, scan_id, target, *item)
             conn.execute(
-                "UPDATE scans SET status=?,finished_at=?,summary=?,progress=100,current_stage=?,tool_status=? WHERE id=?",
+                "UPDATE scans SET status=?,finished_at=?,summary=?,progress=100,current_stage=?,tool_status=?,heartbeat_at=? WHERE id=?",
                 (
                     "completed", now(),
                     json.dumps({
@@ -1276,14 +1610,14 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                         "endpoint_discovery": discovery_status,
                         "finding_count": len(findings),
                     }),
-                    "Assessment complete", json.dumps(tool_status), scan_id,
+                    "Assessment complete", json.dumps(tool_status), now(), scan_id,
                 ),
             )
     except Exception as exc:
         with connect() as conn:
             conn.execute(
-                "UPDATE scans SET status=?,finished_at=?,summary=?,current_stage=?,tool_status=? WHERE id=?",
-                ("failed", now(), json.dumps({"error": str(exc)}), "Assessment failed", json.dumps(tool_status), scan_id),
+                "UPDATE scans SET status=?,finished_at=?,summary=?,current_stage=?,tool_status=?,heartbeat_at=? WHERE id=?",
+                ("failed", now(), json.dumps({"error": str(exc)}), "Assessment failed", json.dumps(tool_status), now(), scan_id),
             )
 
 
@@ -1305,13 +1639,14 @@ def start_scan(target: str, profile: str) -> int:
         # Serialize the capacity check and insert so simultaneous requests cannot
         # all observe the same free slot and exceed the configured worker limit.
         conn.execute("BEGIN IMMEDIATE")
+        recover_stale_scans(conn)
         active_scans = running_scan_count(conn)
         limit = max_concurrent_scans()
         if active_scans >= limit:
             raise HTTPException(429, f"Scanner capacity reached ({active_scans}/{limit} assessments running). Wait for a scan to finish before starting another.")
         cursor = conn.execute(
-            "INSERT INTO scans(target,profile,status,created_at,progress,current_stage,tool_status) VALUES(?,?,?,?,?,?,?)",
-            (target, profile, "running", now(), 1, "Queued", json.dumps({})),
+            "INSERT INTO scans(target,profile,status,created_at,progress,current_stage,tool_status,heartbeat_at) VALUES(?,?,?,?,?,?,?,?)",
+            (target, profile, "running", now(), 1, "Queued", json.dumps({}), now()),
         )
         scan_id = cursor.lastrowid
     threading.Thread(target=perform_scan, args=(scan_id, target, profile), daemon=True).start()
@@ -1330,7 +1665,9 @@ def scheduler_loop() -> None:
                     except ValueError:
                         continue
                     if due <= current:
-                        # Scheduled work must respect the same worker cap as manual requests.
+                        # Recover abandoned workers before enforcing the shared capacity limit.
+                        recover_stale_scans(conn)
+                        conn.commit()
                         if running_scan_count(conn) >= max_concurrent_scans():
                             continue
                         try:
@@ -1360,7 +1697,7 @@ def home():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "product": "DKCISSP Web Security Scanner", "version": app.version}
+    return {"status": "ok", "product": "DKCISSP External Attack Surface & Web Security Scanner", "version": app.version}
 
 
 @app.get("/api/dashboard")
@@ -1384,12 +1721,133 @@ def dashboard():
         }
 
 
+def normalize_root_domain(raw: str) -> str:
+    """Accept a DNS name only, never a URL, wildcard, IP literal, or suffix lookalike."""
+    domain = raw.strip().lower().rstrip(".")
+    if not valid_dns_name(domain) or "." not in domain or re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", domain):
+        raise HTTPException(400, "Root domain must be a valid fully qualified DNS name, not a URL or IP address.")
+    return domain
+
+
+@app.get("/api/organizations")
+def list_organizations():
+    with connect() as conn:
+        return [dict(row) for row in conn.execute(
+            """SELECT o.*, COUNT(a.id) AS asset_count FROM organizations o
+               LEFT JOIN assets a ON a.organization_id=o.id
+               GROUP BY o.id ORDER BY o.name COLLATE NOCASE"""
+        )]
+
+
+@app.post("/api/organizations")
+def create_organization(request: OrganizationRequest):
+    if not request.authorized:
+        raise HTTPException(400, "Confirm you are authorized to register this organization/root domain.")
+    name = request.name.strip()
+    if not name:
+        raise HTTPException(400, "Organization name cannot be blank.")
+    root_domain = normalize_root_domain(request.root_domain)
+    timestamp = now()
+    with connect() as conn:
+        existing = conn.execute("SELECT * FROM organizations WHERE root_domain=?", (root_domain,)).fetchone()
+        if existing:
+            before = {key: existing[key] for key in ("name", "owner_contact", "notes")}
+            after = {"name": name, "owner_contact": request.owner_contact.strip(), "notes": request.notes.strip()}
+            conn.execute("UPDATE organizations SET name=?,owner_contact=?,notes=?,updated_at=? WHERE id=?",
+                         (name, after["owner_contact"], after["notes"], timestamp, existing["id"]))
+            if before != after:
+                conn.execute("""INSERT INTO organization_events(organization_id,event_at,event_type,summary,details_json)
+                    VALUES(?,?,?,?,?)""", (existing["id"], timestamp, "organization_updated", "Organization details updated",
+                    json.dumps({"before": before, "after": after}, sort_keys=True)))
+            row = conn.execute("SELECT * FROM organizations WHERE id=?", (existing["id"],)).fetchone()
+            return {**dict(row), "created": False}
+        try:
+            cursor = conn.execute(
+                "INSERT INTO organizations(name,root_domain,owner_contact,notes,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                (name, root_domain, request.owner_contact.strip(), request.notes.strip(), timestamp, timestamp),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(409, "An organization with that name already exists; use its existing record or choose a unique name.") from exc
+        conn.execute("INSERT INTO organization_events(organization_id,event_at,event_type,summary,details_json) VALUES(?,?,?,?,?)",
+                     (cursor.lastrowid, timestamp, "organization_registered", "Organization/root domain registered",
+                      json.dumps({"root_domain": root_domain, "owner_contact": request.owner_contact.strip()}, sort_keys=True)))
+        row = conn.execute("SELECT * FROM organizations WHERE id=?", (cursor.lastrowid,)).fetchone()
+        return {**dict(row), "created": True}
+
+
+def build_posture_signals(asset):
+    signals = []
+    if asset.get("scope_status") == "needs_review":
+        signals.append({"code": "scope_review_required", "label": "Scope review required"})
+    if not asset.get("organization_id"):
+        signals.append({"code": "owner_unassigned", "label": "Organization unassigned"})
+    if asset.get("discovery_source") != "manual":
+        signals.append({"code": "discovered_candidate", "label": "Discovered candidate"})
+    resolution = asset.get("resolution_status") or "unknown"
+    if resolution == "unknown":
+        signals.append({"code": "dns_not_checked", "label": "DNS not checked"})
+    elif resolution != "resolved":
+        signals.append({"code": "dns_unresolved", "label": "DNS unresolved"})
+    if asset.get("scope_status") == "needs_review":
+        priority = "Review scope"
+    elif not asset.get("organization_id"):
+        priority = "Assign organization"
+    elif resolution != "resolved":
+        priority = "Resolve DNS"
+    else:
+        priority = "Inventory recorded"
+    return signals, priority
+
+
 @app.get("/api/assets")
 def list_assets():
     with connect() as conn:
-        return [dict(row) for row in conn.execute(
-            "SELECT * FROM assets ORDER BY last_seen DESC, id DESC"
+        rows = [dict(row) for row in conn.execute(
+            """SELECT a.*, o.name AS organization_name, o.root_domain AS organization_root_domain
+               FROM assets a LEFT JOIN organizations o ON o.id=a.organization_id
+               ORDER BY a.last_seen DESC, a.id DESC"""
         )]
+    for asset in rows:
+        signals, priority = build_posture_signals(asset)
+        asset["posture_signals"] = signals
+        asset["posture_priority"] = priority
+    return rows
+
+
+@app.get("/api/easm/source-health")
+def easm_source_health():
+    with connect() as conn:
+        sources = conn.execute(
+            """SELECT source, COUNT(*) AS run_count,
+                      SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS success_count,
+                      SUM(CASE WHEN status!='success' THEN 1 ELSE 0 END) AS failure_count
+               FROM discovery_runs GROUP BY source ORDER BY source"""
+        ).fetchall()
+        result = []
+        for source_row in sources:
+            source = dict(source_row)
+            latest = conn.execute(
+                """SELECT id, root_asset_id, started_at, finished_at, status,
+                          candidate_count, new_assets_added, error_summary
+                   FROM discovery_runs WHERE source=? ORDER BY id DESC LIMIT 1""",
+                (source["source"],),
+            ).fetchone()
+            source["latest_run"] = dict(latest) if latest else None
+            result.append(source)
+        dns = conn.execute(
+            """SELECT resolution_status, COUNT(*) AS asset_count
+               FROM assets GROUP BY resolution_status ORDER BY resolution_status"""
+        ).fetchall()
+    return {"sources": result, "dns_inventory": [dict(row) for row in dns]}
+
+
+@app.get("/api/organizations/{organization_id}/events")
+def list_organization_events(organization_id: int):
+    with connect() as conn:
+        if not conn.execute("SELECT 1 FROM organizations WHERE id=?", (organization_id,)).fetchone():
+            raise HTTPException(404, "Organization not found")
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM organization_events WHERE organization_id=? ORDER BY id DESC LIMIT 100", (organization_id,))]
 
 
 @app.post("/api/assets")
@@ -1415,21 +1873,65 @@ def create_asset(request: AssetRequest):
     timestamp = now()
     asset_type = "ip_address" if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", hostname) else "web_url"
     with connect() as conn:
+        organization_id = request.organization_id
+        if organization_id is not None:
+            organization = conn.execute("SELECT * FROM organizations WHERE id=?", (organization_id,)).fetchone()
+            if not organization:
+                raise HTTPException(404, "Organization not found")
+            root_domain = organization["root_domain"].lower().rstrip(".")
+            if hostname != root_domain and not hostname.endswith("." + root_domain):
+                raise HTTPException(400, "Asset hostname must match the organization's exact root domain or a true subdomain label boundary.")
+        else:
+            matches = conn.execute("SELECT id,root_domain FROM organizations").fetchall()
+            eligible = [row for row in matches if hostname == row["root_domain"] or hostname.endswith("." + row["root_domain"])]
+            if eligible:
+                organization_id = max(eligible, key=lambda row: len(row["root_domain"]))["id"]
         existing = conn.execute("SELECT * FROM assets WHERE target=?", (normalized,)).fetchone()
         if existing:
-            conn.execute("UPDATE assets SET last_seen=?, notes=? WHERE id=?",
-                         (timestamp, request.notes, existing["id"]))
+            conn.execute("UPDATE assets SET last_seen=?, notes=?, organization_id=COALESCE(?, organization_id) WHERE id=?",
+                         (timestamp, request.notes, organization_id, existing["id"]))
             row = conn.execute("SELECT * FROM assets WHERE id=?", (existing["id"],)).fetchone()
             return {**dict(row), "created": False}
         initial_decision = "approved" if request.scope_status == "in_scope" else ("rejected" if request.scope_status == "out_of_scope" else "pending")
         cursor = conn.execute(
-            """INSERT INTO assets(target,asset_type,scope_status,discovery_source,first_seen,last_seen,notes,reviewed_at,review_decision)
-               VALUES(?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO assets(target,asset_type,scope_status,discovery_source,first_seen,last_seen,notes,reviewed_at,review_decision,organization_id)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
             (normalized, asset_type, request.scope_status, "manual", timestamp, timestamp, request.notes,
-             timestamp if initial_decision in {"approved", "rejected"} else None, initial_decision),
+             timestamp if initial_decision in {"approved", "rejected"} else None, initial_decision, organization_id),
         )
         row = conn.execute("SELECT * FROM assets WHERE id=?", (cursor.lastrowid,)).fetchone()
+        record_asset_event(conn, cursor.lastrowid, "asset_registered", "Asset registered in inventory", {
+            "scope_status": request.scope_status, "discovery_source": "manual", "organization_id": organization_id,
+        })
         return {**dict(row), "created": True}
+
+
+@app.patch("/api/assets/{asset_id}/organization")
+def update_asset_organization(asset_id: int, request: AssetOrganizationUpdate):
+    if not request.authorized:
+        raise HTTPException(400, "Confirm you are authorized to change asset ownership association.")
+    with connect() as conn:
+        asset = conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+        if not asset:
+            raise HTTPException(404, "Asset not found")
+        org = None
+        if request.organization_id is not None:
+            org = conn.execute("SELECT * FROM organizations WHERE id=?", (request.organization_id,)).fetchone()
+            if not org:
+                raise HTTPException(404, "Organization not found")
+            hostname = (urlparse(asset["target"]).hostname or "").lower().rstrip(".")
+            root = org["root_domain"].lower().rstrip(".")
+            if hostname != root and not hostname.endswith("." + root):
+                raise HTTPException(400, "Asset hostname must match the organization's exact root domain or a true subdomain label boundary.")
+        old_id = asset["organization_id"]
+        if old_id == request.organization_id:
+            return {"asset_id": asset_id, "organization_id": old_id, "changed": False}
+        conn.execute("UPDATE assets SET organization_id=?,last_seen=? WHERE id=?", (request.organization_id, now(), asset_id))
+        record_asset_event(conn, asset_id, "organization_reassigned", "Asset organization association changed", {
+            "from_organization_id": old_id, "to_organization_id": request.organization_id,
+            "reason": request.notes.strip(),
+        })
+        return {"asset_id": asset_id, "organization_id": request.organization_id, "changed": True}
 
 
 @app.patch("/api/assets/{asset_id}/scope")
@@ -1451,6 +1953,12 @@ def update_asset_scope(asset_id: int, request: AssetScopeUpdate):
         conn.execute("""UPDATE assets SET scope_status=?,notes=?,approval_reference=?,reviewed_at=?,
             review_decision=?,last_seen=? WHERE id=?""",
             (request.scope_status, notes, approval_reference if decision == "approved" else "", reviewed_at, decision, timestamp, asset_id))
+        if existing["scope_status"] != request.scope_status or (request.scope_status == "in_scope" and existing["approval_reference"] != approval_reference):
+            record_asset_event(conn, asset_id, "scope_changed", "Asset scope changed", {
+                "from": existing["scope_status"], "to": request.scope_status,
+                "approval_reference": approval_reference if decision == "approved" else "",
+                "review_decision": decision,
+            })
         return dict(conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone())
 
 
@@ -1496,6 +2004,130 @@ def query_certificate_transparency(root_domain: str, max_results: int) -> list[s
     return sorted(name for name in candidates if name != root_domain)[:max_results]
 
 
+def query_wayback_hosts(root_domain: str, max_results: int) -> list[str]:
+    """Read a bounded Wayback CDX index response; never fetch archived pages or target hosts."""
+    endpoint = "https://web.archive.org/cdx/search/cdx?" + urlencode({
+        "url": "*." + root_domain + "/*",
+        "output": "json",
+        "fl": "original",
+        "filter": "statuscode:200",
+        "collapse": "urlkey",
+        "limit": str(min(max_results * 20, 2000)),
+    })
+    req = Request(endpoint, headers={
+        "Accept": "application/json",
+        "User-Agent": "DKCISSP-WebSecurityScanner/0.1 (passive authorized inventory)",
+    })
+    with urlopen(req, timeout=12) as response:
+        payload = response.read(1_000_001)
+    if len(payload) > 1_000_000:
+        raise HTTPException(502, "Wayback CDX response exceeded the 1 MB safety limit.")
+    try:
+        records = json.loads(payload.decode("utf-8", "replace"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(502, "Wayback CDX returned invalid JSON.")
+    if not isinstance(records, list):
+        raise HTTPException(502, "Wayback CDX returned an unexpected response.")
+    candidates = set()
+    suffix = "." + root_domain
+    for record in records:
+        if not isinstance(record, list):
+            continue
+        for raw_url in record:
+            try:
+                hostname = (urlparse(str(raw_url)).hostname or "").lower().rstrip(".")
+            except ValueError:
+                continue
+            if (hostname == root_domain or hostname.endswith(suffix)) and valid_dns_name(hostname):
+                if hostname != root_domain:
+                    candidates.add(hostname)
+    return sorted(candidates)[:max_results]
+
+
+def run_wayback_discovery_adapter(root_domain: str, max_results: int) -> dict:
+    """Normalize a bounded Wayback CDX query into the common discovery contract."""
+    started = now()
+    try:
+        candidates = query_wayback_hosts(root_domain, max_results)
+        return {"source": "wayback", "started_at": started, "finished_at": now(),
+                "status": "completed", "candidates": candidates, "errors": [],
+                "limit_metadata": {"max_results": max_results, "response_limit_bytes": 1_000_000,
+                                   "cdx_record_limit": min(max_results * 20, 2000)}}
+    except Exception as exc:
+        return {"source": "wayback", "started_at": started, "finished_at": now(),
+                "status": "failed", "candidates": [],
+                "errors": [f"{type(exc).__name__}: {str(exc)[:300]}"],
+                "limit_metadata": {"max_results": max_results, "response_limit_bytes": 1_000_000,
+                                   "cdx_record_limit": min(max_results * 20, 2000)}}
+
+
+def run_ct_discovery_adapter(root_domain: str, max_results: int) -> dict:
+    """Normalize the CT source into a stable, auditable adapter result contract."""
+    started = now()
+    try:
+        candidates = query_certificate_transparency(root_domain, max_results)
+        return {"source": "crt.sh", "started_at": started, "finished_at": now(),
+                "status": "completed", "candidates": candidates, "errors": [],
+                "limit_metadata": {"max_results": max_results, "response_limit_bytes": 1_000_000}}
+    except Exception as exc:
+        return {"source": "crt.sh", "started_at": started, "finished_at": now(),
+                "status": "failed", "candidates": [],
+                "errors": [f"{type(exc).__name__}: {str(exc)[:300]}"],
+                "limit_metadata": {"max_results": max_results, "response_limit_bytes": 1_000_000}}
+
+
+def persist_discovery_run(root_asset_id: int, result: dict, candidate_count: int = 0,
+                          new_assets_added: int = 0, error_summary: str = "") -> int:
+    with connect() as conn:
+        cur = conn.execute("""INSERT INTO discovery_runs
+            (root_asset_id,source,started_at,finished_at,status,candidate_count,new_assets_added,error_summary,metadata_json)
+            VALUES(?,?,?,?,?,?,?,?,?)""", (root_asset_id, result["source"], result["started_at"],
+            result["finished_at"], result["status"], candidate_count, new_assets_added,
+            error_summary[:500], json.dumps(result.get("limit_metadata", {}), sort_keys=True)))
+        run_id = cur.lastrowid
+        if result.get("status") == "completed":
+            previous = conn.execute("""SELECT id FROM discovery_runs WHERE root_asset_id=? AND source=? AND status='completed' AND id<?
+                ORDER BY id DESC LIMIT 1""", (root_asset_id, result["source"], run_id)).fetchone()
+            previous_targets = set()
+            if previous:
+                previous_targets = {row["target"] for row in conn.execute(
+                    "SELECT target FROM asset_snapshots WHERE discovery_run_id=? AND state IN ('new','present')", (previous["id"],))}
+            current_targets = {"https://" + host for host in result.get("candidates", [])}
+            for target in sorted(current_targets):
+                asset = conn.execute("SELECT id FROM assets WHERE target=?", (target,)).fetchone()
+                state = "present" if target in previous_targets else "new"
+                conn.execute("INSERT INTO asset_snapshots(root_asset_id,discovery_run_id,asset_id,target,state,observed_at) VALUES(?,?,?,?,?,?)",
+                    (root_asset_id, run_id, asset["id"] if asset else None, target, state, result["finished_at"]))
+                if state == "new" and previous:
+                    record_asset_event(conn, asset["id"], "discovery_new", "Asset newly observed in a successful discovery run", {"source": result["source"], "run_id": run_id})
+            missing_targets = previous_targets - current_targets
+            for target in sorted(missing_targets):
+                old = conn.execute("SELECT asset_id FROM asset_snapshots WHERE discovery_run_id=? AND target=? AND asset_id IS NOT NULL LIMIT 1", (previous["id"], target)).fetchone()
+                conn.execute("INSERT INTO asset_snapshots(root_asset_id,discovery_run_id,asset_id,target,state,observed_at) VALUES(?,?,?,?,?,?)",
+                    (root_asset_id, run_id, old["asset_id"] if old else None, target, "missing_from_source", result["finished_at"]))
+                if old and old["asset_id"]:
+                    record_asset_event(conn, old["asset_id"], "discovery_missing", "Asset absent from latest successful discovery result; not confirmed removed", {"source": result["source"], "run_id": run_id})
+        return run_id
+
+
+@app.get("/api/assets/{asset_id}/discovery-runs")
+def list_asset_discovery_runs(asset_id: int):
+    with connect() as conn:
+        if not conn.execute("SELECT id FROM assets WHERE id=?", (asset_id,)).fetchone():
+            raise HTTPException(404, "Asset not found")
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM discovery_runs WHERE root_asset_id=? ORDER BY id DESC LIMIT 50", (asset_id,))]
+
+
+@app.get("/api/assets/{asset_id}/snapshots")
+def list_asset_snapshots(asset_id: int):
+    with connect() as conn:
+        if not conn.execute("SELECT 1 FROM assets WHERE id=?", (asset_id,)).fetchone():
+            raise HTTPException(404, "Asset not found")
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM asset_snapshots WHERE asset_id=? ORDER BY id DESC LIMIT 100", (asset_id,))]
+
+
 @app.post("/api/assets/{asset_id}/discover")
 def discover_subdomains(asset_id: int, request: AssetDiscoveryRequest):
     if not request.authorized:
@@ -1510,12 +2142,14 @@ def discover_subdomains(asset_id: int, request: AssetDiscoveryRequest):
     root_domain = (parsed.hostname or "").lower().rstrip(".")
     if not valid_dns_name(root_domain) or "." not in root_domain:
         raise HTTPException(400, "Passive subdomain discovery requires a fully qualified DNS root, not an IP address or local hostname.")
-    try:
-        candidates = query_certificate_transparency(root_domain, request.max_results)
-    except HTTPException:
-        raise
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        raise HTTPException(502, "Passive discovery could not reach the certificate-transparency service.") from exc
+    result = (run_ct_discovery_adapter(root_domain, request.max_results)
+              if request.source == "crt.sh"
+              else run_wayback_discovery_adapter(root_domain, request.max_results))
+    if result["status"] != "completed":
+        message = result["errors"][0] if result["errors"] else "Unknown source error"
+        persist_discovery_run(asset_id, result, error_summary=message)
+        raise HTTPException(502, "Passive discovery failed; source status was recorded in discovery history.")
+    candidates = result["candidates"]
     timestamp = now()
     created = 0
     with connect() as conn:
@@ -1525,16 +2159,75 @@ def discover_subdomains(asset_id: int, request: AssetDiscoveryRequest):
             if exists:
                 conn.execute("UPDATE assets SET last_seen=? WHERE id=?", (timestamp, exists["id"]))
                 continue
-            conn.execute(
-                """INSERT INTO assets(target,asset_type,scope_status,discovery_source,first_seen,last_seen,notes)
-                   VALUES(?,?,?,?,?,?,?)""",
-                (target, "subdomain", "needs_review", "crt.sh", timestamp, timestamp,
-                 "Passive certificate-transparency candidate; verify ownership and scope before scanning."),
+            inserted = conn.execute(
+                """INSERT INTO assets(target,asset_type,scope_status,discovery_source,first_seen,last_seen,notes,organization_id)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (target, "subdomain", "needs_review", result["source"], timestamp, timestamp,
+                 "Passive " + result["source"] + " candidate; verify ownership and scope before scanning.", root["organization_id"]),
             )
+            record_asset_event(conn, inserted.lastrowid, "passive_discovery", "Candidate discovered via " + result["source"], {
+                "source": result["source"], "root_asset_id": asset_id, "scope_status": "needs_review",
+            })
             created += 1
-    return {"root_asset_id": asset_id, "source": "crt.sh", "candidates_found": len(candidates),
+    run_id = persist_discovery_run(asset_id, result, candidate_count=len(candidates), new_assets_added=created)
+    return {"root_asset_id": asset_id, "run_id": run_id, "source": result["source"],
+            "source_status": result["status"], "started_at": result["started_at"],
+            "finished_at": result["finished_at"], "candidates_found": len(candidates),
             "new_assets_added": created, "scope_status": "needs_review",
-            "scans_started": 0, "message": "Candidates were added for review only; no hosts were contacted or scanned."}
+            "limit_metadata": result["limit_metadata"], "scans_started": 0,
+            "message": "Candidates were added for review only; no hosts were contacted or scanned."}
+
+
+@app.get("/api/assets/{asset_id}/events")
+def list_asset_events(asset_id: int):
+    with connect() as conn:
+        if not conn.execute("SELECT 1 FROM assets WHERE id=?", (asset_id,)).fetchone():
+            raise HTTPException(404, "Asset not found")
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM asset_events WHERE asset_id=? ORDER BY id DESC LIMIT 100", (asset_id,)
+        )]
+
+
+@app.post("/api/assets/{asset_id}/resolve")
+def resolve_asset_dns(asset_id: int, request: AssetResolveRequest):
+    """Explicit, bounded DNS inventory action. Does not probe HTTP/TLS or launch scans."""
+    if not request.authorized:
+        raise HTTPException(400, "Confirm you are authorized to resolve this asset's DNS records.")
+    with connect() as conn:
+        asset = conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+        if not asset:
+            raise HTTPException(404, "Asset not found")
+        org = conn.execute("SELECT root_domain FROM organizations WHERE id=?", (asset["organization_id"],)).fetchone() if asset["organization_id"] else None
+    parsed = urlparse(asset["target"])
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if not valid_dns_name(hostname) or "." not in hostname or re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", hostname):
+        raise HTTPException(400, "DNS resolution requires a fully qualified DNS hostname, not an IP or local name.")
+    if asset["discovery_source"] != "manual" and (not org or not (hostname == org["root_domain"] or hostname.endswith("." + org["root_domain"]))):
+        raise HTTPException(403, "Discovered candidates must be linked to a registered organization root before DNS resolution.")
+    checked = now()
+    status, addresses, error = "no_records", [], ""
+    future = DNS_RESOLVER_POOL.submit(socket.getaddrinfo, hostname, None, 0, socket.SOCK_STREAM)
+    try:
+        records = future.result(timeout=request.timeout_seconds)
+        addresses = sorted({str(record[4][0]) for record in records if record and len(record) > 4 and record[4]})
+        status = "resolved" if addresses else "no_records"
+    except Exception as exc:
+        future.cancel()
+        if isinstance(exc, TimeoutError):
+            status, error = "timeout", f"DNS lookup exceeded {request.timeout_seconds}s"
+        elif isinstance(exc, socket.gaierror):
+            status, error = "no_records", str(exc)[:300]
+        else:
+            status, error = "error", f"{type(exc).__name__}: {str(exc)[:250]}"
+    with connect() as conn:
+        conn.execute("UPDATE assets SET resolution_status=?,resolved_addresses_json=?,resolution_checked_at=?,resolution_error=?,last_seen=? WHERE id=?",
+                     (status, json.dumps(addresses), checked, error, checked, asset_id))
+        record_asset_event(conn, asset_id, "dns_resolution", "DNS inventory lookup completed", {
+            "status": status, "address_count": len(addresses), "error": error,
+        })
+    return {"asset_id": asset_id, "hostname": hostname, "resolution_status": status,
+            "addresses": addresses, "checked_at": checked, "error": error,
+            "http_probes_started": 0, "tls_checks_started": 0, "scans_started": 0}
 
 
 @app.post("/api/scans")
@@ -1560,11 +2253,7 @@ def create_scan(request: ScanRequest):
             continue
         if hostname == registered_host and port == registered_port and asset["scope_status"] != "in_scope":
             raise HTTPException(403, "This target is marked " + asset["scope_status"].replace("_", " ") + " in Asset Inventory. Review its scope before scanning.")
-    with connect() as conn:
-        active_scans = running_scan_count(conn)
-    limit = max_concurrent_scans()
-    if active_scans >= limit:
-        raise HTTPException(429, f"Scanner capacity reached ({active_scans}/{limit} assessments running). Wait for a scan to finish before starting another.")
+    # start_scan performs the authoritative, atomic capacity check and stale-worker recovery.
     scan_id = start_scan(target, request.profile)
     return {
         "id": scan_id, "status": "running", "profile": request.profile,
@@ -1576,6 +2265,20 @@ def create_scan(request: ScanRequest):
 def list_scans():
     with connect() as conn:
         return [dict(row) for row in conn.execute("SELECT * FROM scans ORDER BY id DESC")]
+
+
+@app.get("/api/scans/{scan_id}/activity")
+def get_scan_activity(scan_id: int, after_id: int = 0, limit: int = 100):
+    """Return persisted timeline events for a single scan, newest events last."""
+    limit = max(1, min(int(limit), 200))
+    with connect() as conn:
+        if not conn.execute("SELECT id FROM scans WHERE id=?", (scan_id,)).fetchone():
+            raise HTTPException(404, "Scan not found.")
+        rows = conn.execute(
+            "SELECT id,category,status,stage,message,created_at FROM scanner_activity WHERE scan_id=? AND id>? ORDER BY id ASC LIMIT ?",
+            (scan_id, max(0, int(after_id)), limit),
+        ).fetchall()
+    return {"events": [dict(row) for row in rows]}
 
 
 @app.get("/api/scans/{scan_id}")
@@ -1716,7 +2419,7 @@ def safe_csv_cell(value):
     """Prevent spreadsheet apps from interpreting untrusted finding text as formulas."""
     if not isinstance(value, str):
         return value
-    significant = value.lstrip(" \\t\\r\\n")
+    significant = value.lstrip(" \\t\\r\n")
     if significant.startswith(("=", "+", "-", "@", "\\t", "\\r")):
         return "'" + value
     return value
@@ -1857,14 +2560,78 @@ def delete_schedule(schedule_id: int):
 
 # Scanner-tool management is deliberately allow-listed. No user-supplied shell commands.
 TOOL_CATALOG = {
-    "curl": {"label": "curl", "binary": "curl", "package": "curl", "version_args": ["--version"], "purpose": "HTTP connectivity and endpoint diagnostics"},
-    "zaproxy": {"label": "OWASP ZAP", "binary": "zaproxy", "package": "zaproxy", "version_args": ["-version"], "purpose": "Web crawler and passive security scanner"},
-    "whatweb": {"label": "WhatWeb", "binary": "whatweb", "package": "whatweb", "version_args": ["--version"], "purpose": "Technology fingerprinting"},
-    "testssl": {"label": "testssl.sh", "binary": "testssl.sh", "package": "testssl.sh", "version_args": ["--version"], "purpose": "TLS and HTTPS configuration assessment"},
-    "nuclei": {"label": "Nuclei", "binary": "nuclei", "package": "nuclei", "version_args": ["-version"], "purpose": "Template-based checks for known exposures and misconfigurations"},
-    "nikto": {"label": "Nikto", "binary": "nikto", "package": "nikto", "version_args": ["-Version"], "purpose": "Deep-profile checks for common web-server files and misconfigurations"},
-    "wapiti": {"label": "Wapiti", "binary": "wapiti", "package": "wapiti", "version_args": ["--version"], "purpose": "Explicitly approved active tests for web-application vulnerabilities"},
+    # Existing scanner integrations. A registered tool is not necessarily run in every profile.
+    "curl": {"label": "curl", "binary": "curl", "package": "curl", "version_args": ["--version"], "purpose": "HTTP connectivity and endpoint diagnostics", "capabilities": ["http_diagnostics"], "risk": "passive", "integration": "integrated", "installable": True},
+    "zaproxy": {"label": "OWASP ZAP", "binary": "zaproxy", "package": "zaproxy", "version_args": ["-version"], "purpose": "Web application security rules and passive alerts", "capabilities": ["web_app", "passive_checks", "api_security"], "risk": "passive_by_default", "integration": "integrated", "installable": True},
+    "whatweb": {"label": "WhatWeb", "binary": "whatweb", "package": "whatweb", "version_args": ["--version"], "purpose": "Technology fingerprinting", "capabilities": ["technology_fingerprinting", "cms_detection"], "risk": "passive", "integration": "integrated", "installable": True},
+    "testssl": {"label": "testssl.sh", "binary": "testssl.sh", "package": "testssl.sh", "version_args": ["--version"], "purpose": "TLS and HTTPS configuration assessment", "capabilities": ["tls", "https_configuration"], "risk": "low_impact", "integration": "integrated", "installable": True},
+    "nuclei": {"label": "Nuclei", "binary": "nuclei", "package": "nuclei", "version_args": ["-version"], "purpose": "Template-based checks for known exposures and misconfigurations", "capabilities": ["known_vulnerabilities", "misconfiguration", "exposure_detection"], "risk": "curated_templates_only", "integration": "integrated", "installable": True},
+    "nikto": {"label": "Nikto", "binary": "nikto", "package": "nikto", "version_args": ["-Version"], "purpose": "Web-server files and misconfiguration checks", "capabilities": ["web_server", "exposed_files", "misconfiguration"], "risk": "low_to_moderate_request_volume", "integration": "integrated_deep_profile", "installable": True},
+    "wapiti": {"label": "Wapiti", "binary": "wapiti", "package": "wapiti", "version_args": ["--version"], "purpose": "Active web-application vulnerability tests", "capabilities": ["web_app_active", "injection_testing"], "risk": "active_requires_approval", "integration": "explicit_active_profile", "installable": True},
+    # Expanded Kali inventory. These are capability candidates, not a claim that the scan runner invokes them yet.
+    "nmap": {"label": "Nmap", "binary": "nmap", "package": "nmap", "version_args": ["--version"], "purpose": "Network/service discovery for explicitly scoped hosts", "capabilities": ["service_discovery", "network_exposure"], "risk": "network_scope_required", "integration": "inventory_only", "installable": True},
+    "httpx": {"label": "ProjectDiscovery httpx", "binary": "httpx", "package": None, "version_args": ["-version"], "purpose": "HTTP service probing and metadata enrichment", "capabilities": ["http_probing", "technology_enrichment"], "risk": "low_impact_scoped_probe", "integration": "inventory_only", "installable": False, "install_note": "Package name conflicts with other software; install only through a verified ProjectDiscovery-specific method."},
+    "katana": {"label": "Katana", "binary": "katana", "package": "katana", "version_args": ["-version"], "purpose": "Endpoint discovery and crawling", "capabilities": ["endpoint_discovery"], "risk": "crawl_scope_and_rate_limits_required", "integration": "inventory_only", "installable": True},
+    "ffuf": {"label": "FFUF", "binary": "ffuf", "package": "ffuf", "version_args": ["-V"], "purpose": "Content discovery and fuzzing", "capabilities": ["content_discovery", "fuzzing"], "risk": "active_high_request_volume", "integration": "inventory_only", "installable": True},
+    "dirsearch": {"label": "Dirsearch", "binary": "dirsearch", "package": "dirsearch", "version_args": ["--version"], "purpose": "Web path and content discovery", "capabilities": ["content_discovery", "exposed_files"], "risk": "active_high_request_volume", "integration": "inventory_only", "installable": True},
+    "gobuster": {"label": "Gobuster", "binary": "gobuster", "package": "gobuster", "version_args": ["version"], "purpose": "Directory and DNS discovery", "capabilities": ["content_discovery", "dns_discovery"], "risk": "active_scope_and_rate_limits_required", "integration": "inventory_only", "installable": True},
+    "feroxbuster": {"label": "Feroxbuster", "binary": "feroxbuster", "package": "feroxbuster", "version_args": ["--version"], "purpose": "Recursive content discovery", "capabilities": ["content_discovery", "exposed_files"], "risk": "active_high_request_volume", "integration": "inventory_only", "installable": True},
+    "sqlmap": {"label": "sqlmap", "binary": "sqlmap", "package": "sqlmap", "version_args": ["--version"], "purpose": "Specialized SQL injection testing", "capabilities": ["sql_injection"], "risk": "intrusive_requires_explicit_approval", "integration": "manual_only", "installable": True},
+    "wpscan": {"label": "WPScan", "binary": "wpscan", "package": "wpscan", "version_args": ["--version"], "purpose": "WordPress detection and vulnerability checks", "capabilities": ["wordpress", "cms_vulnerabilities", "plugin_theme_inventory"], "risk": "scoped_checks_api_token_may_be_needed", "integration": "inventory_only", "installable": True},
+    "dalfox": {"label": "Dalfox", "binary": "dalfox", "package": "dalfox", "version_args": ["version"], "purpose": "Specialized XSS detection and verification", "capabilities": ["xss_testing", "parameter_testing"], "risk": "active_payloads_requires_explicit_approval", "integration": "manual_only", "installable": True},
+    "arjun": {"label": "Arjun", "binary": "arjun", "package": "arjun", "version_args": ["--version"], "purpose": "HTTP parameter discovery for web and API endpoints", "capabilities": ["api_parameter_discovery", "endpoint_discovery"], "risk": "active_parameter_probing_requires_scope_limits", "integration": "inventory_only", "installable": True},
+    "commix": {"label": "Commix", "binary": "commix", "package": "commix", "version_args": ["--version"], "purpose": "Specialized command-injection testing", "capabilities": ["command_injection"], "risk": "intrusive_requires_explicit_approval", "integration": "manual_only", "installable": True},
+    "joomscan": {"label": "JoomScan", "binary": "joomscan", "package": "joomscan", "version_args": ["--version"], "purpose": "Joomla CMS vulnerability and exposure checks", "capabilities": ["joomla", "cms_vulnerabilities"], "risk": "scoped_checks_required", "integration": "inventory_only", "installable": True},
+    "wafw00f": {"label": "WAFW00F", "binary": "wafw00f", "package": "wafw00f", "version_args": ["--version"], "purpose": "Heuristic web application firewall detection", "capabilities": ["waf_detection", "technology_fingerprinting"], "risk": "low_impact_heuristic", "integration": "inventory_only", "installable": True},
+    "gitleaks": {"label": "Gitleaks", "binary": "gitleaks", "package": "gitleaks", "version_args": ["version"], "purpose": "Secret scanning for explicitly supplied local repositories", "capabilities": ["secret_scanning", "repository_security"], "risk": "local_files_only_no_remote_repo_clone_by_default", "integration": "inventory_only", "installable": True},
+    "sslscan": {"label": "sslscan", "binary": "sslscan", "package": "sslscan", "version_args": ["--version"], "purpose": "TLS protocol and certificate configuration checks", "capabilities": ["tls", "certificate_checks"], "risk": "low_impact", "integration": "inventory_only", "installable": True},
+    "amass": {"label": "OWASP Amass", "binary": "amass", "package": "amass", "version_args": ["-version"], "purpose": "Asset and subdomain discovery", "capabilities": ["asset_discovery", "dns_discovery"], "risk": "recon_scope_required", "integration": "inventory_only", "installable": True},
+    "subfinder": {"label": "Subfinder", "binary": "subfinder", "package": "subfinder", "version_args": ["-version"], "purpose": "Passive subdomain discovery", "capabilities": ["asset_discovery", "passive_recon"], "risk": "passive_but_scope_review_required", "integration": "inventory_only", "installable": True},
+    "dnsx": {"label": "DNSx", "binary": "dnsx", "package": "dnsx", "version_args": ["-version"], "purpose": "DNS resolution and record checks", "capabilities": ["dns_discovery", "asset_validation"], "risk": "low_impact_scoped_dns", "integration": "inventory_only", "installable": True},
 }
+
+TOOL_CAPABILITY_DESCRIPTIONS = {
+    "http_diagnostics": "HTTP connectivity and response diagnostics",
+    "web_app": "Web application security checks",
+    "passive_checks": "Passive checks that do not submit attack payloads",
+    "api_security": "API and web application security signals",
+    "technology_fingerprinting": "Identify frameworks, servers and libraries",
+    "cms_detection": "Identify content management systems",
+    "tls": "TLS and HTTPS configuration",
+    "https_configuration": "HTTPS response and transport configuration",
+    "known_vulnerabilities": "Template-based checks for known vulnerability patterns",
+    "misconfiguration": "Security misconfiguration checks",
+    "exposure_detection": "Detect exposed services, files and panels",
+    "web_server": "Web-server security checks",
+    "exposed_files": "Check for potentially exposed files and paths",
+    "web_app_active": "Active web-application testing",
+    "injection_testing": "Injection testing; requires approved profile",
+    "service_discovery": "Discover services on explicitly authorized hosts",
+    "network_exposure": "Network service exposure signals",
+    "http_probing": "HTTP service metadata and status checks",
+    "technology_enrichment": "Enrich detected web technology information",
+    "endpoint_discovery": "Discover same-origin application endpoints",
+    "content_discovery": "Discover web paths and content",
+    "fuzzing": "Payload/path fuzzing; not a default action",
+    "dns_discovery": "DNS and subdomain discovery",
+    "sql_injection": "Specialized SQL injection assessment; explicit approval required",
+    "wordpress": "WordPress-specific checks",
+    "cms_vulnerabilities": "CMS, plugin and theme vulnerability checks",
+    "plugin_theme_inventory": "Inventory CMS plugins and themes",
+    "xss_testing": "Cross-site scripting tests; explicit approval required",
+    "parameter_testing": "Parameter discovery and validation",
+    "api_parameter_discovery": "Discover potential HTTP/API parameters",
+    "command_injection": "Command-injection tests; intrusive and approval-gated",
+    "joomla": "Joomla CMS-specific checks",
+    "waf_detection": "Heuristic WAF presence detection, not proof of protection",
+    "secret_scanning": "Detect likely secrets in explicitly supplied local files",
+    "repository_security": "Static repository security checks",
+    "certificate_checks": "Certificate and TLS checks",
+    "asset_discovery": "Asset discovery requiring scope review",
+    "passive_recon": "Passive reconnaissance signals",
+    "asset_validation": "Validate discovered DNS assets",
+}
+
 
 
 def _tool_version(tool: dict) -> str | None:
@@ -1881,16 +2648,33 @@ def _tool_version(tool: dict) -> str | None:
 
 
 def scanner_tools_status() -> list[dict]:
+    # Version commands are independent; run a bounded number concurrently so a
+    # slow or noisy tool cannot serialize the entire inventory page load.
+    candidates = [(key, spec, shutil.which(spec["binary"])) for key, spec in TOOL_CATALOG.items()]
+    installed = [(key, spec, path) for key, spec, path in candidates if path]
+    versions = {}
+    if installed:
+        with ThreadPoolExecutor(max_workers=min(8, len(installed)), thread_name_prefix="tool-version") as pool:
+            futures = {key: pool.submit(_tool_version, spec) for key, spec, _ in installed}
+            for key, future in futures.items():
+                try:
+                    versions[key] = future.result(timeout=5)
+                except Exception:
+                    versions[key] = None
     tools = []
-    for key, spec in TOOL_CATALOG.items():
-        path = shutil.which(spec["binary"])
-        version = _tool_version(spec) if path else None
+    for key, spec, path in candidates:
+        version = versions.get(key) if path else None
         tools.append({
             "id": key, "name": spec["label"], "purpose": spec["purpose"],
             "installed": bool(path), "status": "ready" if path and version else ("installed_check_failed" if path else "missing"),
             "path": path, "version": version,
-            "install_method": "Kali/Debian package manager",
-            "package": spec["package"],
+            "install_method": "Kali/Debian package manager" if spec.get("installable") and spec.get("package") else "verified method required",
+            "package": spec.get("package"),
+            "installable": bool(spec.get("installable") and spec.get("package")),
+            "install_note": spec.get("install_note", ""),
+            "capabilities": spec.get("capabilities", []),
+            "risk": spec.get("risk", "review_required"),
+            "integration": spec.get("integration", "inventory_only"),
         })
     # ZAP executable and API are separate checks; an unrelated service on its port is not ZAP.
     zap_api = diagnose_zap_api()
@@ -1915,11 +2699,68 @@ class ToolInstallRequest(BaseModel):
 
 @app.get("/api/tools")
 def list_tools():
+    tools = scanner_tools_status()
+    capability_map = {}
+    for item in tools:
+        for capability in item.get("capabilities", []):
+            capability_map.setdefault(capability, []).append({
+                "tool_id": item["id"], "name": item["name"],
+                "installed": item["installed"], "integration": item["integration"],
+                "risk": item["risk"],
+            })
     return {
-        "tools": scanner_tools_status(),
-        "install_supported": bool(shutil.which("pkexec")),
-        "note": "Status is verified from executable/version checks. Installs are limited to the fixed package allow-list and require explicit approval.",
+        "tools": tools,
+        "install_supported": bool(shutil.which("pkexec") and shutil.which("apt-get")),
+        "capabilities": TOOL_CAPABILITY_DESCRIPTIONS,
+        "capability_map": capability_map,
+        "inventory_count": len(tools),
+        "installed_count": sum(1 for item in tools if item["installed"]),
+        "note": "Capability inventory covers curated web-security and supporting tools. Inventory-only tools are not automatically executed by scan profiles. Package installs use a fixed allow-list and require explicit local approval.",
     }
+
+
+def update_install_job(job_id: int, status: str, stage: str, message: str, finished: bool = False) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE install_jobs SET status=?,stage=?,message=?,updated_at=?,finished_at=? WHERE id=?",
+            (status, stage[:160], message[:800], now(), now() if finished else None, job_id),
+        )
+
+
+def run_install_job(job_id: int, tool_id: str) -> None:
+    spec = TOOL_CATALOG[tool_id]
+    try:
+        update_install_job(job_id, "running", "Checking prerequisites", "Checking package manager and executable status.")
+        if shutil.which(spec["binary"]):
+            update_install_job(job_id, "completed", "Already installed", f"{spec['label']} is already installed and executable.", True)
+            return
+        pkexec, apt = shutil.which("pkexec"), shutil.which("apt-get")
+        if not pkexec or not apt:
+            update_install_job(job_id, "failed", "Manual installation required",
+                               f"Automatic installation is unavailable. On Kali, run: sudo apt update && sudo apt install {spec['package']}", True)
+            return
+        update_install_job(job_id, "running", "Waiting for administrator approval",
+                           "The package manager will request local administrator authentication if needed.")
+        result = subprocess.run(
+            [pkexec, apt, "install", "-y", "--no-install-recommends", spec["package"]],
+            capture_output=True, text=True, timeout=240, check=False,
+        )
+        if result.returncode != 0:
+            # Do not send raw package output to the UI; it can contain environment details.
+            detail = (result.stderr or result.stdout or "Package installation failed").strip().splitlines()[-1:]
+            message = (detail[0][:500] if detail else "Package installation failed")
+            update_install_job(job_id, "failed", "Installation failed", message, True)
+            return
+        update_install_job(job_id, "running", "Verifying installation", "Installation command completed; checking the executable and version.")
+        statuses = scanner_tools_status()
+        installed = next((item for item in statuses if item["id"] == tool_id), None)
+        ok = bool(installed and installed.get("installed"))
+        update_install_job(job_id, "completed" if ok else "failed", "Installation verified" if ok else "Verification failed",
+                           f"{spec['label']} {'is installed and verified.' if ok else 'could not be verified after installation.'}", True)
+    except subprocess.TimeoutExpired:
+        update_install_job(job_id, "failed", "Timed out", "Package installation exceeded 240 seconds. Check the package manager before retrying.", True)
+    except Exception:
+        update_install_job(job_id, "failed", "Installation error", "Installation could not be completed. Check the local package manager logs.", True)
 
 
 @app.post("/api/tools/install/{tool_id}")
@@ -1928,34 +2769,28 @@ def install_tool(tool_id: str, request: ToolInstallRequest, client: FastAPIReque
         raise HTTPException(404, "Tool is not in the approved installer allow-list.")
     if not request.approved:
         raise HTTPException(400, "Explicit installation approval is required.")
-    # Never allow remote callers to trigger privileged package operations.
     if client.client.host not in {"127.0.0.1", "::1", "testclient"}:
         raise HTTPException(403, "Tool installation is available only from the local machine.")
     spec = TOOL_CATALOG[tool_id]
-    if shutil.which(spec["binary"]):
-        return {"ok": True, "message": f"{spec['label']} is already installed.", "tools": scanner_tools_status()}
-    pkexec = shutil.which("pkexec")
-    apt = shutil.which("apt-get")
-    if not pkexec or not apt:
-        return {
-            "ok": False,
-            "message": f"Automatic installation is unavailable. On Kali, run: sudo apt update && sudo apt install {spec['package']}",
-            "manual_command": f"sudo apt update && sudo apt install {spec['package']}",
-        }
-    try:
-        result = subprocess.run(
-            [pkexec, apt, "install", "-y", "--no-install-recommends", spec["package"]],
-            capture_output=True, text=True, timeout=240, check=False,
+    if not spec.get("installable") or not spec.get("package"):
+        raise HTTPException(400, spec.get("install_note") or "No verified package installation method is configured for this tool.")
+    with connect() as conn:
+        active = conn.execute("SELECT id FROM install_jobs WHERE status='running' ORDER BY id DESC LIMIT 1").fetchone()
+        if active:
+            raise HTTPException(409, "Another tool installation is already running. Wait for it to finish before starting another.")
+        cursor = conn.execute(
+            "INSERT INTO install_jobs(tool_id,tool_name,status,stage,message,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            (tool_id, spec['label'], 'running', 'Queued', 'Installation job queued; preparing package manager.', now(), now()),
         )
-    except subprocess.TimeoutExpired:
-        raise HTTPException(504, "Package installation timed out. Check the package manager before retrying.")
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "Package installation failed").strip()[-1200:]
-        return {"ok": False, "message": detail, "tools": scanner_tools_status()}
-    statuses = scanner_tools_status()
-    installed = next((t for t in statuses if t["id"] == tool_id), None)
-    return {
-        "ok": bool(installed and installed["installed"]),
-        "message": "Installation command completed; executable status was checked again.",
-        "tools": statuses,
-    }
+        job_id = cursor.lastrowid
+    threading.Thread(target=run_install_job, args=(job_id, tool_id), daemon=True).start()
+    return {"job_id": job_id, "tool_id": tool_id, "status": "running", "stage": "Queued", "message": "Installation job started."}
+
+
+@app.get("/api/tools/install-jobs/{job_id}")
+def get_install_job(job_id: int):
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM install_jobs WHERE id=?", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Installation job not found.")
+    return dict(row)
