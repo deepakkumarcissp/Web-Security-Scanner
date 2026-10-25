@@ -186,13 +186,16 @@
       ],
       "evidence": [
         "tests/test_wapiti_vulnerability_signals.py",
+        "tests/test_juice_shop_sqli_benchmark.py",
+        "scripts/benchmark_juice_shop_sqli.py",
         "LOCAL_DETECTION_BENCHMARK.md"
       ],
       "known_gaps": [
-        "Parser normalization has regression coverage, but the direct Wapiti run against the local simulated-error fixture found no SQLi vulnerability; its HTTP 500 is not a confirmed SQLi signal.",
-        "A bounded unauthenticated Wapiti run against the local Juice Shop lab found no SQLi signal; it did not demonstrate coverage of a known vulnerable SQLi input."
+        "Parser normalization has regression coverage, but direct Wapiti and the DKCISSP adapter have not produced a confirmed SQLi finding from the known expected-positive API behavior.",
+        "A bounded sqlmap JSON API test also missed the behavior; HTTP 500 anomalies are not counted as SQLi detections.",
+        "The benchmark oracle confirms the expected behavior in the training lab but is not itself a scanner detector."
       ],
-      "next_action": "Create or configure a database-backed loopback-only expected-positive SQLi benchmark, then verify both direct Wapiti and the DKCISSP adapter against that known input."
+      "next_action": "Implement and validate an API-aware SQLi detector against the known loopback expected-positive case, with a negative control and strict same-origin scope checks."
     },
     {
       "id": "cross-site-scripting",

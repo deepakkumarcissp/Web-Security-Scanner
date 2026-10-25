@@ -82,3 +82,16 @@ The current DKCISSP Wapiti adapter crawls pages and query/form parameters; it do
 A temporary OpenAPI 3.0 specification describing the Juice Shop login endpoint was created under `/tmp` and used with Wapiti's `--swagger` option. The targeted run did send an `application/json` POST to `/rest/user/login`, confirming that Wapiti can exercise this endpoint when given an API schema. It again logged an HTTP 500 anomaly for a generated malformed-input request and reported no SQL Injection or Blind SQL Injection finding. The same result occurred when scope was narrowed to the login URL. Temporary specifications, reports, and session databases were kept outside the repository.
 
 This narrows the gap further: OpenAPI can provide JSON endpoint coverage, but the generic Wapiti SQL module still did not detect the manually demonstrated boolean-based login bypass in this test. The adapter also does not expose the OpenAPI option today. Before adding API support to the product, build an automated expected-positive benchmark using the known boolean-based behavior and verify which detector can reliably distinguish the bypass from the invalid-credentials control. Do not treat a malformed-input 500 as proof of SQLi detection.
+
+
+## Repeatable Juice Shop API expected-positive oracle
+
+A loopback-only benchmark harness is now available at `scripts/benchmark_juice_shop_sqli.py`. Run it while the local Juice Shop training app is available on port 1003:
+
+    python3 scripts/benchmark_juice_shop_sqli.py
+
+The script sends a normal invalid-login control and a known boolean-based injection test to `POST /rest/user/login`. It only accepts plain HTTP loopback base URLs, suppresses response tokens, and exits non-zero if the control/test behavior does not match expectations. Unit tests verify loopback enforcement, expected-positive classification, token suppression, and that a generic HTTP 500 is not counted as a hit.
+
+Observed result on 2026-10-25: control returned HTTP 401 with the invalid-credentials response; test returned HTTP 200 with an authentication response. The oracle passed. This proves a repeatable expected-positive behavior exists in the local training app, but it does not mean a scanner detected it.
+
+A bounded sqlmap 1.10.8 run against the JSON endpoint (parameter `email`, boolean-based technique, level 2, risk 1, one thread, five-second timeout, no retries) did not identify the parameter as injectable and recorded HTTP 401/500 responses. Wapiti's OpenAPI-driven JSON attempt likewise produced a malformed-input HTTP 500 anomaly but no confirmed SQLi finding. The detection-engine benchmark therefore still fails its expected-positive assertion: the oracle works, but neither tested tool has yet detected the known behavior. SQLi remains **unverified** in the product coverage matrix.

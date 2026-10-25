@@ -39,7 +39,7 @@ Direct Wapiti 3.2.10 against the loopback fixture crawled 5 pages and reported o
 
 The DKCISSP Wapiti adapter was then run against the same loopback fixture. It completed with return code 0, crawled 5 pages, and normalized one finding: `Wapiti: Reflected Cross Site Scripting` on `/search`, parameter `q`. No SQLi finding was normalized. This confirms the narrow reflected-XSS path through the adapter, not broad XSS coverage.
 
-A separate bounded direct Wapiti 3.2.10 SQL-only run against local Juice Shop at `http://127.0.0.1:1003/` used a fresh session and crawled 18 pages. It reported zero SQL Injection and zero Blind SQL Injection findings, with zero SQL-related anomalies. This is a negative result for that unauthenticated crawl; it did not demonstrate coverage of a known vulnerable SQLi input.
+A separate bounded direct Wapiti 3.2.10 SQL-only run against local Juice Shop at `http://127.0.0.1:1003/` used a fresh session and crawled 18 pages. It reported zero SQL Injection and zero Blind SQL Injection findings, with zero SQL-related anomalies. A new loopback-only oracle at `scripts/benchmark_juice_shop_sqli.py` now reproduces a known expected-positive login API behavior: an invalid-login control returns HTTP 401, while a boolean-based injection test returns HTTP 200 with an authentication response. This validates the benchmark oracle, not scanner detection. A targeted Wapiti OpenAPI JSON run and a bounded sqlmap 1.10.8 JSON run both failed to report confirmed SQLi. The expected-positive detector benchmark therefore currently fails, and SQLi remains unverified.
 
 Raw reports remain local-only:
 - `/tmp/dkcissp-wapiti-benchmark.json`
