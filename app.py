@@ -112,6 +112,16 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS organization_events(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                organization_id INTEGER NOT NULL,
+                event_at TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(organization_id) REFERENCES organizations(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_organization_events_org ON organization_events(organization_id, id DESC);
             CREATE TABLE IF NOT EXISTS discovery_runs(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 root_asset_id INTEGER NOT NULL,
@@ -136,6 +146,20 @@ def init_db() -> None:
                 FOREIGN KEY(asset_id) REFERENCES assets(id)
             );
             CREATE INDEX IF NOT EXISTS idx_asset_events_asset ON asset_events(asset_id, id DESC);
+            CREATE TABLE IF NOT EXISTS asset_snapshots(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                root_asset_id INTEGER NOT NULL,
+                discovery_run_id INTEGER NOT NULL,
+                asset_id INTEGER,
+                target TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('new','present','missing_from_source')),
+                observed_at TEXT NOT NULL,
+                FOREIGN KEY(root_asset_id) REFERENCES assets(id),
+                FOREIGN KEY(discovery_run_id) REFERENCES discovery_runs(id),
+                FOREIGN KEY(asset_id) REFERENCES assets(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_asset_snapshots_run ON asset_snapshots(discovery_run_id, id);
+            CREATE INDEX IF NOT EXISTS idx_asset_snapshots_root ON asset_snapshots(root_asset_id, id DESC);
             CREATE TABLE IF NOT EXISTS assets(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 target TEXT NOT NULL UNIQUE,
@@ -253,6 +277,12 @@ class AssetRequest(BaseModel):
     authorized: bool = False
     scope_status: str = Field(default="needs_review", pattern="^(in_scope|out_of_scope|needs_review)$")
     notes: str = Field(default="", max_length=1000)
+
+
+class AssetOrganizationUpdate(BaseModel):
+    authorized: bool = False
+    organization_id: int | None = Field(default=None, ge=1)
+    notes: str = Field(default="", max_length=500)
 
 
 class AssetScopeUpdate(BaseModel):
@@ -1710,8 +1740,14 @@ def create_organization(request: OrganizationRequest):
     with connect() as conn:
         existing = conn.execute("SELECT * FROM organizations WHERE root_domain=?", (root_domain,)).fetchone()
         if existing:
+            before = {key: existing[key] for key in ("name", "owner_contact", "notes")}
+            after = {"name": name, "owner_contact": request.owner_contact.strip(), "notes": request.notes.strip()}
             conn.execute("UPDATE organizations SET name=?,owner_contact=?,notes=?,updated_at=? WHERE id=?",
-                         (name, request.owner_contact.strip(), request.notes.strip(), timestamp, existing["id"]))
+                         (name, after["owner_contact"], after["notes"], timestamp, existing["id"]))
+            if before != after:
+                conn.execute("""INSERT INTO organization_events(organization_id,event_at,event_type,summary,details_json)
+                    VALUES(?,?,?,?,?)""", (existing["id"], timestamp, "organization_updated", "Organization details updated",
+                    json.dumps({"before": before, "after": after}, sort_keys=True)))
             row = conn.execute("SELECT * FROM organizations WHERE id=?", (existing["id"],)).fetchone()
             return {**dict(row), "created": False}
         try:
@@ -1721,6 +1757,9 @@ def create_organization(request: OrganizationRequest):
             )
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, "An organization with that name already exists; use its existing record or choose a unique name.") from exc
+        conn.execute("INSERT INTO organization_events(organization_id,event_at,event_type,summary,details_json) VALUES(?,?,?,?,?)",
+                     (cursor.lastrowid, timestamp, "organization_registered", "Organization/root domain registered",
+                      json.dumps({"root_domain": root_domain, "owner_contact": request.owner_contact.strip()}, sort_keys=True)))
         row = conn.execute("SELECT * FROM organizations WHERE id=?", (cursor.lastrowid,)).fetchone()
         return {**dict(row), "created": True}
 
@@ -1733,6 +1772,15 @@ def list_assets():
                FROM assets a LEFT JOIN organizations o ON o.id=a.organization_id
                ORDER BY a.last_seen DESC, a.id DESC"""
         )]
+
+
+@app.get("/api/organizations/{organization_id}/events")
+def list_organization_events(organization_id: int):
+    with connect() as conn:
+        if not conn.execute("SELECT 1 FROM organizations WHERE id=?", (organization_id,)).fetchone():
+            raise HTTPException(404, "Organization not found")
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM organization_events WHERE organization_id=? ORDER BY id DESC LIMIT 100", (organization_id,))]
 
 
 @app.post("/api/assets")
@@ -1789,6 +1837,34 @@ def create_asset(request: AssetRequest):
             "scope_status": request.scope_status, "discovery_source": "manual", "organization_id": organization_id,
         })
         return {**dict(row), "created": True}
+
+
+@app.patch("/api/assets/{asset_id}/organization")
+def update_asset_organization(asset_id: int, request: AssetOrganizationUpdate):
+    if not request.authorized:
+        raise HTTPException(400, "Confirm you are authorized to change asset ownership association.")
+    with connect() as conn:
+        asset = conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+        if not asset:
+            raise HTTPException(404, "Asset not found")
+        org = None
+        if request.organization_id is not None:
+            org = conn.execute("SELECT * FROM organizations WHERE id=?", (request.organization_id,)).fetchone()
+            if not org:
+                raise HTTPException(404, "Organization not found")
+            hostname = (urlparse(asset["target"]).hostname or "").lower().rstrip(".")
+            root = org["root_domain"].lower().rstrip(".")
+            if hostname != root and not hostname.endswith("." + root):
+                raise HTTPException(400, "Asset hostname must match the organization's exact root domain or a true subdomain label boundary.")
+        old_id = asset["organization_id"]
+        if old_id == request.organization_id:
+            return {"asset_id": asset_id, "organization_id": old_id, "changed": False}
+        conn.execute("UPDATE assets SET organization_id=?,last_seen=? WHERE id=?", (request.organization_id, now(), asset_id))
+        record_asset_event(conn, asset_id, "organization_reassigned", "Asset organization association changed", {
+            "from_organization_id": old_id, "to_organization_id": request.organization_id,
+            "reason": request.notes.strip(),
+        })
+        return {"asset_id": asset_id, "organization_id": request.organization_id, "changed": True}
 
 
 @app.patch("/api/assets/{asset_id}/scope")
@@ -1884,7 +1960,30 @@ def persist_discovery_run(root_asset_id: int, result: dict, candidate_count: int
             VALUES(?,?,?,?,?,?,?,?,?)""", (root_asset_id, result["source"], result["started_at"],
             result["finished_at"], result["status"], candidate_count, new_assets_added,
             error_summary[:500], json.dumps(result.get("limit_metadata", {}), sort_keys=True)))
-        return cur.lastrowid
+        run_id = cur.lastrowid
+        if result.get("status") == "completed":
+            previous = conn.execute("""SELECT id FROM discovery_runs WHERE root_asset_id=? AND source=? AND status='completed' AND id<?
+                ORDER BY id DESC LIMIT 1""", (root_asset_id, result["source"], run_id)).fetchone()
+            previous_targets = set()
+            if previous:
+                previous_targets = {row["target"] for row in conn.execute(
+                    "SELECT target FROM asset_snapshots WHERE discovery_run_id=? AND state IN ('new','present')", (previous["id"],))}
+            current_targets = {"https://" + host for host in result.get("candidates", [])}
+            for target in sorted(current_targets):
+                asset = conn.execute("SELECT id FROM assets WHERE target=?", (target,)).fetchone()
+                state = "present" if target in previous_targets else "new"
+                conn.execute("INSERT INTO asset_snapshots(root_asset_id,discovery_run_id,asset_id,target,state,observed_at) VALUES(?,?,?,?,?,?)",
+                    (root_asset_id, run_id, asset["id"] if asset else None, target, state, result["finished_at"]))
+                if state == "new" and previous:
+                    record_asset_event(conn, asset["id"], "discovery_new", "Asset newly observed in a successful discovery run", {"source": result["source"], "run_id": run_id})
+            missing_targets = previous_targets - current_targets
+            for target in sorted(missing_targets):
+                old = conn.execute("SELECT asset_id FROM asset_snapshots WHERE discovery_run_id=? AND target=? AND asset_id IS NOT NULL LIMIT 1", (previous["id"], target)).fetchone()
+                conn.execute("INSERT INTO asset_snapshots(root_asset_id,discovery_run_id,asset_id,target,state,observed_at) VALUES(?,?,?,?,?,?)",
+                    (root_asset_id, run_id, old["asset_id"] if old else None, target, "missing_from_source", result["finished_at"]))
+                if old and old["asset_id"]:
+                    record_asset_event(conn, old["asset_id"], "discovery_missing", "Asset absent from latest successful discovery result; not confirmed removed", {"source": result["source"], "run_id": run_id})
+        return run_id
 
 
 @app.get("/api/assets/{asset_id}/discovery-runs")
@@ -1894,6 +1993,15 @@ def list_asset_discovery_runs(asset_id: int):
             raise HTTPException(404, "Asset not found")
         return [dict(row) for row in conn.execute(
             "SELECT * FROM discovery_runs WHERE root_asset_id=? ORDER BY id DESC LIMIT 50", (asset_id,))]
+
+
+@app.get("/api/assets/{asset_id}/snapshots")
+def list_asset_snapshots(asset_id: int):
+    with connect() as conn:
+        if not conn.execute("SELECT 1 FROM assets WHERE id=?", (asset_id,)).fetchone():
+            raise HTTPException(404, "Asset not found")
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM asset_snapshots WHERE asset_id=? ORDER BY id DESC LIMIT 100", (asset_id,))]
 
 
 @app.post("/api/assets/{asset_id}/discover")

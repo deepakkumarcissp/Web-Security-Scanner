@@ -1758,3 +1758,52 @@ def test_asset_history_ui_is_exposed():
     assert response.status_code == 200
     assert "showAssetEvents" in response.text
     assert "Asset History" in response.text
+
+
+def test_asset_organization_reassignment_requires_auth_and_exact_domain():
+    from uuid import uuid4
+    first_domain = f"owner-a-{uuid4().hex}.example"
+    second_domain = f"owner-b-{uuid4().hex}.example"
+    first = client.post("/api/organizations", json={"name": f"Owner A {first_domain}", "root_domain": first_domain, "authorized": True}).json()
+    second = client.post("/api/organizations", json={"name": f"Owner B {second_domain}", "root_domain": second_domain, "authorized": True}).json()
+    asset = client.post("/api/assets", json={"target": f"https://api.{first_domain}", "organization_id": first["id"], "authorized": True}).json()
+    assert client.patch(f"/api/assets/{asset['id']}/organization", json={"organization_id": second["id"]}).status_code == 400
+    assert client.patch(f"/api/assets/{asset['id']}/organization", json={"organization_id": second["id"], "authorized": True}).status_code == 400
+    changed = client.patch(f"/api/assets/{asset['id']}/organization", json={"organization_id": None, "notes": "ownership review", "authorized": True})
+    assert changed.status_code == 200 and changed.json()["changed"] is True
+    assert any(e["event_type"] == "organization_reassigned" for e in client.get(f"/api/assets/{asset['id']}/events").json())
+
+
+def test_discovery_snapshots_compare_successful_runs_only(monkeypatch):
+    from uuid import uuid4
+    domain = f"snapshots-{uuid4().hex}.example"
+    org = client.post("/api/organizations", json={"name": f"Snapshots {domain}", "root_domain": domain, "authorized": True}).json()
+    root = client.post("/api/assets", json={"target": f"https://{domain}", "organization_id": org["id"], "scope_status": "in_scope", "authorized": True}).json()
+    current = {"items": [f"api.{domain}", f"login.{domain}"]}
+    monkeypatch.setattr(app, "query_certificate_transparency", lambda root_domain, max_results: list(current["items"]))
+    assert client.post(f"/api/assets/{root['id']}/discover", json={"authorized": True}).status_code == 200
+    current["items"] = [f"api.{domain}"]
+    assert client.post(f"/api/assets/{root['id']}/discover", json={"authorized": True}).status_code == 200
+    login = next(a for a in client.get("/api/assets").json() if a["target"] == f"https://login.{domain}")
+    snapshots = client.get(f"/api/assets/{login['id']}/snapshots").json()
+    assert any(row["state"] == "new" for row in snapshots)
+    assert any(row["state"] == "missing_from_source" for row in snapshots)
+    assert client.get("/api/assets/999999/snapshots").status_code == 404
+
+
+def test_organization_event_history_records_edits():
+    from uuid import uuid4
+    domain = f"org-events-{uuid4().hex}.example"
+    created = client.post("/api/organizations", json={"name": f"Org {domain}", "root_domain": domain, "owner_contact": "old@example.test", "authorized": True}).json()
+    updated = client.post("/api/organizations", json={"name": f"Org Updated {domain}", "root_domain": domain, "owner_contact": "new@example.test", "authorized": True})
+    assert updated.status_code == 200
+    assert any(row["event_type"] == "organization_updated" for row in client.get(f"/api/organizations/{created['id']}/events").json())
+
+
+def test_asset_ownership_and_snapshot_controls_are_exposed():
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "changeAssetOrganization" in response.text
+    assert "showAssetSnapshots" in response.text
+    assert "Save owner" in response.text
+    assert "Snapshots</button>" in response.text

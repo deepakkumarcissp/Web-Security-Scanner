@@ -29,7 +29,10 @@ The broader `assessments/domain_recon.py` also illustrates a wide enrichment cat
 - Dashboard organization/root-domain registration form, organization inventory table, optional organization selection during asset registration, organization-aware asset rows, posture metric cards, and client-side inventory filters for scope/DNS status.
 - Opt-in Certificate Transparency lookup for an approved DNS root, normalized through a source adapter contract (`source`, timestamps, status, candidates, errors, and limit metadata).
 - Persistent per-root discovery run history, including successful runs and source failures.
-- Append-only asset event history for manual registration, passive candidate discovery, scope/approval changes, and DNS resolution; latest 100 events are available per asset and surfaced in the dashboard.
+- Append-only asset event history for manual registration, passive candidate discovery, scope/approval changes, DNS resolution, and organization reassignment; latest 100 events are available per asset and surfaced in the dashboard.
+- Organization event history records registration and edits to organization name, owner contact, and notes.
+- Asset organization reassignment is an explicit, authorization-gated action that validates the selected root-domain boundary and records the change reason.
+- Successful passive discovery runs persist per-run asset snapshots and classify candidates as new/present or missing from the latest successful source result. A missing result is explicitly not treated as confirmed asset removal; failed source runs do not generate disappearance snapshots.
 - Explicit bounded DNS resolution action for registered, organization-linked discovered candidates; stores resolution status, deduplicated A/AAAA addresses, timestamp, and error without HTTP/TLS probing or scan launch.
 - Discovered subdomains enter `needs_review`; discovery starts zero scans.
 - Scope promotion for discovered assets requires an approval/change-ticket reference.
@@ -40,7 +43,7 @@ The broader `assessments/domain_recon.py` also illustrates a wide enrichment cat
 
 | Capability | Current scanner state | Recommended next step |
 |---|---|---|
-| Root organization/brand registry | Organization/root-domain API, management form, inventory table, asset association, and posture filters implemented | Extend audit coverage to organization edits, ownership changes, and asset reassignment |
+| Root organization/brand registry | Organization/root-domain API, management form, inventory table, asset association, and posture filters implemented | Extend audit coverage to asset owner contact changes, evidence attachment, and organization root-domain changes |
 | Subdomain sources | Opt-in `crt.sh` adapter with persisted per-run status and bounded metadata; no archive/subfinder source yet | Add optional passive archive adapter and explicitly invoked subfinder integration |
 | Candidate validation | Explicit bounded DNS resolution persists deduplicated addresses, status, timestamp, and errors; no HTTP/TLS fingerprinting | Add CNAME detail and separately approved low-impact fingerprinting |
 | HTTP/TLS fingerprint | Existing web checks happen during a scan | Add a low-impact, separately reported inventory fingerprint only after scope approval, with strict origin controls and verified TLS diagnostics |
@@ -89,7 +92,8 @@ The broader `assessments/domain_recon.py` also illustrates a wide enrichment cat
 - Track job and tool lifecycle, including errors, timeouts, partial output, and cancellations.
 
 ### EASM-5 — posture and trends
-- Snapshot assets and signals over time; report first seen, last seen, newly discovered, disappeared, changed, and unassessed.
+- [x] Snapshot successful discovery results over time and classify new/present/missing-from-source candidates without treating source failures as disappearance.
+- [ ] Extend snapshots to all inventory signals and report changed/unassessed assets with source freshness.
 - Use explainable prioritization: exposure, confidence/evidence, asset criticality when owner-supplied, and age—not an opaque score alone.
 - Export machine-readable inventory and executive/technical reports with coverage boundaries and per-source health.
 
