@@ -235,6 +235,12 @@ class _PageLinkParser(HTMLParser):
                 self.links.append(value.strip())
 
 
+def is_html_document(content_type: str) -> bool:
+    """Return whether response headers apply to a browser document rather than an asset."""
+    media_type = (content_type or "").split(";", 1)[0].strip().lower()
+    return media_type in {"text/html", "application/xhtml+xml"}
+
+
 def extract_same_origin_links(base_url: str, html: str) -> list[str]:
     """Return normalized HTTP(S) links on the exact same origin as base_url."""
     base = urlparse(base_url)
@@ -1172,6 +1178,10 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                         if page_final.scheme != root_parsed.scheme or page_final.hostname != root_parsed.hostname or page_port != root_port:
                             continue
                         page_headers = {k.lower(): v for k, v in page_response.headers.items()}
+                        # Document security policies should be assessed on HTML/XHTML
+                        # documents, not every linked JS, CSS, image, or favicon asset.
+                        if not is_html_document(page_headers.get("content-type", "")):
+                            continue
                         page_body = page_response.read(100_000).decode("utf-8", "replace")
                         page_url_final = page_response.geturl()
                     if page_url_final.startswith("https://") and "strict-transport-security" not in page_headers:

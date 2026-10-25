@@ -848,6 +848,15 @@ def test_zap_diagnostics_rejects_invalid_endpoint(monkeypatch):
     assert result["status"] == "configuration_error"
 
 
+def test_is_html_document_only_accepts_html_document_media_types():
+    assert app.is_html_document("text/html; charset=utf-8") is True
+    assert app.is_html_document("application/xhtml+xml") is True
+    assert app.is_html_document("text/css") is False
+    assert app.is_html_document("application/javascript") is False
+    assert app.is_html_document("image/x-icon") is False
+    assert app.is_html_document("") is False
+
+
 def test_endpoint_discovery_extracts_only_same_origin_http_urls():
     base = "https://app.example.test/home"
     html = '''<html><a href="/account">Account</a><a href="https://app.example.test/search?q=x#top">Search</a>
