@@ -141,3 +141,16 @@ The API operation discovery now resolves bounded local JSON Pointer references u
 ## SQLMap timeout and execution status accuracy
 
 The SQLMap adapter now distinguishes a full timeout (`timeout`), partial timeout (`partial_timeout`), complete execution failure (`error`), partial execution failure (`partial_error`), and normal completion (`completed`). Status includes counts for timed-out parameters and execution errors, rather than silently reporting completion when every parameter test times out. A regression test forces a timeout and asserts the adapter reports it accurately.
+
+
+## Repeatable DKCISSP adapter reflected-XSS benchmark
+
+Run from the repository root with Wapiti installed:
+
+```bash
+python3 scripts/run_local_xss_benchmark.py
+```
+
+The runner starts the existing deliberately vulnerable fixture on an ephemeral `127.0.0.1` port, verifies a clean query and a deterministic reflected-script oracle, runs the actual `app.perform_wapiti_check` adapter, prints sanitized JSON evidence, and shuts the fixture down in a `finally` block. Scanner SQLite state is redirected to a temporary directory. The benchmark exits non-zero if the oracle fails, the adapter does not complete, or the expected reflected-XSS finding is missing. It does not access the live scanner database or any external target.
+
+Observed result on 2026-10-25: oracle passed; Wapiti adapter completed with exit code 0; 5 pages crawled; one `Wapiti: Reflected Cross Site Scripting` finding on `/search`, parameter `q`; benchmark passed. This is a repeatable narrow reflected-XSS result, not evidence for stored XSS, DOM-based XSS, authenticated routes, or comprehensive XSS coverage. If Wapiti is missing, the runner reports failure rather than pretending the detector ran.
