@@ -159,19 +159,34 @@ Keep the terminal and application process running while using the dashboard and 
 8. Export findings as CSV when you need to share or analyze results.
 9. Keep scan scope, permissions, and the intended test intensity documented.
 
-### Use the DKCISSP local lab targets
+### Connect the scanner to the DKCISSP local lab
 
-The separate [DKCISSP Web Application Security Lab repository](https://github.com/deepakkumarcissp/Kali-Web-Application-Security-Lab) installs three intentionally vulnerable applications with one command. On Kali, follow that repository's README and run `./install.sh`. Once the lab is running, these local targets are available:
+The scanner and lab installer are separate repositories. The lab starts the targets; this project scans them.
 
-| Training target | URL |
+**Step 1 — Start the lab.** On the same Kali machine, follow the [DKCISSP Web Application Security Lab README](https://github.com/deepakkumarcissp/Kali-Web-Application-Security-Lab) and run:
+
+```bash
+git clone https://github.com/deepakkumarcissp/Kali-Web-Application-Security-Lab.git
+cd Kali-Web-Application-Security-Lab
+chmod +x install.sh lab.sh scenarios.sh
+./install.sh
+```
+
+Wait for the installer to finish its HTTP readiness checks. If you already cloned the repository, run `./lab.sh start` from its directory instead.
+
+**Step 2 — Start the scanner.** Follow this repository's installation instructions and open the scanner dashboard at `http://127.0.0.1:1005`.
+
+**Step 3 — Register and approve the assets.** Open **Asset Inventory** and register each exact local target URL you plan to test. Confirm authorization and set its scope to **In Scope**. The target selector does not register or approve assets for you.
+
+| Training target | URL to register |
 |---|---|
 | OWASP Juice Shop | `http://127.0.0.1:1003` |
 | DVWA | `http://127.0.0.1:1006` |
 | OWASP WebGoat | `http://127.0.0.1:1007/WebGoat` |
 
-On **Assess Website**, choose a target from the **DKCISSP Local Lab Target** selector. Then open **Asset Inventory**, register that exact URL with the authorization checkbox enabled, and select **In Scope** only for the local training targets you intend to test. Return to **Assess Website**, confirm the authorization checkbox, and start with **Standard** or a lower-impact profile. The selector fills the URL; it does not bypass scope enforcement or automatically approve assets.
+**Step 4 — Run a scan.** Open **Assess Website**, select the target from **DKCISSP Local Lab Target**, confirm the scan authorization checkbox, and start with **Quick** for a low-impact baseline or **Standard** for broader bounded discovery. Review findings and evidence in the dashboard, verify important results manually, and compare a later scan after remediation.
 
-These apps are deliberately vulnerable. Keep them bound to localhost, do not expose them to a LAN or the Internet, and do not use production credentials or data. The Active profile can submit payloads; use it only when explicitly approved and after understanding the possible impact.
+**Safety:** these applications are intentionally vulnerable. Keep their ports bound to `127.0.0.1`; do not expose them to a LAN or the Internet, and do not use production credentials or data. The **Active** profile can submit payloads and must only be used with explicit approval and an understanding of its potential impact.
 
 ## Scheduling
 
