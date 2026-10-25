@@ -877,7 +877,11 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
                 if item.get("curl-command"):
                     evidence_parts.append("Request details omitted from stored evidence for safety.")
                 remediation = str(info.get("remediation") or "Review the template evidence, validate applicability, and apply the vendor-recommended fix.")[:1800]
-                findings.append((severity, "Nuclei: " + title, matched_at, "; ".join(evidence_parts)[:1800], remediation, "Medium"))
+                # Confidence reflects the evidence actually emitted by Nuclei,
+                # not the template's severity label. A named matcher plus extracted
+                # response evidence is stronger than a bare template match.
+                confidence = "High" if matcher and isinstance(extracted, list) and any(str(x).strip() for x in extracted) else "Medium"
+                findings.append((severity, "Nuclei: " + title, matched_at, "; ".join(evidence_parts)[:1800], remediation, confidence))
 
     deduped = []
     seen = set()

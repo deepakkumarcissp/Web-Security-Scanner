@@ -298,8 +298,8 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
         assert kwargs["timeout"] == 60
         report_path = command[command.index("-jsonl-export") + 1]
         records = [
-            {"template-id": "tls-test", "matched-at": "https://example.test/", "info": {"name": "Weak TLS setting", "severity": "high", "remediation": "Enable secure TLS."}},
-            {"template-id": "tls-test", "matched-at": "https://example.test/", "info": {"name": "Weak TLS setting", "severity": "high", "remediation": "Enable secure TLS."}},
+            {"template-id": "tls-test", "matched-at": "https://example.test/", "matcher-name": "header-present", "extracted-results": ["strict-transport-security"], "info": {"name": "Weak TLS setting", "severity": "high", "remediation": "Enable secure TLS."}},
+            {"template-id": "tls-test", "matched-at": "https://example.test/", "matcher-name": "header-present", "extracted-results": ["strict-transport-security"], "info": {"name": "Weak TLS setting", "severity": "high", "remediation": "Enable secure TLS."}},
             {"template-id": "info-test", "matched-at": "https://example.test/", "info": {"name": "Banner info", "severity": "info"}},
         ]
         with open(report_path, "w", encoding="utf-8") as report_file:
@@ -322,6 +322,8 @@ def test_nuclei_parses_jsonl_with_safe_bounded_command(monkeypatch):
     assert status["interactsh_disabled"] is True
     assert findings[0][0] == "High"
     assert findings[0][1] == "Nuclei: Weak TLS setting"
+    assert findings[0][5] == "High"  # matcher plus extracted response evidence
+    assert findings[1][5] == "Medium"  # bare template match without strong response evidence
     assert "template-id" not in findings[0][3]
     assert all("curl-command" not in str(item) for item in findings)
 
