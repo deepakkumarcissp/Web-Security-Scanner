@@ -182,13 +182,21 @@ def require_in_scope_asset(target: str) -> dict:
 
 def validate_target(raw: str) -> str:
     raw = raw.strip()
-    if not raw.lower().startswith(("http://", "https://")):
-        raise HTTPException(400, "Target must start with http:// or https://")
-    parsed = urlparse(raw)
-    if not parsed.hostname or parsed.username or parsed.password:
-        raise HTTPException(400, "Invalid target URL")
     if any(ch in raw for ch in "\r\n\x00"):
         raise HTTPException(400, "Invalid URL characters")
+    if not raw.lower().startswith(("http://", "https://")):
+        raise HTTPException(400, "Target must start with http:// or https://")
+    try:
+        parsed = urlparse(raw)
+        # Accessing .port validates its syntax and numeric range; urlparse alone
+        # accepts malformed ports such as ':not-a-port' without raising.
+        port = parsed.port
+    except ValueError:
+        raise HTTPException(400, "Invalid target URL or port")
+    if (parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or (port is not None and not 1 <= port <= 65535)):
+        raise HTTPException(400, "Invalid target URL")
     return raw.rstrip("/")
 
 
@@ -248,8 +256,14 @@ class _SameOriginRedirectHandler(HTTPRedirectHandler):
         self.port = parsed.port or (443 if self.scheme == "https" else 80)
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        parsed = urlparse(newurl)
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            parsed = urlparse(newurl)
+            explicit_port = parsed.port
+        except ValueError:
+            return None
+        if parsed.username is not None or parsed.password is not None:
+            return None
+        port = explicit_port or (443 if parsed.scheme == "https" else 80)
         if (parsed.scheme.lower() != self.scheme or
                 (parsed.hostname or "").lower().rstrip(".") != self.hostname or port != self.port):
             return None

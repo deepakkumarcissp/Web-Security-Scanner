@@ -921,3 +921,58 @@ def test_zap_passive_unavailable_status_is_not_reported_as_success(monkeypatch):
     assert findings == []
     assert status["status"] == "api_unreachable"
     assert status["reason"] == "ZAP unavailable"
+
+
+def test_same_origin_redirect_handler_allows_only_exact_origin():
+    from urllib.request import Request
+
+    handler = app._SameOriginRedirectHandler("https://app.example.test/start")
+    request = Request("https://app.example.test/start")
+    headers = {}
+
+    same_host = handler.redirect_request(request, None, 302, "Found", headers, "https://app.example.test/next")
+    same_host_explicit_default_port = handler.redirect_request(request, None, 302, "Found", headers, "https://app.example.test:443/next")
+    assert same_host is not None
+    assert same_host_explicit_default_port is not None
+
+    assert handler.redirect_request(request, None, 302, "Found", headers, "https://evil.example.test/next") is None
+    assert handler.redirect_request(request, None, 302, "Found", headers, "http://app.example.test/next") is None
+    assert handler.redirect_request(request, None, 302, "Found", headers, "https://app.example.test:8443/next") is None
+    assert handler.redirect_request(request, None, 302, "Found", headers, "//evil.example.test/next") is None
+
+
+def test_same_origin_redirect_handler_normalizes_trailing_dot_hostname():
+    from urllib.request import Request
+
+    handler = app._SameOriginRedirectHandler("https://app.example.test/")
+    request = Request("https://app.example.test/")
+    allowed = handler.redirect_request(request, None, 301, "Moved", {}, "https://app.example.test./next")
+    assert allowed is not None
+
+
+def test_scan_rejects_malformed_or_out_of_range_target_ports():
+    for target in (
+        "http://example.test:not-a-port/",
+        "http://example.test:0/",
+        "https://example.test:65536/",
+    ):
+        response = client.post("/api/scans", json={
+            "target": target, "profile": "quick", "authorized": True,
+        })
+        assert response.status_code == 400, target
+
+
+def test_scan_rejects_url_with_embedded_credentials():
+    response = client.post("/api/scans", json={
+        "target": "https://user:password@example.test/", "profile": "quick", "authorized": True,
+    })
+    assert response.status_code == 400
+
+
+def test_same_origin_redirect_handler_rejects_malformed_and_credential_urls():
+    from urllib.request import Request
+
+    handler = app._SameOriginRedirectHandler("https://app.example.test/")
+    request = Request("https://app.example.test/")
+    assert handler.redirect_request(request, None, 302, "Found", {}, "https://app.example.test:notaport/") is None
+    assert handler.redirect_request(request, None, 302, "Found", {}, "https://user:secret@app.example.test/next") is None
