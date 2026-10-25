@@ -76,7 +76,9 @@ Standard/Deep scans now discover up to 12 same-origin URLs, with a maximum link 
 - Optional OWASP ZAP passive-alert retrieval from a local API
 - Scanner Setup page with real executable/version checks for supported tools
 - Allow-listed tool installation workflow with explicit user confirmation
-- Target authorization confirmation before scan and schedule creation
+- Target authorization confirmation before scan and schedule creation; malformed ports and credential-bearing URLs are rejected
+- Bounded concurrent scan workers (default 2; `DKCISSP_MAX_CONCURRENT_SCANS` may be set from 1 to 8); manual and scheduled scans respect the same cap
+- Adapter finding URLs are filtered against the approved target origin for Nikto and Wapiti, with regression tests for scheme/host/port and malformed URL cases
 - Finding normalization with severity, affected URL, evidence, confidence, and remediation
 - SQLite-backed scan and finding history
 - Finding lifecycle tracking: open, accepted, remediated, false positive, and retest required, with notes and update timestamps
@@ -296,7 +298,7 @@ The roadmap is staged so each integration is independently testable and the UI s
 
 - [ ] Repeatable end-to-end validation against a local OWASP Juice Shop lab
 - [ ] Validate target scope and redirect behavior for every adapter
-- [ ] Add rate limits and robust input validation for scan creation
+- [x] Add a bounded concurrent-scan cap and robust target URL validation for scan creation
 - [ ] Review authentication and deployment hardening before any non-local use
 - [ ] Document threat model, permissions, data retention, and known limitations
 

@@ -154,6 +154,8 @@ def test_scan_comparison_requires_same_target_and_completed_scans():
                            ("https://compare-pending.example/", "quick", "running", app.now()))
         pending_id = cur.lastrowid
     assert client.get(f"/api/scans/{pending_id}/comparison").status_code == 409
+    with app.connect() as conn:
+        conn.execute("DELETE FROM scans WHERE id=?", (pending_id,))
 
 
 def test_scan_comparison_without_baseline_returns_clear_message():
@@ -738,6 +740,8 @@ def test_scan_progress_fields_are_available_to_the_dashboard(monkeypatch):
     assert detail["progress"] == 35
     assert detail["current_stage"] == "Running Nuclei safe checks"
     assert '"Nuclei"' in detail["tool_status"]
+    with app.connect() as conn:
+        conn.execute("DELETE FROM scans WHERE id=?", (scan_id,))
 
 
 def test_discovered_candidate_cannot_be_scanned_until_human_approves_it(monkeypatch):
@@ -1001,3 +1005,53 @@ def test_shared_same_origin_validator_fails_closed():
         "https://app.example.test:notaport/a", "javascript:alert(1)",
     ):
         assert not app.is_same_origin_url(candidate, "https://app.example.test/"), candidate
+
+
+def test_scan_creation_rejects_when_concurrency_limit_is_reached(monkeypatch):
+    from uuid import uuid4
+    target = f"https://capacity-{uuid4().hex}.example"
+    started = []
+    monkeypatch.setenv("DKCISSP_MAX_CONCURRENT_SCANS", "1")
+    monkeypatch.setattr(app, "start_scan", lambda target, profile: started.append((target, profile)) or 777)
+    with app.connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+            (f"https://already-running-{uuid4().hex}.example", "standard", "running", app.now()),
+        )
+        running_id = cursor.lastrowid
+    try:
+        response = client.post("/api/scans", json={"target": target, "profile": "quick", "authorized": True})
+        assert response.status_code == 429
+        assert "capacity reached" in response.json()["detail"].lower()
+        assert started == []
+    finally:
+        with app.connect() as conn:
+            conn.execute("DELETE FROM scans WHERE id=?", (running_id,))
+
+
+def test_concurrency_limit_is_bounded_and_has_safe_fallback(monkeypatch):
+    monkeypatch.setenv("DKCISSP_MAX_CONCURRENT_SCANS", "not-a-number")
+    assert app.max_concurrent_scans() == 2
+    monkeypatch.setenv("DKCISSP_MAX_CONCURRENT_SCANS", "1000")
+    assert app.max_concurrent_scans() == 8
+    monkeypatch.setenv("DKCISSP_MAX_CONCURRENT_SCANS", "0")
+    assert app.max_concurrent_scans() == 1
+
+
+def test_start_scan_enforces_capacity_atomically(monkeypatch):
+    import pytest
+    from uuid import uuid4
+    monkeypatch.setenv("DKCISSP_MAX_CONCURRENT_SCANS", "1")
+    with app.connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+            (f"https://worker-running-{uuid4().hex}.example", "quick", "running", app.now()),
+        )
+        running_id = cursor.lastrowid
+    try:
+        with pytest.raises(app.HTTPException) as exc_info:
+            app.start_scan(f"https://worker-new-{uuid4().hex}.example", "quick")
+        assert exc_info.value.status_code == 429
+    finally:
+        with app.connect() as conn:
+            conn.execute("DELETE FROM scans WHERE id=?", (running_id,))
