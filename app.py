@@ -1151,6 +1151,182 @@ def perform_dalfox_check(target: str, urls, timeout_seconds: int = 540) -> tuple
                       "safety": "Active profile only; same-origin parameterised URLs; reflected payloads only; no headless browser, parameter mining, blind-XSS callbacks or BAV; 3 workers, 150 ms delay; stops at the first verified result per URL"}
 
 
+WPSCAN_INTERESTING = {  # wpscan "interesting finding" type -> (severity, plain title, advice)
+    "debug_log": ("Medium", "WordPress debug log is publicly readable", "Delete the debug log, disable WP_DEBUG_LOG on production, and block access to wp-content/debug.log."),
+    "backup_db": ("High", "WordPress database backup is exposed", "Remove the backup from the web root and rotate any credentials it contains."),
+    "config_backup": ("High", "WordPress configuration backup is exposed", "Remove the file from the web root and rotate the database and secret keys it contains."),
+    "db_export": ("High", "WordPress database export is exposed", "Remove the export from the web root and rotate any credentials it contains."),
+    "emergency_pwd_reset_script": ("High", "WordPress emergency password-reset script is present", "Delete the script immediately; it can let anyone reset the admin password."),
+    "upload_directory_listing": ("Medium", "WordPress uploads directory listing is enabled", "Disable directory listing (Options -Indexes) so uploaded files cannot be browsed."),
+    "xmlrpc": ("Low", "WordPress XML-RPC is enabled", "Disable XML-RPC if it is not needed, or restrict it; it enables brute-force amplification and pingback abuse."),
+    "readme": ("Info", "WordPress readme file is exposed", "Remove readme.html and license.txt from production; they reveal the exact WordPress version."),
+    "wp_cron": ("Info", "WordPress WP-Cron is externally reachable", "Prefer a real system cron and block external wp-cron.php requests to avoid load-based abuse."),
+    "multisite": ("Info", "WordPress Multisite is enabled", "Review network-wide plugin and user permissions."),
+    "registration": ("Low", "WordPress user registration is open", "Disable open registration unless it is required, and review the default role."),
+}
+
+
+def _wpscan_vulnerability_findings(label: str, vulnerabilities, url: str) -> list[tuple]:
+    findings = []
+    for vuln in vulnerabilities if isinstance(vulnerabilities, list) else []:
+        if not isinstance(vuln, dict) or not vuln.get("title"):
+            continue
+        refs = vuln.get("references") if isinstance(vuln.get("references"), dict) else {}
+        cves = ", ".join("CVE-" + str(c) if not str(c).upper().startswith("CVE-") else str(c) for c in (refs.get("cve") or [])[:4])
+        cvss = vuln.get("cvss") if isinstance(vuln.get("cvss"), dict) else {}
+        try:
+            score = float(cvss.get("score"))
+        except (TypeError, ValueError):
+            score = None
+        severity = "High" if score is not None and score >= 7 else "Medium"
+        evidence = f"Known vulnerability in {label}: {str(vuln['title'])[:200]}."
+        if vuln.get("fixed_in"):
+            evidence += f" Fixed in {str(vuln['fixed_in'])[:40]}."
+        if cves:
+            evidence += f" {cves}."
+        if score is not None:
+            evidence += f" CVSS {score}."
+        findings.append((severity, f"WordPress vulnerability: {str(vuln['title'])[:180]}", url[:2048], evidence[:1800],
+                         "Update the affected component to the fixed version (or remove it), then retest. Confirm the installed version first; matching is by detected version.", "High" if vuln.get("fixed_in") else "Medium"))
+    return findings
+
+
+def _wpscan_component_findings(kind: str, slug: str, comp: dict) -> list[tuple]:
+    findings = []
+    location = str(comp.get("location") or "")
+    version = ((comp.get("version") or {}) if isinstance(comp.get("version"), dict) else {}).get("number")
+    label = f"{kind} '{slug}'" + (f" {version}" if version else "")
+    findings.append(("Info", f"WordPress {kind} detected: {slug}" + (f" {version}" if version else ""), location[:2048],
+                     f"wpscan identified the {kind} '{slug}'" + (f", version {version}" if version else ", version not determined") + f" ({str(comp.get('found_by') or 'detection')[:80]}).",
+                     "Keep it updated and remove components that are not needed.", "Medium"))
+    if comp.get("outdated") is True:
+        latest = comp.get("latest_version")
+        findings.append(("Medium", f"WordPress {kind} is outdated: {slug}", location[:2048],
+                         f"Installed {version or 'unknown'}, latest {latest or 'unknown'}.", f"Update the {kind} to the latest version, or remove it if unused.", "Medium"))
+    if comp.get("directory_listing") is True:
+        findings.append(("Medium", f"Directory listing enabled for {kind} '{slug}'", location[:2048],
+                         "wpscan reports that the component directory can be browsed.", "Disable directory listing on the web server.", "Medium"))
+    if comp.get("error_log_url"):
+        findings.append(("Medium", f"Error log exposed for {kind} '{slug}'", str(comp["error_log_url"])[:2048],
+                         "An error log file is reachable and may disclose paths and internal details.", "Delete the log and block access to log files.", "Medium"))
+    findings.extend(_wpscan_vulnerability_findings(label, comp.get("vulnerabilities"), location))
+    return findings
+
+
+def parse_wpscan_report(report, target: str) -> list[tuple]:
+    """Normalise wpscan's JSON report into findings (core version, plugins, themes, exposures, users)."""
+    if not isinstance(report, dict):
+        return []
+    root = urlparse(target)
+    root_port = root.port or (443 if root.scheme == "https" else 80)
+
+    def same_origin(url: str) -> bool:
+        parsed = urlparse(str(url))
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        return parsed.scheme == root.scheme and (parsed.hostname or "").lower() == (root.hostname or "").lower() and port == root_port
+
+    findings = []
+    version = report.get("version") if isinstance(report.get("version"), dict) else None
+    if version and version.get("number"):
+        number = str(version["number"])[:40]
+        findings.append(("Info", f"WordPress core version detected: {number}", target[:2048],
+                         f"wpscan identified WordPress {number} ({str(version.get('found_by') or 'detection')[:80]}); status: {str(version.get('status') or 'unknown')[:40]}.",
+                         "Keep WordPress core on a supported, current release and hide the exact version where practical.", "Medium"))
+        if str(version.get("status") or "").lower() in ("insecure", "outdated"):
+            findings.append(("Medium", f"WordPress core is {str(version['status']).lower()}: {number}", target[:2048],
+                             f"wpscan classes WordPress {number} as {str(version['status']).lower()}.", "Update WordPress core to the latest release, then retest.", "Medium"))
+        findings.extend(_wpscan_vulnerability_findings(f"WordPress core {number}", version.get("vulnerabilities"), target))
+    theme = report.get("main_theme") if isinstance(report.get("main_theme"), dict) else None
+    plugins = report.get("plugins") if isinstance(report.get("plugins"), dict) else {}
+    themes = report.get("themes") if isinstance(report.get("themes"), dict) else {}
+    seen_themes = set()
+    for slug, comp in list(themes.items())[:30]:
+        if isinstance(comp, dict) and same_origin(comp.get("location") or target):
+            seen_themes.add(slug)
+            findings.extend(_wpscan_component_findings("theme", str(slug)[:80], comp))
+    if theme and str(theme.get("slug")) not in seen_themes and same_origin(theme.get("location") or target):
+        findings.extend(_wpscan_component_findings("theme", str(theme.get("slug"))[:80], theme))
+    for slug, comp in list(plugins.items())[:60]:
+        if isinstance(comp, dict) and same_origin(comp.get("location") or target):
+            findings.extend(_wpscan_component_findings("plugin", str(slug)[:80], comp))
+    for item in report.get("interesting_findings") if isinstance(report.get("interesting_findings"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        rule = WPSCAN_INTERESTING.get(str(item.get("type")))
+        url = str(item.get("url") or target)
+        if not rule or not same_origin(url):
+            continue
+        severity, title, advice = rule
+        findings.append((severity, title, url[:2048], (str(item.get("to_s") or title)[:300] + "."), advice, "Medium" if severity != "Info" else "Low"))
+    users = report.get("users") if isinstance(report.get("users"), dict) else {}
+    if users:
+        names = ", ".join(sorted(str(name)[:40] for name in users)[:10])
+        findings.append(("Low", f"WordPress user names can be enumerated ({len(users)} found)", target[:2048],
+                         f"wpscan retrieved user name(s) without logging in: {names}.",
+                         "Block author-archive and REST user enumeration, use non-obvious login names, and enforce strong passwords with rate limiting or 2FA.", "High"))
+    order = {"High": 0, "Medium": 1, "Low": 2, "Info": 3}
+    unique, seen = [], set()
+    for finding in sorted(findings, key=lambda f: order.get(f[0], 4)):
+        key = (finding[0], finding[1], finding[2])
+        if key not in seen:
+            seen.add(key)
+            unique.append(finding)
+    return unique[:80]
+
+
+def perform_wpscan_check(target: str, timeout_seconds: int = 300, profile: str = "standard") -> tuple[list[tuple], dict]:
+    """WordPress-specific checks. Standard is passive; Deep/Active add bounded active detection and user enumeration."""
+    binary = shutil.which(TOOL_CATALOG["wpscan"]["binary"])
+    if not binary:
+        return [], {"status": "unavailable", "reason": "WPScan is not installed"}
+    deep = profile in ("deep", "active")
+    # The API token (known-vulnerability data) travels only in the child's environment, never in arguments or logs.
+    token = (os.environ.get("DKCISSP_WPSCAN_API_TOKEN") or os.environ.get("WPSCAN_API_TOKEN") or "").strip()
+    child_env = {**os.environ, "NO_COLOR": "1", "TERM": "dumb"}
+    if token:
+        child_env["WPSCAN_API_TOKEN"] = token
+    else:
+        child_env.pop("WPSCAN_API_TOKEN", None)
+    with tempfile.TemporaryDirectory(prefix="dkcissp-wpscan-") as temp_dir:
+        report_path = str(Path(temp_dir) / "wpscan.json")
+        command = [binary, "--url", target, "--no-banner", "--format", "json", "--output", report_path,
+                   "--detection-mode", "mixed" if deep else "passive", "--plugins-detection", "passive", "--themes-detection", "passive",
+                   "--max-threads", "2", "--request-timeout", "20", "--connect-timeout", "10",
+                   "--user-agent", "DKCISSP-WebSecurityScanner/0.1 (+authorized WordPress assessment)",
+                   "-e", "ap,at,u1-10,cb,dbe,bf" if deep else "ap,at"]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout_seconds, check=False,
+                                    env=child_env, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            return [], {"status": "timeout", "timeout_seconds": timeout_seconds}
+        except OSError as exc:
+            return [], {"status": "error", "reason": str(exc)[:300]}
+        if not os.path.isfile(report_path) or os.path.getsize(report_path) == 0:
+            return [], {"status": "error", "return_code": result.returncode,
+                        "reason": "wpscan did not produce a JSON report; no findings were inferred from console text"}
+        try:
+            with open(report_path, encoding="utf-8", errors="replace") as handle:
+                report = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return [], {"status": "error", "return_code": result.returncode, "reason": "wpscan produced an unreadable JSON report"}
+    if isinstance(report, dict) and (report.get("scan_aborted") or report.get("update_aborted")):
+        message = str(report.get("scan_aborted") or report.get("update_aborted"))[:300].replace("\n", " ")
+        if "does not seem to be running wordpress" in message.lower():
+            return [], {"status": "skipped", "reason": "wpscan did not confirm that the target runs WordPress"}
+        return [], {"status": "error", "reason": "wpscan could not run: " + message
+                    + (" Its vulnerability database could not be downloaded; check internet access or run 'wpscan --update'." if "update" in message.lower() or report.get("update_aborted") else "")}
+    findings = parse_wpscan_report(report, target)
+    status = {"status": "completed" if result.returncode in (0, 5) else "completed_with_warnings", "return_code": result.returncode,
+              "finding_count": len(findings), "api_token_configured": bool(token), "timeout_seconds": timeout_seconds,
+              "mode": "passive detection" if not deep else "mixed detection with user enumeration",
+              "safety": "Runs only when WordPress is detected; same supplied origin; 2 threads; plugin and theme detection is passive (no slug brute-forcing); token passed via environment only"}
+    if not token:
+        status["status"] = "completed_with_warnings"
+        status["reason"] = ("No WPScan API token is configured, so components were identified but known-vulnerability data was not included. "
+                            "Set DKCISSP_WPSCAN_API_TOKEN (a free token is available at wpscan.com/register) to include it.")
+    return findings, status
+
+
 def parse_wapiti_report(report, target: str) -> list[tuple]:
     """Normalize Wapiti JSON without storing raw requests, cookies, or curl commands."""
     if not isinstance(report, dict):
@@ -1345,6 +1521,7 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         "Nuclei": {"status": "queued", "detail": "Waiting for built-in checks"},
         "Nikto": {"status": "queued", "detail": "Runs in Deep and Active profiles"},
         "Content discovery (ffuf)": {"status": "queued", "detail": "Runs in Deep and Active profiles"},
+        "WordPress (wpscan)": {"status": "queued", "detail": "Runs when WordPress is detected"},
         "SQL injection (sqlmap)": {"status": "queued", "detail": "Runs only in the Active profile"},
         "XSS (dalfox)": {"status": "queued", "detail": "Runs only in the Active profile"},
         "Wapiti active checks": {"status": "queued", "detail": "Runs only after explicit active-testing approval"},
@@ -1513,6 +1690,7 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         whatweb_findings = []
         ffuf_status = {"status": "not_run", "reason": "Content discovery runs in Deep and Active profiles only"}
         sqlmap_status = {"status": "not_run", "reason": "SQL injection testing runs only in the Active profile"}
+        wpscan_status = {"status": "not_run", "reason": "WordPress checks run when WordPress is detected"}
         dalfox_status = {"status": "not_run", "reason": "XSS testing runs only in the Active profile"}
         nuclei_status = {"status": "not_run", "reason": "Nuclei checks are enabled for Standard/Deep/Active profiles only"}
         nikto_status = {"status": "not_run", "reason": "Nikto server checks are enabled for Deep/Active profiles only"}
@@ -1594,6 +1772,16 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         else:
             tool_status["Wapiti active checks"] = {"status": "skipped", "detail": "Requires the separate Active profile and explicit approval"}
 
+        wp_facts = planner.Facts(profile=profile, technologies=planner.detect_technologies(headers, body, [f[1] for f in whatweb_findings]))
+        wp_rule = next(rule for rule in planner.RULES if rule.id == "wordpress")
+        if planner.rule_applies(wp_rule, wp_facts):
+            tool_status["WordPress (wpscan)"] = {"status": "running", "detail": "WordPress detected; checking core, plugins, themes and exposed files"}
+            update_scan_progress(scan_id, 92, "Running WordPress checks", tool_status)
+            wp_findings, wpscan_status = perform_wpscan_check(target, profile=profile)
+            findings.extend(wp_findings)
+            tool_status["WordPress (wpscan)"] = {"status": wpscan_status.get("status", "error"), "detail": f"{wpscan_status.get('finding_count', len(wp_findings))} finding(s); {wpscan_status.get('reason', 'check finished')}"}
+        else:
+            tool_status["WordPress (wpscan)"] = {"status": "skipped", "detail": "WordPress was not detected" if profile != "quick" else "Not selected for this profile"}
         if profile == "active":
             injection_urls = discovery_status.get("urls", [target])
             for tool_id, runner, name in (("sqlmap", perform_sqlmap_check, "SQL injection (sqlmap)"), ("dalfox", perform_dalfox_check, "XSS (dalfox)")):
@@ -1614,7 +1802,7 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         request_missing_tools(scan_id, profile, tool_status, {
             "nuclei": nuclei_status, "nikto": nikto_status, "whatweb": whatweb_status,
             "testssl": tls_status, "wapiti": wapiti_status, "ffuf": ffuf_status,
-            "sqlmap": sqlmap_status, "dalfox": dalfox_status,
+            "sqlmap": sqlmap_status, "dalfox": dalfox_status, "wpscan": wpscan_status,
         })
 
         # Plan what else this target deserves, and say plainly what no engine here covers yet.
@@ -1649,7 +1837,7 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                         "tls_check": tls_status, "whatweb_check": whatweb_status,
                         "nuclei_check": nuclei_status, "nikto_check": nikto_status, "wapiti_check": wapiti_status, "zap_check": zap_status,
                         "endpoint_discovery": discovery_status, "ffuf_check": {k: v for k, v in ffuf_status.items() if k != "found_urls"},
-                        "sqlmap_check": sqlmap_status, "dalfox_check": dalfox_status, "coverage": coverage,
+                        "sqlmap_check": sqlmap_status, "dalfox_check": dalfox_status, "wpscan_check": wpscan_status, "coverage": coverage,
                         "finding_count": len(findings), "assessment_gaps": gaps,
                     }),
                     "Assessment complete with gaps" if gaps else "Assessment complete", json.dumps(tool_status), scan_id,
@@ -2223,6 +2411,7 @@ TOOL_CATALOG = {
     "nikto": {"label": "Nikto", "binary": "nikto", "package": "nikto", "version_args": ["-Version"], "purpose": "Deep-profile checks for common web-server files and misconfigurations"},
     "sqlmap": {"label": "sqlmap", "binary": "sqlmap", "package": "sqlmap", "version_args": ["--version"], "purpose": "Active SQL injection testing of URL parameters (Active profile only)"},
     "dalfox": {"label": "dalfox", "binary": "dalfox", "package": "dalfox", "version_args": ["version"], "purpose": "Active cross-site scripting testing of URL parameters (Active profile only)"},
+    "wpscan": {"label": "WPScan", "binary": "wpscan", "package": "wpscan", "version_args": ["--version", "--no-banner"], "purpose": "WordPress core, plugin, theme and user-exposure checks (only when WordPress is detected)"},
     "ffuf": {"label": "ffuf", "binary": "ffuf", "package": "ffuf", "version_args": ["-V"], "purpose": "Hidden content and path discovery with a built-in wordlist"},
     "wapiti": {"label": "Wapiti", "binary": "wapiti", "package": "wapiti", "version_args": ["--version"], "purpose": "Explicitly approved active tests for web-application vulnerabilities"},
 }
@@ -2339,6 +2528,7 @@ ENGINE_STAGES = {
     "testssl": {"stage": "TLS (testssl.sh)", "summary_key": "tls_check"},
     "wapiti": {"stage": "Wapiti active checks", "summary_key": "wapiti_check"},
     "ffuf": {"stage": "Content discovery (ffuf)", "summary_key": "ffuf_check"},
+    "wpscan": {"stage": "WordPress (wpscan)", "summary_key": "wpscan_check"},
     "sqlmap": {"stage": "SQL injection (sqlmap)", "summary_key": "sqlmap_check"},
     "dalfox": {"stage": "XSS (dalfox)", "summary_key": "dalfox_check"},
 }
@@ -2490,6 +2680,9 @@ def run_engine_stage(tool_id: str, target: str, profile: str, urls: list[str]):
             findings, status = perform_testssl_check(target)
         else:
             findings, status = [], {"status": "skipped", "reason": "TLS assessment requires an HTTPS target"}
+        label = "finding(s)"
+    elif tool_id == "wpscan":
+        findings, status = perform_wpscan_check(target, profile=profile)
         label = "finding(s)"
     elif tool_id in ("sqlmap", "dalfox"):
         runner = perform_sqlmap_check if tool_id == "sqlmap" else perform_dalfox_check

@@ -1421,7 +1421,7 @@ def test_builtin_wordlist_is_present_and_bounded():
     assert ".git/HEAD" in lines and "admin" in lines and not any(" " in l or l.startswith("/") for l in lines)
 
 
-def _deep_scan(monkeypatch, ffuf_result, target="http://deep-test.example/", body="<html></html>"):
+def _deep_scan(monkeypatch, ffuf_result, target="http://deep-test.example/", body="<html></html>", wpscan=None):
     monkeypatch.setattr(app, "perform_zap_passive_check", lambda *a, **k: ([], {"status": "completed"}))
     for name in ("perform_whatweb_check", "perform_nikto_check", "perform_testssl_check", "perform_nuclei_check"):
         monkeypatch.setattr(app, name, lambda *a, **k: ([], {"status": "completed"}))
@@ -1431,6 +1431,7 @@ def _deep_scan(monkeypatch, ffuf_result, target="http://deep-test.example/", bod
         return [], {"status": "completed"}
     monkeypatch.setattr(app, "perform_nuclei_check", fake_nuclei)
     monkeypatch.setattr(app, "perform_ffuf_check", lambda *a, **k: ffuf_result)
+    monkeypatch.setattr(app, "perform_wpscan_check", wpscan or (lambda *a, **k: ([], {"status": "completed"})))
     monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/" + str(binary))
     page = _FakeHTTP()
     page.geturl = lambda: target
@@ -1458,13 +1459,13 @@ def test_deep_scan_runs_content_discovery_and_feeds_found_pages_to_later_stages(
 
 
 def test_standard_scan_skips_content_discovery_and_notes_uncovered_technology(monkeypatch):
-    import json
-    scan_id, _ = _deep_scan(monkeypatch, ([], {"status": "completed"}), "http://wp-test.example/",
-                            '<link href="/wp-content/themes/a/style.css">')
+    scan_id, _ = _deep_scan(monkeypatch, ([], {"status": "completed"}), "http://joomla-test.example/",
+                            '<meta name="generator" content="Joomla! 4">')
     row, tools, summary = _scan_row(scan_id)
-    assert summary["coverage"]["facts"]["technologies"] == ["wordpress"]
-    assert [n["tool"] for n in summary["coverage"]["not_covered"]] == ["wpscan"]
+    assert summary["coverage"]["facts"]["technologies"] == ["joomla"]
+    assert [n["tool"] for n in summary["coverage"]["not_covered"]] == ["joomscan"]
     assert "not available in this version" in summary["coverage"]["not_covered"][0]["message"]
+    assert tools["WordPress (wpscan)"]["status"] == "skipped"  # Joomla is not WordPress
     assert row["status"] == "completed"  # a coverage note is information, not a failed stage
 
 
@@ -1622,6 +1623,7 @@ def _active_scan(monkeypatch, urls, profile="active", sqlmap_result=None, dalfox
     for name in ("perform_whatweb_check", "perform_nikto_check", "perform_testssl_check", "perform_nuclei_check", "perform_wapiti_check"):
         monkeypatch.setattr(app, name, lambda *a, **k: ([], {"status": "completed"}))
     monkeypatch.setattr(app, "perform_ffuf_check", lambda *a, **k: ([], {"status": "completed"}))
+    monkeypatch.setattr(app, "perform_wpscan_check", lambda *a, **k: ([], {"status": "completed"}))
     calls = []
     def fake_sqlmap(target, test_urls, *a, **k):
         calls.append(("sqlmap", list(test_urls))); return sqlmap_result or ([], {"status": "completed", "finding_count": 0})
@@ -1679,3 +1681,165 @@ def test_missing_injection_tool_asks_for_approval_and_a_timeout_is_a_gap(monkeyp
     assert len(created) == 2
     requests = {r["tool_id"]: r for r in client.get(f"/api/tool-requests?scan_id={scan_id}").json()}
     assert requests["sqlmap"]["package"] == "sqlmap" and requests["dalfox"]["package"] == "dalfox"
+
+
+# ---- wpscan (WordPress) ------------------------------------------------------------------------------
+
+REAL_WPSCAN_THEME_ONLY = {
+    "target_url": "http://wp.example/", "effective_url": "http://wp.example/",
+    "interesting_findings": [{"url": "http://wp.example/", "to_s": "Headers", "type": "headers", "confidence": 100, "interesting_entries": ["Server: x"]}],
+    "version": None,
+    "main_theme": {"slug": "twentytwenty", "location": "http://wp.example/wp-content/themes/twentytwenty/", "outdated": False,
+                   "found_by": "Css Style In Homepage (Passive Detection)", "vulnerabilities": [], "version": {"number": "1.0"}},
+    "plugins": {}, "themes": {"twentytwenty": {"slug": "twentytwenty", "location": "http://wp.example/wp-content/themes/twentytwenty/",
+                                               "outdated": False, "vulnerabilities": [], "version": {"number": "1.0"}, "found_by": "Urls In Homepage (Passive Detection)"}},
+    "vuln_api": {"error": "No WPScan API Token given, as a result vulnerability data has not been output."},
+}
+RICH_WPSCAN_REPORT = {
+    "version": {"number": "5.8.1", "status": "insecure", "found_by": "Meta Generator",
+                "vulnerabilities": [{"title": "WP < 5.8.3 - Object Injection in PHPMailer", "fixed_in": "5.8.3",
+                                     "references": {"cve": ["2020-36326"]}, "cvss": {"score": "9.8"}}]},
+    "plugins": {"contact-form-7": {"slug": "contact-form-7", "location": "http://wp.example/wp-content/plugins/contact-form-7/",
+                                   "outdated": True, "latest_version": "5.9", "version": {"number": "5.1"}, "directory_listing": True,
+                                   "error_log_url": "http://wp.example/wp-content/plugins/contact-form-7/error_log",
+                                   "vulnerabilities": [{"title": "CF7 < 5.3.2 - Unrestricted File Upload", "fixed_in": "5.3.2", "references": {"cve": ["CVE-2020-35489"]}}]},
+                "evil": {"slug": "evil", "location": "http://other.example/wp-content/plugins/evil/", "version": {"number": "1"}}},
+    "interesting_findings": [
+        {"url": "http://wp.example/wp-content/debug.log", "to_s": "Debug Log found: http://wp.example/wp-content/debug.log", "type": "debug_log"},
+        {"url": "http://wp.example/wp-config.php.bak", "to_s": "A wp-config.php backup file has been found", "type": "config_backup"},
+        {"url": "http://wp.example/xmlrpc.php", "to_s": "XML-RPC seems to be enabled", "type": "xmlrpc"},
+        {"url": "http://other.example/readme.html", "to_s": "elsewhere", "type": "readme"},
+        {"url": "http://wp.example/", "to_s": "Headers", "type": "headers"},
+        "junk"],
+    "users": {"admin": {"id": 1}, "editor": {"id": 2}},
+}
+
+
+def test_wpscan_parser_maps_core_plugins_exposures_and_users():
+    findings = app.parse_wpscan_report(RICH_WPSCAN_REPORT, "http://wp.example/")
+    titles = {f[1]: f for f in findings}
+    assert titles["WordPress vulnerability: WP < 5.8.3 - Object Injection in PHPMailer"][0] == "High"   # CVSS 9.8
+    assert "CVE-2020-36326" in titles["WordPress vulnerability: WP < 5.8.3 - Object Injection in PHPMailer"][3]
+    assert titles["WordPress vulnerability: CF7 < 5.3.2 - Unrestricted File Upload"][0] == "Medium"       # no CVSS given
+    assert "CVE-2020-35489" in titles["WordPress vulnerability: CF7 < 5.3.2 - Unrestricted File Upload"][3]
+    assert titles["WordPress core is insecure: 5.8.1"][0] == "Medium"
+    assert titles["WordPress plugin is outdated: contact-form-7"][0] == "Medium"
+    assert "Directory listing enabled for plugin 'contact-form-7'" in titles and "Error log exposed for plugin 'contact-form-7'" in titles
+    assert titles["WordPress configuration backup is exposed"][0] == "High"
+    assert titles["WordPress debug log is publicly readable"][0] == "Medium"
+    assert titles["WordPress XML-RPC is enabled"][0] == "Low"
+    assert titles["WordPress user names can be enumerated (2 found)"][0] == "Low" and "admin, editor" in titles["WordPress user names can be enumerated (2 found)"][3]
+    assert not any("evil" in f[1] or "other.example" in f[2] for f in findings)   # other origin is dropped
+    assert "WordPress readme file is exposed" not in titles                         # that readme was on another origin
+    assert [f[0] for f in findings] == sorted((f[0] for f in findings), key=["High", "Medium", "Low", "Info"].index)
+
+
+def test_wpscan_parser_handles_the_real_theme_only_report_and_junk():
+    findings = app.parse_wpscan_report(REAL_WPSCAN_THEME_ONLY, "http://wp.example/")
+    assert [f[1] for f in findings] == ["WordPress theme detected: twentytwenty 1.0"]   # deduped: main theme and themes list
+    assert app.parse_wpscan_report(None, "http://wp.example/") == [] and app.parse_wpscan_report({"plugins": "x", "users": []}, "http://wp.example/") == []
+
+
+def _fake_wpscan_run(monkeypatch, report, returncode=0, capture=None):
+    import json
+    monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/wpscan")
+    class Done: stdout = ""; stderr = ""
+    def fake_run(command, **kwargs):
+        if capture is not None:
+            capture.update(command=command, env=kwargs.get("env"), stdin=kwargs.get("stdin"))
+        if report is not None:
+            app.Path(command[command.index("--output") + 1]).write_text(json.dumps(report))
+        done = Done(); done.returncode = returncode
+        return done
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+
+
+def test_wpscan_token_goes_to_the_environment_never_the_command_line(monkeypatch):
+    seen = {}
+    monkeypatch.delenv("WPSCAN_API_TOKEN", raising=False)
+    monkeypatch.setenv("DKCISSP_WPSCAN_API_TOKEN", "s3cr3t-token-value")
+    _fake_wpscan_run(monkeypatch, REAL_WPSCAN_THEME_ONLY, capture=seen)
+    findings, status = app.perform_wpscan_check("http://wp.example/")
+    assert "s3cr3t-token-value" not in " ".join(seen["command"])
+    assert seen["env"]["WPSCAN_API_TOKEN"] == "s3cr3t-token-value"
+    assert "s3cr3t-token-value" not in repr(status) and "s3cr3t-token-value" not in repr(findings)
+    assert status["api_token_configured"] is True and status["status"] == "completed" and "reason" not in status
+
+
+def test_wpscan_without_token_is_a_warning_that_says_what_is_missing(monkeypatch):
+    seen = {}
+    monkeypatch.delenv("DKCISSP_WPSCAN_API_TOKEN", raising=False)
+    monkeypatch.setenv("WPSCAN_API_TOKEN", "")
+    _fake_wpscan_run(monkeypatch, REAL_WPSCAN_THEME_ONLY, capture=seen)
+    findings, status = app.perform_wpscan_check("http://wp.example/")
+    assert status["status"] == "completed_with_warnings" and status["api_token_configured"] is False
+    assert "known-vulnerability data was not included" in status["reason"] and "DKCISSP_WPSCAN_API_TOKEN" in status["reason"]
+    assert "WPSCAN_API_TOKEN" not in seen["env"] and len(findings) == 1
+
+
+def test_wpscan_standard_is_passive_and_deep_adds_bounded_active_detection(monkeypatch):
+    monkeypatch.delenv("DKCISSP_WPSCAN_API_TOKEN", raising=False)
+    standard, deep = {}, {}
+    _fake_wpscan_run(monkeypatch, REAL_WPSCAN_THEME_ONLY, capture=standard)
+    app.perform_wpscan_check("http://wp.example/", profile="standard")
+    _fake_wpscan_run(monkeypatch, REAL_WPSCAN_THEME_ONLY, capture=deep)
+    app.perform_wpscan_check("http://wp.example/", profile="deep")
+    sc, dc = standard["command"], deep["command"]
+    assert sc[sc.index("--detection-mode") + 1] == "passive" and sc[sc.index("-e") + 1] == "ap,at"
+    assert dc[dc.index("--detection-mode") + 1] == "mixed" and dc[dc.index("-e") + 1] == "ap,at,u1-10,cb,dbe,bf"
+    for command in (sc, dc):
+        assert command[command.index("--plugins-detection") + 1] == "passive" and command[command.index("--themes-detection") + 1] == "passive"
+        assert command[command.index("--max-threads") + 1] == "2" and command[command.index("--url") + 1] == "http://wp.example/"
+        assert "aggressive" not in command and "--password-attack" not in command and "--passwords" not in command and "-P" not in command
+        assert "--no-update" not in command    # wpscan fetches its own database on first use
+    assert standard["stdin"] == app.subprocess.DEVNULL
+
+
+def test_wpscan_reports_aborts_and_missing_output_truthfully(monkeypatch):
+    monkeypatch.setattr(app.shutil, "which", lambda binary: None)
+    assert app.perform_wpscan_check("http://wp.example/") == ([], {"status": "unavailable", "reason": "WPScan is not installed"})
+    _fake_wpscan_run(monkeypatch, {"scan_aborted": "The remote website is up, but does not seem to be running WordPress.", "target_url": "x"}, returncode=1)
+    assert app.perform_wpscan_check("http://wp.example/")[1] == {"status": "skipped", "reason": "wpscan did not confirm that the target runs WordPress"}
+    _fake_wpscan_run(monkeypatch, {"db_update_started": True, "update_aborted": "Unable to get https://data.wpscan.org/metadata.json.sha512"}, returncode=1)
+    status = app.perform_wpscan_check("http://wp.example/")[1]
+    assert status["status"] == "error" and "could not run" in status["reason"] and "wpscan --update" in status["reason"]
+    _fake_wpscan_run(monkeypatch, None, returncode=1)
+    assert "no findings were inferred" in app.perform_wpscan_check("http://wp.example/")[1]["reason"]
+    import subprocess
+    monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("wpscan", 300)))
+    assert app.perform_wpscan_check("http://wp.example/")[1]["status"] == "timeout"
+
+
+def test_scan_runs_wpscan_only_when_wordpress_is_detected(monkeypatch):
+    calls = []
+    def fake_wpscan(target, timeout_seconds=300, profile="standard"):
+        calls.append(profile)
+        return ([("Low", "WordPress user names can be enumerated (1 found)", target, "e", "f", "High")],
+                {"status": "completed_with_warnings", "finding_count": 1, "reason": "No WPScan API token is configured, so known-vulnerability data was not included."})
+    plain_id, _ = _deep_scan(monkeypatch, ([], {"status": "completed"}), "http://plain-site.example/", "<html>plain</html>", wpscan=fake_wpscan)
+    assert calls == [] and _scan_row(plain_id)[1]["WordPress (wpscan)"]["status"] == "skipped"
+    assert "WordPress was not detected" in _scan_row(plain_id)[1]["WordPress (wpscan)"]["detail"]
+    wp_id, _ = _deep_scan(monkeypatch, ([], {"status": "completed"}), "http://wp-run2.example/", '<link href="/wp-content/themes/a/style.css">', wpscan=fake_wpscan)
+    assert calls == ["deep"]
+    row, tools, summary = _scan_row(wp_id)
+    assert tools["WordPress (wpscan)"]["status"] == "completed_with_warnings" and row["status"] == "completed_with_gaps"   # missing token is a gap
+    assert summary["wpscan_check"]["status"] == "completed_with_warnings"
+    assert "wpscan" in [p["tool"] for p in summary["coverage"]["planned"]] and summary["coverage"]["not_covered"] == []
+    assert any(f["title"].startswith("WordPress user names") for f in client.get(f"/api/scans/{wp_id}").json()["findings"])
+
+
+def test_missing_wpscan_asks_for_approval_and_the_resumed_stage_uses_the_scan_profile(monkeypatch):
+    monkeypatch.setattr(app.shutil, "which", lambda binary: None)
+    scan_id, _ = _deep_scan(monkeypatch, ([], {"status": "completed"}), "http://wp-missing.example/", '<link href="/wp-content/x.css">')
+    monkeypatch.setattr(app.shutil, "which", lambda binary: None)
+    created = app.request_missing_tools(scan_id, "standard", {}, {"wpscan": {"status": "unavailable"}})
+    assert len(created) == 1
+    seen = {}
+    monkeypatch.setattr(app, "_spawn", lambda function, *args: function(*args))
+    monkeypatch.setattr(app, "install_package", lambda tool_id: (True, "WPScan was installed from the Kali repository."))
+    monkeypatch.setattr(app, "perform_wpscan_check", lambda target, timeout_seconds=300, profile="standard": (seen.update(profile=profile) or
+                        ([("Info", "WordPress theme detected: t 1", target, "e", "f", "Medium")], {"status": "completed", "finding_count": 1})))
+    request = client.get(f"/api/tool-requests?scan_id={scan_id}").json()[0]
+    assert request["tool_id"] == "wpscan" and request["package"] == "wpscan"
+    client.post(f"/api/tool-requests/{request['id']}/decision", json={"decision": "approve"})
+    assert seen["profile"] == "deep" and _scan_row(scan_id)[1]["WordPress (wpscan)"]["status"] == "completed"

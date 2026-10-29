@@ -17,6 +17,9 @@ Use this checklist before merging a feature, announcing a release, or making the
 - [ ] Record OS/version, runtime versions, exact commands, exit codes, and observed results.
 - [ ] Verify the documented URL/port and a health check or other explicit success criterion.
 - [ ] Test a failure path and document recovery/troubleshooting.
+- [ ] On a clean Kali VM, run the one-command installer from the README exactly as written (`curl -fsSL …/install.sh | bash`) and confirm it downloads, installs, starts and serves the dashboard. Then run it a second time (update path) and confirm it succeeds without touching `data.sqlite3`.
+- [ ] Confirm `dkcissp-scanner`, `dkcissp-scanner update`, `./run.sh` and `./update.sh` work, and that a busy port gives a clear message.
+- [ ] Approve and decline one missing-tool request on the Approvals page with a real `apt` install on Kali.
 
 ## 3. Documentation hygiene
 
