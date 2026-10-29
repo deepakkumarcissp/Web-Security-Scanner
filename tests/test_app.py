@@ -1485,3 +1485,197 @@ def test_missing_ffuf_asks_for_approval_then_runs_and_merges(monkeypatch):
     _, tools, summary = _scan_row(scan_id)
     assert tools["Content discovery (ffuf)"]["status"] == "completed"
     assert summary["ffuf_check"]["status"] == "completed"
+
+
+# ---- sqlmap and dalfox (Active profile) -------------------------------------------------------------
+
+REAL_SQLMAP_LOG = """sqlmap identified the following injection point(s) with a total of 42 HTTP(s) requests:
+---
+Parameter: id (GET)
+    Type: boolean-based blind
+    Title: AND boolean-based blind - WHERE or HAVING clause
+    Payload: id=1 AND 2518=2518
+
+    Type: UNION query
+    Title: Generic UNION query (NULL) - 1 column
+    Payload: id=1 UNION ALL SELECT CHAR(113,118,98,120,113)-- xpCw
+---
+back-end DBMS: SQLite
+"""
+REAL_DALFOX_LINES = (
+    '{"type":"R","inject_type":"inHTML-URL","poc_type":"plain","method":"GET","data":"http://t.example/search?q=test%22%3E","param":"q","payload":"\\"><svg>","evidence":"1 line: reflected","cwe":"CWE-79","severity":"Medium"}\n'
+    '{"type":"V","inject_type":"inHTML-URL","poc_type":"plain","method":"GET","data":"http://t.example/search?q=test%22%3E%3CSvG","param":"q","payload":"\\"><SvG/onload=alert(1)>","evidence":"1 line: dy>Results for: test","cwe":"CWE-79","severity":"High"}\n'
+)
+
+
+def test_select_test_urls_keeps_only_safe_same_origin_parameterised_shapes():
+    urls = ["http://t.example/", "http://t.example/item?id=1", "http://t.example/item?id=2", "http://t.example/s?q=a&p=1",
+            "http://t.example/s?p=9&q=b", "http://evil.example/x?a=1", "http://t.example:8080/x?a=1", "https://t.example/x?a=1",
+            "http://t.example/bad path?a=1", "-oBad?x=1", "http://t.example/ctl\x01?a=1", "http://t.example/a?x=1",
+            "http://t.example/b?x=1", "http://t.example/c?x=1"]
+    chosen = app.select_test_urls("http://t.example/", urls)
+    assert chosen == ["http://t.example/item?id=1", "http://t.example/s?q=a&p=1", "http://t.example/a?x=1", "http://t.example/b?x=1"]
+    assert len(app.select_test_urls("http://t.example/", urls, limit=2)) == 2
+    assert app.select_test_urls("http://t.example/", ["http://t.example/"]) == []
+
+
+def test_query_parameter_names_are_sanitised():
+    assert app.query_parameter_names("http://a/p?id=1&id=2&-x=1&q=2&ok[]=3&bad name=4&=5") == ["id", "q", "ok[]"]
+
+
+def test_sqlmap_log_parser_reads_the_structured_block():
+    findings = app.parse_sqlmap_log(REAL_SQLMAP_LOG, "http://t.example/item?id=1")
+    assert len(findings) == 1
+    severity, title, url, evidence, remediation, confidence = findings[0]
+    assert severity == "High" and confidence == "High" and "parameter 'id' (GET)" in title
+    assert "boolean-based blind" in evidence and "UNION query" in evidence and "SQLite" in evidence
+    assert "parameterized queries" in remediation
+    assert app.parse_sqlmap_log("Parameter: id (GET)\n---\n", "http://t/") == []
+    assert app.parse_sqlmap_log("nothing here", "http://t/") == []
+
+
+def test_sqlmap_skips_without_parameters_even_if_not_installed_and_asks_when_needed(monkeypatch):
+    monkeypatch.setattr(app.shutil, "which", lambda binary: None)
+    assert app.perform_sqlmap_check("http://t.example/", ["http://t.example/"])[1]["status"] == "skipped"
+    assert app.perform_sqlmap_check("http://t.example/", ["http://t.example/p?id=1"])[1] == {"status": "unavailable", "reason": "sqlmap is not installed"}
+
+
+def test_sqlmap_runs_detection_only_with_bounded_arguments(monkeypatch):
+    seen = []
+    monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/sqlmap")
+    class Done: returncode = 0; stdout = ""; stderr = ""
+    def fake_run(command, **kwargs):
+        seen.append((command, kwargs))
+        out = [a for a in command if a.startswith("--output-dir=")][0].split("=", 1)[1]
+        (app.Path(out) / "t.example").mkdir(parents=True)
+        (app.Path(out) / "t.example" / "log").write_text(REAL_SQLMAP_LOG)
+        return Done()
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    findings, status = app.perform_sqlmap_check("http://t.example/", ["http://t.example/item?id=1"])
+    command = seen[0][0]
+    assert command[:3] == ["/usr/bin/sqlmap", "-u", "http://t.example/item?id=1"]
+    for required in ("--batch", "--level=1", "--risk=1", "--technique=BEU", "--threads=1", "--ignore-redirects", "--flush-session"):
+        assert required in command
+    forbidden = ("--dump", "--dump-all", "--os-shell", "--os-cmd", "--sql-shell", "--passwords", "--file-read", "--file-write", "--forms", "--crawl", "--level=5", "--risk=3")
+    assert not any(a.startswith(f) for a in command for f in forbidden)
+    assert "S" not in command[command.index("--technique=BEU")].split("=")[1]  # no stacked queries
+    assert status["status"] == "completed" and status["urls_tested"] == 1 and len(findings) == 1
+
+
+def test_sqlmap_timeout_keeps_partial_findings_and_is_not_reported_clean(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/sqlmap")
+    def fake_run(command, **kwargs):
+        out = [a for a in command if a.startswith("--output-dir=")][0].split("=", 1)[1]
+        (app.Path(out) / "t.example").mkdir(parents=True)
+        (app.Path(out) / "t.example" / "log").write_text(REAL_SQLMAP_LOG)
+        raise subprocess.TimeoutExpired("sqlmap", 30)
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    findings, status = app.perform_sqlmap_check("http://t.example/", ["http://t.example/item?id=1"])
+    assert len(findings) == 1 and status["status"] == "partial_timeout"
+    monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("sqlmap", 30)))
+    assert app.perform_sqlmap_check("http://t.example/", ["http://t.example/item?id=1"])[1]["status"] == "timeout"
+
+
+def test_dalfox_parser_maps_verified_and_reflected_and_stays_in_origin():
+    findings = app.parse_dalfox_lines(REAL_DALFOX_LINES + '{"type":"V","param":"x","data":"http://evil.example/?x=1","payload":"p"}\nnot json\n[1]\n', "http://t.example/")
+    assert [f[0] for f in findings] == ["Medium", "High"]
+    assert findings[1][1] == "Cross-site scripting: parameter 'q' executes a verified payload" and findings[1][5] == "High"
+    assert findings[0][1].startswith("Input reflected without encoding") and findings[0][5] == "Medium"
+    assert all("evil.example" not in f[2] for f in findings)
+    assert app.parse_dalfox_lines("", "http://t.example/") == []
+
+
+def test_dalfox_runs_without_browser_mining_or_callbacks_and_with_known_parameters(monkeypatch):
+    seen = []
+    monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/dalfox")
+    class Done: returncode = 0; stdout = ""; stderr = ""
+    def fake_run(command, **kwargs):
+        seen.append(command)
+        app.Path(command[command.index("--output") + 1]).write_text(REAL_DALFOX_LINES)
+        return Done()
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    findings, status = app.perform_dalfox_check("http://t.example/", ["http://t.example/search?q=test&page=2"])
+    command = seen[0]
+    assert command[:3] == ["/usr/bin/dalfox", "url", "http://t.example/search?q=test&page=2"]
+    for required in ("--skip-headless", "--skip-mining-all", "--skip-bav", "--skip-discovery", "--no-spinner"):
+        assert required in command
+    assert [command[i + 1] for i, a in enumerate(command) if a == "-p"] == ["q", "page"]
+    assert "-b" not in command and "--blind" not in command and "--remote-payloads" not in command
+    assert command[command.index("--format") + 1] == "jsonl"
+    assert status["status"] == "completed" and len(findings) == 2
+
+
+def test_dalfox_timeout_is_an_incomplete_test(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/dalfox")
+    monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("dalfox", 60)))
+    findings, status = app.perform_dalfox_check("http://t.example/", ["http://t.example/s?q=1"])
+    assert findings == [] and status["status"] == "timeout" and "not fully tested" in status["reason"]
+    monkeypatch.setattr(app.shutil, "which", lambda binary: None)
+    assert app.perform_dalfox_check("http://t.example/", ["http://t.example/s?q=1"])[1]["status"] == "unavailable"
+    assert app.perform_dalfox_check("http://t.example/", ["http://t.example/"])[1]["status"] == "skipped"
+
+
+def _active_scan(monkeypatch, urls, profile="active", sqlmap_result=None, dalfox_result=None):
+    monkeypatch.setattr(app, "perform_zap_passive_check", lambda *a, **k: ([], {"status": "completed"}))
+    for name in ("perform_whatweb_check", "perform_nikto_check", "perform_testssl_check", "perform_nuclei_check", "perform_wapiti_check"):
+        monkeypatch.setattr(app, name, lambda *a, **k: ([], {"status": "completed"}))
+    monkeypatch.setattr(app, "perform_ffuf_check", lambda *a, **k: ([], {"status": "completed"}))
+    calls = []
+    def fake_sqlmap(target, test_urls, *a, **k):
+        calls.append(("sqlmap", list(test_urls))); return sqlmap_result or ([], {"status": "completed", "finding_count": 0})
+    def fake_dalfox(target, test_urls, *a, **k):
+        calls.append(("dalfox", list(test_urls))); return dalfox_result or ([], {"status": "completed", "finding_count": 0})
+    monkeypatch.setattr(app, "perform_sqlmap_check", fake_sqlmap)
+    monkeypatch.setattr(app, "perform_dalfox_check", fake_dalfox)
+    monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/" + str(binary))
+    target = "http://inj-" + profile + ".example/"
+    page = _FakeHTTP(); page.geturl = lambda: target
+    monkeypatch.setattr(app, "urlopen", lambda *a, **k: page)
+    monkeypatch.setattr(app, "discover_same_origin_pages", lambda url, html: {"status": "completed", "urls": [url] + urls})
+    with app.connect() as conn:
+        scan_id = conn.execute("INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)", (target, profile, "running", app.now())).lastrowid
+    app.perform_scan(scan_id, target, profile)
+    return scan_id, calls
+
+
+def test_active_scan_runs_sqlmap_and_dalfox_and_merges_their_findings(monkeypatch):
+    sql = ([("High", "SQL injection: parameter 'id' (GET) appears injectable", "http://inj-active.example/item?id=1", "e", "f", "High")], {"status": "completed", "finding_count": 1})
+    xss = ([("High", "Cross-site scripting: parameter 'q' executes a verified payload", "http://inj-active.example/s?q=1", "e", "f", "High")], {"status": "completed", "finding_count": 1})
+    scan_id, calls = _active_scan(monkeypatch, ["http://inj-active.example/item?id=1", "http://inj-active.example/s?q=1"], sqlmap_result=sql, dalfox_result=xss)
+    row, tools, summary = _scan_row(scan_id)
+    assert [c[0] for c in calls] == ["sqlmap", "dalfox"]
+    assert tools["SQL injection (sqlmap)"]["status"] == "completed" and tools["XSS (dalfox)"]["status"] == "completed"
+    assert summary["sqlmap_check"]["status"] == "completed" and summary["dalfox_check"]["status"] == "completed"
+    titles = [f["title"] for f in client.get(f"/api/scans/{scan_id}").json()["findings"]]
+    assert any(t.startswith("SQL injection") for t in titles) and any(t.startswith("Cross-site scripting") for t in titles)
+    assert {p["tool"] for p in summary["coverage"]["planned"]} >= {"ffuf", "sqlmap", "dalfox"}
+    assert summary["coverage"]["not_covered"] == []
+
+
+def test_injection_tools_never_run_outside_the_active_profile(monkeypatch):
+    scan_id, calls = _active_scan(monkeypatch, ["http://inj-deep.example/item?id=1"], profile="deep")
+    row, tools, summary = _scan_row(scan_id)
+    assert calls == []
+    assert tools["SQL injection (sqlmap)"]["status"] == "skipped" and tools["XSS (dalfox)"]["status"] == "skipped"
+    assert row["status"] == "completed"
+    stage_findings, status, state = app.run_engine_stage("sqlmap", "http://t.example/", "standard", ["http://t.example/p?id=1"])
+    assert status["status"] == "skipped" and stage_findings == []
+    assert app.run_engine_stage("dalfox", "http://t.example/", "deep", ["http://t.example/p?id=1"])[1]["status"] == "skipped"
+
+
+def test_missing_injection_tool_asks_for_approval_and_a_timeout_is_a_gap(monkeypatch):
+    monkeypatch.setattr(app.shutil, "which", lambda binary: None)
+    scan_id, _ = _active_scan(monkeypatch, ["http://inj-active.example/item?id=1"],
+                              sqlmap_result=([], {"status": "unavailable", "reason": "sqlmap is not installed"}),
+                              dalfox_result=([], {"status": "timeout", "reason": "time limit reached"}))
+    monkeypatch.setattr(app.shutil, "which", lambda binary: None)  # _active_scan re-patched which to present
+    row, tools, summary = _scan_row(scan_id)
+    assert row["status"] == "completed_with_gaps"
+    assert tools["XSS (dalfox)"]["status"] == "timeout"
+    assert {g["tool"] for g in summary["assessment_gaps"]} >= {"XSS (dalfox)"}
+    created = app.request_missing_tools(scan_id, "active", {}, {"sqlmap": {"status": "unavailable"}, "dalfox": {"status": "unavailable"}})
+    assert len(created) == 2
+    requests = {r["tool_id"]: r for r in client.get(f"/api/tool-requests?scan_id={scan_id}").json()}
+    assert requests["sqlmap"]["package"] == "sqlmap" and requests["dalfox"]["package"] == "dalfox"

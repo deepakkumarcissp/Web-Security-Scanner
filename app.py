@@ -958,6 +958,199 @@ def perform_ffuf_check(target: str, timeout_seconds: int = 60) -> tuple[list[tup
                       "safety": "Deep/Active profiles only; same supplied origin; GET requests from a short built-in wordlist; 10 requests/second, 4 threads; no redirects followed; no recursion"}
 
 
+SAFE_URL = re.compile(r"^https?://[^\s\x00-\x1f\x7f]+$")
+
+
+def select_test_urls(target: str, urls, limit: int = 4) -> list[str]:
+    """Same-origin URLs with query parameters worth testing, one per endpoint+parameter-name shape.
+
+    Values come from crawled pages, so they are untrusted: only plain http(s) URLs without whitespace or
+    control characters are ever passed to an external tool, always as a single argument after a flag.
+    """
+    root = urlparse(target)
+    root_port = root.port or (443 if root.scheme == "https" else 80)
+    chosen, shapes = [], set()
+    for url in urls or []:
+        url = str(url)
+        if len(url) > 2000 or not SAFE_URL.match(url):
+            continue
+        parsed = urlparse(url)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if (not parsed.query or parsed.scheme != root.scheme or (parsed.hostname or "").lower() != (root.hostname or "").lower()
+                or port != root_port):
+            continue
+        shape = (parsed.path, tuple(sorted(pair.split("=", 1)[0] for pair in parsed.query.split("&"))))
+        if shape in shapes:
+            continue
+        shapes.add(shape)
+        chosen.append(url)
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
+def parse_sqlmap_log(text: str, url: str) -> list[tuple]:
+    """Findings from sqlmap's structured session log ('Parameter: id (GET)' blocks); console chatter is never parsed."""
+    findings = []
+    dbms = re.search(r"^back-end DBMS: (.+)$", text, re.M)
+    blocks = re.split(r"(?m)^Parameter: ", text)[1:]
+    for block in blocks:
+        header, _, rest = block.partition("\n")
+        match = re.match(r"(.+?) \(([^)]+)\)\s*$", header.strip())
+        if not match:
+            continue
+        name, where = match.group(1)[:80], match.group(2)[:40]
+        rest = rest.split("\n---")[0]
+        techniques = re.findall(r"Type: (.+)\n\s*Title: (.+)", rest)
+        payload = re.search(r"Payload: (.+)", rest)
+        if not techniques:
+            continue
+        evidence = "sqlmap confirmed injection using: " + "; ".join(f"{t.strip()} ({ti.strip()})" for t, ti in techniques[:4])
+        if payload:
+            evidence += ". Example payload: " + payload.group(1).strip()[:200]
+        if dbms:
+            evidence += ". Back-end DBMS: " + dbms.group(1).strip()[:80]
+        findings.append(("High", f"SQL injection: parameter '{name}' ({where}) appears injectable", url[:2048], evidence[:1800],
+                         "Use parameterized queries or prepared statements for every database call, validate input, and run the database account with least privilege. Retest after the fix.",
+                         "High"))
+    return findings
+
+
+def perform_sqlmap_check(target: str, urls, timeout_seconds: int = 240) -> tuple[list[tuple], dict]:
+    """Detection-only SQL injection testing of a few same-origin parameterised URLs (Active profile only)."""
+    test_urls = select_test_urls(target, urls)
+    if not test_urls:
+        return [], {"status": "skipped", "reason": "No same-origin URLs with query parameters were found to test"}
+    binary = shutil.which(TOOL_CATALOG["sqlmap"]["binary"])
+    if not binary:
+        return [], {"status": "unavailable", "reason": "sqlmap is not installed"}
+    per_url = max(30, min(timeout_seconds // len(test_urls), 90))
+    findings, timed_out, errors = [], 0, []
+    with tempfile.TemporaryDirectory(prefix="dkcissp-sqlmap-") as temp_dir:
+        for index, url in enumerate(test_urls):
+            out_dir = str(Path(temp_dir) / f"run{index}")
+            command = [binary, "-u", url, "--batch", "--level=1", "--risk=1", "--technique=BEU", "--threads=1",
+                       "--timeout=10", "--retries=1", "--delay=0.2", "--ignore-redirects", "--flush-session",
+                       "--disable-coloring", "--user-agent=DKCISSP-WebSecurityScanner/0.1 (+authorized active testing)",
+                       "--output-dir=" + out_dir]
+            try:
+                subprocess.run(command, capture_output=True, text=True, timeout=per_url, check=False,
+                               env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"})
+            except subprocess.TimeoutExpired:
+                timed_out += 1
+            except OSError as exc:
+                errors.append(str(exc)[:200])
+                continue
+            for log_path in Path(out_dir).glob("*/log"):  # partial results survive a timeout
+                try:
+                    findings.extend(parse_sqlmap_log(log_path.read_text(encoding="utf-8", errors="replace"), url))
+                except OSError:
+                    errors.append("Could not read sqlmap's session log")
+    status = "completed"
+    reason = f"{len(test_urls)} URL(s) tested with detection-only settings (level 1, risk 1, no data extraction)"
+    if errors and not findings:
+        status, reason = "error", errors[0]
+    elif timed_out:
+        status = "partial_timeout" if findings else "timeout"
+        reason = f"time limit reached on {timed_out} of {len(test_urls)} URL(s); results so far are kept"
+    return findings, {"status": status, "reason": reason, "finding_count": len(findings), "urls_tested": len(test_urls),
+                      "safety": "Active profile only; same-origin parameterised URLs; level 1, risk 1; boolean, error and union techniques only (no stacked queries); no data extraction; 0.2 s delay; redirects not followed"}
+
+
+def query_parameter_names(url: str, limit: int = 8) -> list[str]:
+    """Plain parameter names from a URL's query string (letters, digits, _ - . [ ] only), in order, deduplicated."""
+    names = []
+    for pair in urlparse(url).query.split("&"):
+        name = pair.split("=", 1)[0]
+        if name and re.fullmatch(r"[A-Za-z0-9_.\-\[\]]{1,64}", name) and not name.startswith("-") and name not in names:
+            names.append(name)
+    return names[:limit]
+
+
+def parse_dalfox_lines(text: str, target: str) -> list[tuple]:
+    """Findings from dalfox's JSON-lines output (one result per line, so a timeout keeps earlier results)."""
+    root = urlparse(target)
+    root_port = root.port or (443 if root.scheme == "https" else 80)
+    findings, seen = [], set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type") or "")
+        param = str(item.get("param") or "")[:80]
+        data = str(item.get("data") or "")
+        parsed = urlparse(data)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if kind not in ("V", "R") or (parsed.scheme != root.scheme or (parsed.hostname or "").lower() != (root.hostname or "").lower() or port != root_port):
+            continue
+        key = (kind, param, parsed.path)
+        if key in seen:
+            continue
+        seen.add(key)
+        where = str(item.get("inject_type") or "response")[:60]
+        evidence = f"Injection context: {where}. Payload: {str(item.get('payload') or '')[:200]}. Evidence: {str(item.get('evidence') or '')[:300]}"
+        if kind == "V":
+            findings.append(("High", f"Cross-site scripting: parameter '{param}' executes a verified payload", data[:2048], evidence[:1800],
+                             "Encode output for its HTML/JavaScript/attribute context, validate input, and add a strict Content-Security-Policy. Retest after the fix.", "High"))
+        else:
+            findings.append(("Medium", f"Input reflected without encoding (possible XSS): parameter '{param}'", data[:2048], evidence[:1800],
+                             "Encode reflected input for its output context and confirm manually whether a payload can execute.", "Medium"))
+    return findings
+
+
+def perform_dalfox_check(target: str, urls, timeout_seconds: int = 540) -> tuple[list[tuple], dict]:
+    """Detection-only reflected-XSS testing of a few same-origin parameterised URLs (Active profile only)."""
+    test_urls = select_test_urls(target, urls, limit=3)
+    if not test_urls:
+        return [], {"status": "skipped", "reason": "No same-origin URLs with query parameters were found to test"}
+    binary = shutil.which(TOOL_CATALOG["dalfox"]["binary"])
+    if not binary:
+        return [], {"status": "unavailable", "reason": "dalfox is not installed"}
+    per_url = max(60, min(timeout_seconds // len(test_urls), 180))
+    findings, timed_out, errors = [], 0, []
+    with tempfile.TemporaryDirectory(prefix="dkcissp-dalfox-") as temp_dir:
+        for index, url in enumerate(test_urls):
+            out_path = str(Path(temp_dir) / f"dalfox{index}.jsonl")
+            names = query_parameter_names(url)
+            if not names:
+                continue
+            command = [binary, "url", url, "--silence", "--no-color", "--no-spinner", "--format", "jsonl", "--output", out_path,
+                       "--timeout", "10", "--delay", "150", "--worker", "3", "--skip-bav", "--skip-mining-all",
+                       "--skip-headless", "--skip-grepping", "--skip-discovery",
+                       *[arg for name in names for arg in ("-p", name)], "--limit-result", "1", "--limit-result-type", "v",
+                       "--user-agent", "DKCISSP-WebSecurityScanner/0.1 (+authorized active testing)"]
+            try:
+                subprocess.run(command, capture_output=True, text=True, timeout=per_url, check=False,
+                               env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"})
+            except subprocess.TimeoutExpired:
+                timed_out += 1
+            except OSError as exc:
+                errors.append(str(exc)[:200])
+                continue
+            if os.path.isfile(out_path):
+                try:
+                    with open(out_path, encoding="utf-8", errors="replace") as handle:
+                        findings.extend(parse_dalfox_lines(handle.read(), target))
+                except OSError:
+                    errors.append("Could not read dalfox's result file")
+    status = "completed"
+    reason = f"{len(test_urls)} URL(s) tested; no browser or blind-callback features used"
+    if errors and not findings:
+        status, reason = "error", errors[0]
+    elif timed_out:
+        # An unfinished payload run is an incomplete test, not a clean result.
+        status = "partial_timeout" if findings else "timeout"
+        reason = f"time limit reached before dalfox finished testing {timed_out} of {len(test_urls)} URL(s); findings so far are kept, but those URLs were not fully tested"
+    return findings, {"status": status, "reason": reason, "finding_count": len(findings), "urls_tested": len(test_urls),
+                      "safety": "Active profile only; same-origin parameterised URLs; reflected payloads only; no headless browser, parameter mining, blind-XSS callbacks or BAV; 3 workers, 150 ms delay; stops at the first verified result per URL"}
+
+
 def parse_wapiti_report(report, target: str) -> list[tuple]:
     """Normalize Wapiti JSON without storing raw requests, cookies, or curl commands."""
     if not isinstance(report, dict):
@@ -1152,6 +1345,8 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         "Nuclei": {"status": "queued", "detail": "Waiting for built-in checks"},
         "Nikto": {"status": "queued", "detail": "Runs in Deep and Active profiles"},
         "Content discovery (ffuf)": {"status": "queued", "detail": "Runs in Deep and Active profiles"},
+        "SQL injection (sqlmap)": {"status": "queued", "detail": "Runs only in the Active profile"},
+        "XSS (dalfox)": {"status": "queued", "detail": "Runs only in the Active profile"},
         "Wapiti active checks": {"status": "queued", "detail": "Runs only after explicit active-testing approval"},
         "WhatWeb": {"status": "queued", "detail": "Waiting for built-in checks"},
         "TLS (testssl.sh)": {"status": "queued", "detail": "Waiting for built-in checks"},
@@ -1317,6 +1512,8 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         whatweb_status = {"status": "not_run", "reason": "Technology discovery not requested by profile"}
         whatweb_findings = []
         ffuf_status = {"status": "not_run", "reason": "Content discovery runs in Deep and Active profiles only"}
+        sqlmap_status = {"status": "not_run", "reason": "SQL injection testing runs only in the Active profile"}
+        dalfox_status = {"status": "not_run", "reason": "XSS testing runs only in the Active profile"}
         nuclei_status = {"status": "not_run", "reason": "Nuclei checks are enabled for Standard/Deep/Active profiles only"}
         nikto_status = {"status": "not_run", "reason": "Nikto server checks are enabled for Deep/Active profiles only"}
         if profile in ("deep", "active"):
@@ -1397,10 +1594,27 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         else:
             tool_status["Wapiti active checks"] = {"status": "skipped", "detail": "Requires the separate Active profile and explicit approval"}
 
+        if profile == "active":
+            injection_urls = discovery_status.get("urls", [target])
+            for tool_id, runner, name in (("sqlmap", perform_sqlmap_check, "SQL injection (sqlmap)"), ("dalfox", perform_dalfox_check, "XSS (dalfox)")):
+                tool_status[name] = {"status": "running", "detail": "Active tests approved; testing same-origin URLs that have query parameters"}
+                update_scan_progress(scan_id, 94, f"Running approved {TOOL_CATALOG[tool_id]['label']} tests", tool_status)
+                tool_findings, result = runner(target, injection_urls)
+                findings.extend(tool_findings)
+                tool_status[name] = {"status": result.get("status", "error"), "detail": f"{result.get('finding_count', len(tool_findings))} finding(s); {result.get('reason', 'check finished')}"}
+                if tool_id == "sqlmap":
+                    sqlmap_status = result
+                else:
+                    dalfox_status = result
+        else:
+            tool_status["SQL injection (sqlmap)"] = {"status": "skipped", "detail": "Runs only in the Active profile with explicit approval"}
+            tool_status["XSS (dalfox)"] = {"status": "skipped", "detail": "Runs only in the Active profile with explicit approval"}
+
         # A missing tool is never installed silently: record a request naming what needed it.
         request_missing_tools(scan_id, profile, tool_status, {
             "nuclei": nuclei_status, "nikto": nikto_status, "whatweb": whatweb_status,
             "testssl": tls_status, "wapiti": wapiti_status, "ffuf": ffuf_status,
+            "sqlmap": sqlmap_status, "dalfox": dalfox_status,
         })
 
         # Plan what else this target deserves, and say plainly what no engine here covers yet.
@@ -1435,7 +1649,7 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                         "tls_check": tls_status, "whatweb_check": whatweb_status,
                         "nuclei_check": nuclei_status, "nikto_check": nikto_status, "wapiti_check": wapiti_status, "zap_check": zap_status,
                         "endpoint_discovery": discovery_status, "ffuf_check": {k: v for k, v in ffuf_status.items() if k != "found_urls"},
-                        "coverage": coverage,
+                        "sqlmap_check": sqlmap_status, "dalfox_check": dalfox_status, "coverage": coverage,
                         "finding_count": len(findings), "assessment_gaps": gaps,
                     }),
                     "Assessment complete with gaps" if gaps else "Assessment complete", json.dumps(tool_status), scan_id,
@@ -2007,6 +2221,8 @@ TOOL_CATALOG = {
     "testssl": {"label": "testssl.sh", "binary": "testssl.sh", "package": "testssl.sh", "version_args": ["--version"], "purpose": "TLS and HTTPS configuration assessment"},
     "nuclei": {"label": "Nuclei", "binary": "nuclei", "package": "nuclei", "version_args": ["-version"], "purpose": "Template-based checks for known exposures and misconfigurations"},
     "nikto": {"label": "Nikto", "binary": "nikto", "package": "nikto", "version_args": ["-Version"], "purpose": "Deep-profile checks for common web-server files and misconfigurations"},
+    "sqlmap": {"label": "sqlmap", "binary": "sqlmap", "package": "sqlmap", "version_args": ["--version"], "purpose": "Active SQL injection testing of URL parameters (Active profile only)"},
+    "dalfox": {"label": "dalfox", "binary": "dalfox", "package": "dalfox", "version_args": ["version"], "purpose": "Active cross-site scripting testing of URL parameters (Active profile only)"},
     "ffuf": {"label": "ffuf", "binary": "ffuf", "package": "ffuf", "version_args": ["-V"], "purpose": "Hidden content and path discovery with a built-in wordlist"},
     "wapiti": {"label": "Wapiti", "binary": "wapiti", "package": "wapiti", "version_args": ["--version"], "purpose": "Explicitly approved active tests for web-application vulnerabilities"},
 }
@@ -2123,6 +2339,8 @@ ENGINE_STAGES = {
     "testssl": {"stage": "TLS (testssl.sh)", "summary_key": "tls_check"},
     "wapiti": {"stage": "Wapiti active checks", "summary_key": "wapiti_check"},
     "ffuf": {"stage": "Content discovery (ffuf)", "summary_key": "ffuf_check"},
+    "sqlmap": {"stage": "SQL injection (sqlmap)", "summary_key": "sqlmap_check"},
+    "dalfox": {"stage": "XSS (dalfox)", "summary_key": "dalfox_check"},
 }
 LOCAL_CLIENTS = {"127.0.0.1", "::1", "testclient"}
 
@@ -2272,6 +2490,13 @@ def run_engine_stage(tool_id: str, target: str, profile: str, urls: list[str]):
             findings, status = perform_testssl_check(target)
         else:
             findings, status = [], {"status": "skipped", "reason": "TLS assessment requires an HTTPS target"}
+        label = "finding(s)"
+    elif tool_id in ("sqlmap", "dalfox"):
+        runner = perform_sqlmap_check if tool_id == "sqlmap" else perform_dalfox_check
+        if profile != "active":
+            findings, status = [], {"status": "skipped", "reason": f"{TOOL_CATALOG[tool_id]['label']} runs only in the Active profile"}
+        else:
+            findings, status = runner(target, urls)
         label = "finding(s)"
     elif tool_id == "ffuf":
         if profile not in ("deep", "active"):
