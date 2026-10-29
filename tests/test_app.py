@@ -1306,3 +1306,182 @@ def test_dashboard_exposes_the_approval_page():
     page = client.get("/").text
     assert 'data-page="approvals"' in page and 'id="approvals"' in page
     assert "loadApprovals" in page and "decideTool" in page
+
+
+# ---- planner and content discovery ----------------------------------------------------------------
+
+def test_planner_applies_rules_by_profile_technology_and_parameters():
+    import planner
+    standard = planner.Facts(profile="standard")
+    deep = planner.Facts(profile="deep")
+    active = planner.Facts(profile="active", has_parameters=True, technologies={"wordpress"})
+    assert [r.id for r in planner.RULES if planner.rule_applies(r, standard)] == []
+    assert [r.id for r in planner.RULES if planner.rule_applies(r, deep)] == ["content_discovery"]
+    assert {r.id for r in planner.RULES if planner.rule_applies(r, active)} == {"content_discovery", "wordpress", "sql_injection", "xss"}
+    # Technology-specific rules need the technology; injection rules need parameters.
+    assert "wordpress" not in {r.id for r in planner.RULES if planner.rule_applies(r, planner.Facts(profile="deep"))}
+    assert "sql_injection" not in {r.id for r in planner.RULES if planner.rule_applies(r, planner.Facts(profile="active"))}
+
+
+def test_planner_reports_unavailable_engines_as_coverage_notes_not_silence():
+    import planner
+    facts = planner.Facts(profile="deep", technologies={"wordpress"}, url_count=5)
+    plan = planner.plan_coverage(facts, available_tools={"ffuf"})
+    assert [p["tool"] for p in plan["planned"]] == ["ffuf"]
+    assert [n["tool"] for n in plan["not_covered"]] == ["wpscan"]
+    assert "not available in this version" in plan["not_covered"][0]["message"]
+    assert "WordPress was detected" in plan["not_covered"][0]["message"]
+    nothing_available = planner.plan_coverage(facts, available_tools=set())
+    assert {n["tool"] for n in nothing_available["not_covered"]} == {"ffuf", "wpscan"}
+    assert plan["facts"]["technologies"] == ["wordpress"]
+
+
+def test_planner_detects_technologies_from_markup_headers_and_fingerprints():
+    import planner
+    assert planner.detect_technologies({}, '<link href="/wp-content/themes/x/style.css">') == {"wordpress"}
+    assert planner.detect_technologies({"x-generator": "Drupal 10"}, "") == {"drupal"}
+    assert planner.detect_technologies({}, "<meta name=\"generator\" content=\"Joomla! 4\">") == {"joomla"}
+    assert planner.detect_technologies({}, "<html>plain</html>", ["WhatWeb technology detected: WordPress"]) == {"wordpress"}
+    assert planner.detect_technologies({}, "<html>plain</html>") == set()
+    assert planner.has_query_parameters(["http://a.example/", "http://a.example/p?id=1"]) is True
+    assert planner.has_query_parameters(["http://a.example/", "http://a.example/p"]) is False
+
+
+def test_ffuf_report_parser_ranks_findings_and_keeps_only_the_approved_origin():
+    report = {"results": [
+        {"url": "http://t.example/.git/HEAD", "status": 200, "length": 23},
+        {"url": "http://t.example/backup", "status": 200, "length": 900},
+        {"url": "http://t.example/about", "status": 200, "length": 500},
+        {"url": "http://t.example/admin", "status": 403, "length": 10},
+        {"url": "http://t.example/old", "status": 404, "length": 10},
+        {"url": "http://evil.example/admin", "status": 200, "length": 10},
+        {"url": "http://t.example:8080/other", "status": 200, "length": 10},
+        {"url": "http://t.example/about", "status": 200, "length": 500},
+        {"url": "http://t.example/x", "status": "bad"},
+        "junk",
+    ]}
+    findings, urls = app.parse_ffuf_report(report, "http://t.example/")
+    assert [f[0] for f in findings] == ["High", "Medium", "Info", "Info"]
+    assert findings[0][1].startswith("Sensitive file or directory appears exposed: /.git/HEAD")
+    assert findings[0][5] == "Medium" and "Verify manually" in findings[0][4]
+    assert "Protected path exists: /admin (HTTP 403)" in findings[3][1]
+    assert urls == ["http://t.example/.git/HEAD", "http://t.example/backup", "http://t.example/about"]
+    redirects = {"results": [
+        {"url": "http://t.example/admin", "status": 301, "length": 0, "redirectlocation": "http://t.example/admin/"},
+        {"url": "http://t.example/docs", "status": 301, "length": 0, "redirectlocation": "/docs/"},
+        {"url": "http://t.example/account", "status": 302, "length": 0, "redirectlocation": "/login"},
+    ]}
+    found, urls = app.parse_ffuf_report(redirects, "http://t.example/")
+    assert [(f[0], f[1].split(":")[0]) for f in found] == [("Medium", "Potentially sensitive path is reachable"),
+                                                         ("Info", "Hidden or unlinked content found"),
+                                                         ("Info", "Path exists and redirects elsewhere")]
+    assert urls == []  # directory redirects are not 200 pages, so they are not fed to later stages
+    assert app.parse_ffuf_report({"results": "nope"}, "http://t.example/") == ([], [])
+    assert app.parse_ffuf_report(None, "http://t.example/") == ([], [])
+
+
+def test_ffuf_runs_with_bounded_arguments_and_reads_only_its_json_report(monkeypatch):
+    import json
+    seen = {}
+    monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/ffuf")
+    def fake_run(command, **kwargs):
+        seen["command"] = command
+        out = command[command.index("-o") + 1]
+        with open(out, "w") as handle:
+            json.dump({"results": [{"url": "http://t.example/admin", "status": 200, "length": 5}]}, handle)
+        return SimpleNamespaceResult()
+    class SimpleNamespaceResult: returncode = 0; stdout = "console text that must be ignored"; stderr = ""
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    findings, status = app.perform_ffuf_check("http://t.example/", timeout_seconds=60)
+    command = seen["command"]
+    assert command[command.index("-u") + 1] == "http://t.example/FUZZ"
+    assert command[command.index("-rate") + 1] == "10" and command[command.index("-t") + 1] == "4"
+    assert "-recursion" not in command and "-r" not in command  # no recursion, no redirect following
+    assert command[command.index("-w") + 1].endswith("wordlists/common-paths.txt")
+    assert status["status"] == "completed" and status["found_urls"] == ["http://t.example/admin"]
+    assert findings and findings[0][1].startswith("Potentially sensitive path is reachable: /admin")
+
+
+def test_ffuf_missing_or_failing_is_reported_truthfully(monkeypatch):
+    import subprocess
+    monkeypatch.setattr(app.shutil, "which", lambda binary: None)
+    assert app.perform_ffuf_check("http://t.example/") == ([], {"status": "unavailable", "reason": "ffuf is not installed"})
+    monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/ffuf")
+    monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("ffuf", 60)))
+    assert app.perform_ffuf_check("http://t.example/")[1]["status"] == "timeout"
+    class Done: returncode = 0; stdout = ""; stderr = ""
+    monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: Done())
+    status = app.perform_ffuf_check("http://t.example/")[1]
+    assert status["status"] == "error" and "no findings were inferred" in status["reason"]
+
+
+def test_builtin_wordlist_is_present_and_bounded():
+    lines = [l for l in (app.ROOT / "wordlists" / "common-paths.txt").read_text().splitlines() if l and not l.startswith("#")]
+    assert 100 <= len(lines) <= 400 and len(lines) == len(set(lines))
+    assert ".git/HEAD" in lines and "admin" in lines and not any(" " in l or l.startswith("/") for l in lines)
+
+
+def _deep_scan(monkeypatch, ffuf_result, target="http://deep-test.example/", body="<html></html>"):
+    monkeypatch.setattr(app, "perform_zap_passive_check", lambda *a, **k: ([], {"status": "completed"}))
+    for name in ("perform_whatweb_check", "perform_nikto_check", "perform_testssl_check", "perform_nuclei_check"):
+        monkeypatch.setattr(app, name, lambda *a, **k: ([], {"status": "completed"}))
+    seen = {}
+    def fake_nuclei(target, timeout_seconds=60, targets=None, max_templates=30):
+        seen["urls"] = targets
+        return [], {"status": "completed"}
+    monkeypatch.setattr(app, "perform_nuclei_check", fake_nuclei)
+    monkeypatch.setattr(app, "perform_ffuf_check", lambda *a, **k: ffuf_result)
+    monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/" + str(binary))
+    page = _FakeHTTP()
+    page.geturl = lambda: target
+    page.read = lambda _n=-1: body.encode()
+    monkeypatch.setattr(app, "urlopen", lambda *a, **k: page)
+    monkeypatch.setattr(app, "discover_same_origin_pages", lambda url, html: {"status": "completed", "urls": [url]})
+    with app.connect() as conn:
+        scan_id = conn.execute("INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+                               (target, "deep", "running", app.now())).lastrowid
+    app.perform_scan(scan_id, target, "deep")
+    return scan_id, seen
+
+
+def test_deep_scan_runs_content_discovery_and_feeds_found_pages_to_later_stages(monkeypatch):
+    import json
+    finding = ("Medium", "Potentially sensitive path is reachable: /backup", "http://deep-test.example/backup", "e", "f", "Medium")
+    scan_id, seen = _deep_scan(monkeypatch, ([finding], {"status": "completed", "finding_count": 1,
+                                                         "found_urls": ["http://deep-test.example/backup"]}))
+    row, tools, summary = _scan_row(scan_id)
+    assert tools["Content discovery (ffuf)"]["status"] == "completed"
+    assert seen["urls"] == ["http://deep-test.example/", "http://deep-test.example/backup"]
+    assert "found_urls" not in summary["ffuf_check"]
+    assert any(f["title"].startswith("Potentially sensitive path") for f in client.get(f"/api/scans/{scan_id}").json()["findings"])
+    assert summary["coverage"]["planned"][0]["tool"] == "ffuf" and summary["coverage"]["not_covered"] == []
+
+
+def test_standard_scan_skips_content_discovery_and_notes_uncovered_technology(monkeypatch):
+    import json
+    scan_id, _ = _deep_scan(monkeypatch, ([], {"status": "completed"}), "http://wp-test.example/",
+                            '<link href="/wp-content/themes/a/style.css">')
+    row, tools, summary = _scan_row(scan_id)
+    assert summary["coverage"]["facts"]["technologies"] == ["wordpress"]
+    assert [n["tool"] for n in summary["coverage"]["not_covered"]] == ["wpscan"]
+    assert "not available in this version" in summary["coverage"]["not_covered"][0]["message"]
+    assert row["status"] == "completed"  # a coverage note is information, not a failed stage
+
+
+def test_missing_ffuf_asks_for_approval_then_runs_and_merges(monkeypatch):
+    scan_id, _ = _deep_scan(monkeypatch, ([], {"status": "unavailable", "reason": "ffuf is not installed"}), "http://ffuf-missing.example/")
+    monkeypatch.setattr(app.shutil, "which", lambda binary: None if binary == "ffuf" else "/usr/bin/" + str(binary))
+    # The scan above ran with every binary present; re-create the missing-tool situation explicitly.
+    tool_status = {}
+    created = app.request_missing_tools(scan_id, "deep", tool_status, {"ffuf": {"status": "unavailable"}})
+    assert len(created) == 1 and tool_status["Content discovery (ffuf)"]["status"] == "needs_tool_approval"
+    request = client.get(f"/api/tool-requests?scan_id={scan_id}").json()[0]
+    assert request["tool_id"] == "ffuf" and request["package"] == "ffuf"
+    monkeypatch.setattr(app, "_spawn", lambda function, *args: function(*args))
+    monkeypatch.setattr(app, "install_package", lambda tool_id: (True, "ffuf was installed from the Kali repository."))
+    monkeypatch.setattr(app, "perform_ffuf_check", lambda target, timeout_seconds=60: (
+        [("Info", "Hidden or unlinked content found: /docs", target + "docs", "e", "f", "Low")], {"status": "completed", "finding_count": 1}))
+    client.post(f"/api/tool-requests/{request['id']}/decision", json={"decision": "approve"})
+    _, tools, summary = _scan_row(scan_id)
+    assert tools["Content discovery (ffuf)"]["status"] == "completed"
+    assert summary["ffuf_check"]["status"] == "completed"

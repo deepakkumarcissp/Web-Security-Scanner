@@ -22,6 +22,7 @@ from urllib.parse import urlparse, urlencode, urljoin, urldefrag
 from html.parser import HTMLParser
 from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler, HTTPSHandler
 
+import planner
 from fastapi import FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -861,6 +862,102 @@ def perform_nikto_check(target: str, timeout_seconds: int = 50) -> tuple[list[tu
                       "safety": "Deep profile only; same supplied target; bounded runtime and request delay; tuning excludes injection, DoS, command execution, upload, and authentication-bypass test groups; no redirect-following flag"}
 
 
+SENSITIVE_HIGH = re.compile(r"(^|/)(\.git|\.svn|\.hg|\.env[^/]*|\.htpasswd|id_rsa[^/]*|wp-config\.php[^/]*|credentials|passwords?\.txt)(/|$)", re.I)
+SENSITIVE_MEDIUM = re.compile(r"(backup|\.bak|\.sql|dump|phpinfo|phpmyadmin|adminer|actuator|server-status|server-info|\.zip|\.tar|"
+                              r"(^|/)(admin|administrator|console|manager|dashboard|cpanel|debug|trace|swagger|graphiql|api-docs|logs?|"
+                              r"config(uration)?(\.[a-z]+)?|settings\.php|web\.config|composer\.(json|lock)|package\.json|docker-compose\.yml|dockerfile)(/|$))", re.I)
+
+
+def parse_ffuf_report(report, target: str) -> tuple[list[tuple], list[str]]:
+    """Normalise ffuf JSON into findings plus same-origin URLs that answered 200 (to feed later stages)."""
+    root = urlparse(target)
+    root_port = root.port or (443 if root.scheme == "https" else 80)
+    results = report.get("results") if isinstance(report, dict) else None
+    if not isinstance(results, list):
+        return [], []
+    ranked, found_urls, seen = [], [], set()
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "")
+        parsed = urlparse(url)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if (parsed.scheme != root.scheme or (parsed.hostname or "").lower() != (root.hostname or "").lower() or port != root_port):
+            continue  # only the approved origin
+        try:
+            status = int(item.get("status"))
+        except (TypeError, ValueError):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        path = parsed.path.lstrip("/")
+        length = item.get("length", "?")
+        location = str(item.get("redirectlocation") or "")
+        # A server redirecting /admin to /admin/ is how most web servers answer for an existing directory.
+        directory_redirect = status in (301, 302, 307, 308) and urlparse(location).path.rstrip("/") == parsed.path.rstrip("/") and location.rstrip("/") != ""
+        if directory_redirect:
+            status = 200
+        evidence = f"HTTP {status}, {length} bytes, found by a content-discovery request; the response body was not inspected."
+        if status in (200, 204) and SENSITIVE_HIGH.search(path):
+            ranked.append((0, ("High", "Sensitive file or directory appears exposed: /" + path, url, evidence,
+                               "Remove the file from the web root or block access to it, then rotate any secrets it may contain. Verify manually.", "Medium")))
+        elif status in (200, 204) and SENSITIVE_MEDIUM.search(path):
+            ranked.append((1, ("Medium", "Potentially sensitive path is reachable: /" + path, url, evidence,
+                               "Restrict access (authentication, network controls) or remove the path if it is not needed. Verify manually.", "Medium")))
+        elif status in (200, 204):
+            ranked.append((2, ("Info", "Hidden or unlinked content found: /" + path, url, evidence,
+                               "Confirm the content is meant to be public; remove or protect anything that is not.", "Low")))
+        elif status in (401, 403):
+            ranked.append((3, ("Info", f"Protected path exists: /{path} (HTTP {status})", url, evidence,
+                               "No action needed if access control is intended; confirm it cannot be bypassed.", "Low")))
+        elif status in (301, 302, 307, 308):
+            ranked.append((3, ("Info", f"Path exists and redirects elsewhere: /{path}", url,
+                               f"HTTP {status} redirect to {location[:200] or 'another location'}; the response body was not inspected.",
+                               "Confirm the redirect target is intended; paths that redirect to a login page usually need authentication.", "Low")))
+        if status == 200 and not directory_redirect:
+            found_urls.append(url)
+    ranked.sort(key=lambda pair: pair[0])
+    return [finding for _, finding in ranked[:40]], found_urls
+
+
+def perform_ffuf_check(target: str, timeout_seconds: int = 60) -> tuple[list[tuple], dict]:
+    """Bounded hidden-content discovery against the supplied origin only, using the built-in wordlist."""
+    binary = shutil.which(TOOL_CATALOG["ffuf"]["binary"])
+    if not binary:
+        return [], {"status": "unavailable", "reason": "ffuf is not installed"}
+    wordlist = ROOT / "wordlists" / "common-paths.txt"
+    if not wordlist.is_file():
+        return [], {"status": "error", "reason": "The built-in content-discovery wordlist is missing"}
+    base = target.rstrip("/")
+    with tempfile.TemporaryDirectory(prefix="dkcissp-ffuf-") as temp_dir:
+        report_path = str(Path(temp_dir) / "ffuf.json")
+        command = [binary, "-u", base + "/FUZZ", "-w", str(wordlist), "-ic", "-ac", "-s", "-noninteractive",
+                   "-rate", "10", "-t", "4", "-timeout", "6", "-maxtime", str(max(10, timeout_seconds - 10)),
+                   "-mc", "200,204,301,302,307,308,401,403", "-H", "User-Agent: DKCISSP-WebSecurityScanner/0.1 (+authorized content discovery)",
+                   "-of", "json", "-o", report_path]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout_seconds, check=False,
+                                    env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"})
+        except subprocess.TimeoutExpired:
+            return [], {"status": "timeout", "timeout_seconds": timeout_seconds}
+        except OSError as exc:
+            return [], {"status": "error", "reason": str(exc)[:300]}
+        if not os.path.isfile(report_path) or os.path.getsize(report_path) == 0:
+            return [], {"status": "error", "return_code": result.returncode,
+                        "reason": "ffuf did not produce a JSON report; no findings were inferred from console text"}
+        try:
+            with open(report_path, encoding="utf-8", errors="replace") as handle:
+                report = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return [], {"status": "error", "return_code": result.returncode, "reason": "ffuf produced an unreadable JSON report"}
+    findings, found_urls = parse_ffuf_report(report, target)
+    return findings, {"status": "completed" if result.returncode == 0 else "completed_with_warnings",
+                      "return_code": result.returncode, "finding_count": len(findings), "found_urls": found_urls[:40],
+                      "timeout_seconds": timeout_seconds,
+                      "safety": "Deep/Active profiles only; same supplied origin; GET requests from a short built-in wordlist; 10 requests/second, 4 threads; no redirects followed; no recursion"}
+
+
 def parse_wapiti_report(report, target: str) -> list[tuple]:
     """Normalize Wapiti JSON without storing raw requests, cookies, or curl commands."""
     if not isinstance(report, dict):
@@ -1054,6 +1151,7 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         "Endpoint discovery": {"status": "queued", "detail": "Waiting for the initial page response"},
         "Nuclei": {"status": "queued", "detail": "Waiting for built-in checks"},
         "Nikto": {"status": "queued", "detail": "Runs in Deep and Active profiles"},
+        "Content discovery (ffuf)": {"status": "queued", "detail": "Runs in Deep and Active profiles"},
         "Wapiti active checks": {"status": "queued", "detail": "Runs only after explicit active-testing approval"},
         "WhatWeb": {"status": "queued", "detail": "Waiting for built-in checks"},
         "TLS (testssl.sh)": {"status": "queued", "detail": "Waiting for built-in checks"},
@@ -1217,8 +1315,24 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         # only for explicitly authorized scans, and its status is recorded in the scan summary.
         tls_status = {"status": "not_run", "reason": "TLS check not requested by profile"}
         whatweb_status = {"status": "not_run", "reason": "Technology discovery not requested by profile"}
+        whatweb_findings = []
+        ffuf_status = {"status": "not_run", "reason": "Content discovery runs in Deep and Active profiles only"}
         nuclei_status = {"status": "not_run", "reason": "Nuclei checks are enabled for Standard/Deep/Active profiles only"}
         nikto_status = {"status": "not_run", "reason": "Nikto server checks are enabled for Deep/Active profiles only"}
+        if profile in ("deep", "active"):
+            tool_status["Content discovery (ffuf)"] = {"status": "running", "detail": "Searching for hidden files and paths with a short built-in wordlist, 10 requests/second"}
+            update_scan_progress(scan_id, 31, "Searching for hidden content", tool_status)
+            ffuf_findings, ffuf_status = perform_ffuf_check(target, timeout_seconds=90 if profile == "active" else 60)
+            findings.extend(ffuf_findings)
+            # Pages that answered 200 join the same-origin list so later stages cover them too (cap stays 12).
+            merged = list(discovery_status.get("urls", [target]))
+            for found in ffuf_status.get("found_urls", []):
+                if found not in merged and len(merged) < 12:
+                    merged.append(found)
+            discovery_status["urls"] = merged
+            tool_status["Content discovery (ffuf)"] = {"status": ffuf_status.get("status", "error"), "detail": f"{ffuf_status.get('finding_count', len(ffuf_findings))} finding(s); {ffuf_status.get('reason', 'check finished')}"}
+        else:
+            tool_status["Content discovery (ffuf)"] = {"status": "skipped", "detail": "Runs in Deep and Active profiles"}
         if profile in ("standard", "deep", "active"):
             nuclei_targets = discovery_status.get("urls", [target])
             nuclei_template_cap = 60 if profile in ("deep", "active") else 30
@@ -1286,8 +1400,16 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         # A missing tool is never installed silently: record a request naming what needed it.
         request_missing_tools(scan_id, profile, tool_status, {
             "nuclei": nuclei_status, "nikto": nikto_status, "whatweb": whatweb_status,
-            "testssl": tls_status, "wapiti": wapiti_status,
+            "testssl": tls_status, "wapiti": wapiti_status, "ffuf": ffuf_status,
         })
+
+        # Plan what else this target deserves, and say plainly what no engine here covers yet.
+        facts = planner.Facts(
+            profile=profile, https=target.lower().startswith("https://"),
+            technologies=planner.detect_technologies(headers, body, [f[1] for f in whatweb_findings]),
+            has_parameters=planner.has_query_parameters(discovery_status.get("urls", [])),
+            url_count=len(discovery_status.get("urls", [])))
+        coverage = planner.plan_coverage(facts, set(ENGINE_STAGES))
 
         update_scan_progress(scan_id, 97, "Combining and deduplicating findings", tool_status)
         deduped = []
@@ -1312,7 +1434,8 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                         "checks": "passive HTTP/header checks, bounded same-origin discovery, curated Nuclei checks, WhatWeb fingerprinting, optional TLS assessment, Deep/Active Nikto checks, optional ZAP passive alerts, and explicitly approved Active-profile Wapiti tests",
                         "tls_check": tls_status, "whatweb_check": whatweb_status,
                         "nuclei_check": nuclei_status, "nikto_check": nikto_status, "wapiti_check": wapiti_status, "zap_check": zap_status,
-                        "endpoint_discovery": discovery_status,
+                        "endpoint_discovery": discovery_status, "ffuf_check": {k: v for k, v in ffuf_status.items() if k != "found_urls"},
+                        "coverage": coverage,
                         "finding_count": len(findings), "assessment_gaps": gaps,
                     }),
                     "Assessment complete with gaps" if gaps else "Assessment complete", json.dumps(tool_status), scan_id,
@@ -1884,6 +2007,7 @@ TOOL_CATALOG = {
     "testssl": {"label": "testssl.sh", "binary": "testssl.sh", "package": "testssl.sh", "version_args": ["--version"], "purpose": "TLS and HTTPS configuration assessment"},
     "nuclei": {"label": "Nuclei", "binary": "nuclei", "package": "nuclei", "version_args": ["-version"], "purpose": "Template-based checks for known exposures and misconfigurations"},
     "nikto": {"label": "Nikto", "binary": "nikto", "package": "nikto", "version_args": ["-Version"], "purpose": "Deep-profile checks for common web-server files and misconfigurations"},
+    "ffuf": {"label": "ffuf", "binary": "ffuf", "package": "ffuf", "version_args": ["-V"], "purpose": "Hidden content and path discovery with a built-in wordlist"},
     "wapiti": {"label": "Wapiti", "binary": "wapiti", "package": "wapiti", "version_args": ["--version"], "purpose": "Explicitly approved active tests for web-application vulnerabilities"},
 }
 
@@ -1998,6 +2122,7 @@ ENGINE_STAGES = {
     "whatweb": {"stage": "WhatWeb", "summary_key": "whatweb_check"},
     "testssl": {"stage": "TLS (testssl.sh)", "summary_key": "tls_check"},
     "wapiti": {"stage": "Wapiti active checks", "summary_key": "wapiti_check"},
+    "ffuf": {"stage": "Content discovery (ffuf)", "summary_key": "ffuf_check"},
 }
 LOCAL_CLIENTS = {"127.0.0.1", "::1", "testclient"}
 
@@ -2147,6 +2272,12 @@ def run_engine_stage(tool_id: str, target: str, profile: str, urls: list[str]):
             findings, status = perform_testssl_check(target)
         else:
             findings, status = [], {"status": "skipped", "reason": "TLS assessment requires an HTTPS target"}
+        label = "finding(s)"
+    elif tool_id == "ffuf":
+        if profile not in ("deep", "active"):
+            findings, status = [], {"status": "skipped", "reason": "Content discovery runs in the Deep and Active profiles"}
+        else:
+            findings, status = perform_ffuf_check(target, timeout_seconds=90 if profile == "active" else 60)
         label = "finding(s)"
     elif tool_id == "wapiti":
         if profile != "active":
