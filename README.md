@@ -68,6 +68,10 @@ SQLite persistence
 
 Standard/Deep scans now discover up to 12 same-origin URLs, with a maximum link depth of two and a short per-request timeout. Discovery extracts links, resource URLs, and form actions but never submits forms or executes JavaScript; query strings are retained, and cross-origin links/redirects are rejected. Passive header/cookie checks are repeated on discovered URLs. This is a bounded link crawler, not a JavaScript renderer or authenticated crawler, so it will miss client-side routes and pages requiring login. The ZAP adapter checks API readiness, fetches only the validated same-origin URLs already discovered by the scanner, reports the actual integration outcome, and does **not** launch a spider or active scan. The optional WhatWeb adapter runs for Standard/Deep/Active scans, uses aggression level 1, disables redirect following to prevent scope expansion, writes a temporary JSON report, and has a 30-second timeout. The optional `testssl.sh` adapter runs only for authorized HTTPS scans using Standard, Deep, or Active profiles, writes a temporary JSON report, and has a 75-second timeout. The Nuclei adapter runs for Standard/Deep/Active profiles using a curated local HTTP template set. Standard selects up to 30 templates; Deep and Active select up to 60, balanced across exposure, misconfiguration, TLS/header, technology, and CVE categories after filtering explicit high-risk tags, non-HTTP flows, state-changing methods, raw/payload-driven requests, and templates declaring over five requests. It scans up to 12 validated same-origin URLs, uses a 5 requests/second cap, concurrency 3, 4-second per-request timeout, no retries, redirects disabled, and OAST/Interactsh disabled. Standard is capped at 75 seconds and Deep at 150 seconds. Valid JSONL findings collected before a timeout are retained and the partial-timeout status is explicit. If a binary is missing or a tool errors/times out, the scan summary records that status and built-in checks continue. The application must not imply that an external tool ran when it did not.
 
+**Scan status semantics.** A scan is `completed` only when every stage the profile selected finished cleanly. If any stage was unavailable, timed out, errored, or finished with warnings, the scan is `completed_with_gaps` and the scan summary lists each gap under `assessment_gaps`. Stages a profile or target type deliberately excludes are reported as `skipped` and are not gaps. Findings are still saved, but the absence of findings does not cover a gap. Comparison caveats are added when either scan has gaps.
+
+**ZAP passive-queue handling.** ZAP analyses fetched pages asynchronously, so the adapter polls ZAP's passive-scan queue and treats it as drained only after two consecutive empty readings. If the queue does not drain in time, or its status cannot be read, the ZAP stage is `completed_with_warnings` with `passive_queue_status` set to `timeout` or `error` and a clear reason. The status also reports `passive_timeout_seconds`. This remains passive only: no ZAP spider or active scan is started. Tunables: `DKCISSP_ZAP_PASSIVE_TIMEOUT_SECONDS` (default 30, bounded 1-180) and `DKCISSP_ZAP_PASSIVE_POLL_SECONDS` (default 0.5, bounded 0.1-2).
+
 ## Current capabilities
 
 - Risk-focused dashboard with summary cards, findings, and scan history
@@ -154,7 +158,7 @@ Keep the terminal and application process running while using the dashboard and 
 3. Visit **Scanner Setup** and run the tool-status check.
 4. Install optional dependencies only when needed and only after reviewing the confirmation prompt.
 5. For local validation, use the DKCISSP Web Application Security Lab below, or another target you own or are explicitly authorized to test.
-6. Register the exact target URL in Asset Inventory and explicitly mark it In Scope before scanning. Unregistered or unapproved targets are blocked.
+6. Enter the target URL on **Assess Website** and tick the authorization confirmation. No asset registration is needed. Only scan targets you own or are explicitly authorized to test.
 7. Create a scan and review its findings, evidence, and remediation guidance.
 8. Export findings as CSV when you need to share or analyze results.
 9. Keep scan scope, permissions, and the intended test intensity documented.
@@ -176,9 +180,9 @@ Wait for the installer to finish its HTTP readiness checks. If you already clone
 
 **Step 2 — Start the scanner.** Follow this repository's installation instructions and open the scanner dashboard at `http://127.0.0.1:1005`.
 
-**Step 3 — Register and approve the assets.** Open **Asset Inventory** and register each exact local target URL you plan to test. Confirm authorization and set its scope to **In Scope**. The target selector does not register or approve assets for you.
+**Step 3 — Pick a target.** On **Assess Website**, choose a lab target from the selector (or type its URL), tick the authorization confirmation and start the assessment. No registration is needed.
 
-| Training target | URL to register |
+| Training target | URL |
 |---|---|
 | OWASP Juice Shop | `http://127.0.0.1:1003` |
 | DVWA | `http://127.0.0.1:1006` |

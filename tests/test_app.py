@@ -503,7 +503,6 @@ def test_dashboard_renders_with_schedule_and_report_navigation():
     assert "http://127.0.0.1:1003" in response.text
     assert "http://127.0.0.1:1006" in response.text
     assert "http://127.0.0.1:1007/WebGoat" in response.text
-    assert "explicitly marked In Scope" in response.text
 
 
 
@@ -608,17 +607,6 @@ def test_asset_scope_change_requires_authorization_and_valid_asset():
     assert missing.status_code == 404
 
 
-def test_asset_inventory_ui_is_wired_to_scope_api():
-    response = client.get("/")
-    assert response.status_code == 200
-    assert 'data-page="assets"' in response.text
-    assert 'id="assetRows"' in response.text
-    assert 'id="assetForm"' in response.text
-    assert "loadAssets()" in response.text
-    assert "New assets default to Needs Review" in response.text
-
-
-
 def test_passive_discovery_requires_authorization_and_in_scope_root(monkeypatch):
     calls = []
     monkeypatch.setattr(app, "query_certificate_transparency", lambda root, limit: calls.append((root, limit)) or [])
@@ -674,16 +662,7 @@ def test_certificate_transparency_parser_only_keeps_valid_subdomains(monkeypatch
     assert "crt.sh" in captured["url"] and captured["timeout"] == 12
 
 
-def test_passive_discovery_ui_warns_about_external_lookup_and_review_only():
-    response = client.get("/")
-    assert response.status_code == 200
-    assert "Passive Discovery" in response.text
-    assert "contacts crt.sh, not the target" in response.text
-    assert "discoverSubdomains" in response.text
-
-
-
-def test_one_off_assessment_needs_no_inventory_but_respects_reviewed_scope(monkeypatch):
+def test_assessment_and_schedule_need_no_asset_registration(monkeypatch):
     from uuid import uuid4
     target = f"https://simple-flow-{uuid4().hex}.example"
     started = []
@@ -693,17 +672,23 @@ def test_one_off_assessment_needs_no_inventory_but_respects_reviewed_scope(monke
     assert allowed.json()["status"] == "running"
     assert allowed.json()["profile"] == "deep"
     assert started == [(target, "deep")]
-    unregistered_schedule = client.post("/api/schedules", json={
-        "name": "blocked", "target": target, "profile": "quick", "frequency": "daily", "authorized": True,
+    schedule = client.post("/api/schedules", json={
+        "name": "no registration needed", "target": target, "profile": "quick", "frequency": "daily", "authorized": True,
     })
-    assert unregistered_schedule.status_code == 403
-    reviewed_target = f"https://needs-review-{uuid4().hex}.example"
-    asset = client.post("/api/assets", json={"target": reviewed_target, "authorized": True}).json()
-    needs_review = client.post("/api/scans", json={"target": reviewed_target, "authorized": True})
-    assert needs_review.status_code == 403
-    client.patch(f"/api/assets/{asset['id']}/scope", json={"scope_status": "out_of_scope", "authorized": True})
-    out_of_scope = client.post("/api/scans", json={"target": reviewed_target, "authorized": True})
-    assert out_of_scope.status_code == 403
+    assert schedule.status_code == 200
+    client.delete(f"/api/schedules/{schedule.json()['id']}")
+    # The authorization confirmation is still required for scans and schedules.
+    assert client.post("/api/scans", json={"target": target, "authorized": False}).status_code == 400
+    assert client.post("/api/schedules", json={
+        "name": "x", "target": target, "profile": "quick", "frequency": "daily", "authorized": False,
+    }).status_code == 400
+
+
+def test_assessment_page_does_not_mention_asset_registration():
+    page = client.get("/").text
+    assert "Asset Inventory" not in page
+    assert "marked In Scope" not in page
+    assert 'id="authorized"' in page
 
 
 def test_active_scan_requires_separate_approval_and_reaches_worker(monkeypatch):
@@ -752,16 +737,17 @@ def test_scan_progress_fields_are_available_to_the_dashboard(monkeypatch):
         conn.execute("DELETE FROM scans WHERE id=?", (scan_id,))
 
 
-def test_discovered_candidate_cannot_be_scanned_until_human_approves_it(monkeypatch):
+def test_discovered_candidate_approval_reference_is_recorded(monkeypatch):
     from uuid import uuid4
     root_domain = f"approval-{uuid4().hex}.example"
     root = client.post("/api/assets", json={"target": f"https://{root_domain}", "authorized": True, "scope_status": "in_scope"}).json()
     monkeypatch.setattr(app, "query_certificate_transparency", lambda domain, limit: [f"api.{domain}"])
     found = client.post(f"/api/assets/{root['id']}/discover", json={"authorized": True}).json()
     candidate = next(a for a in client.get("/api/assets").json() if a["target"] == f"https://api.{root_domain}")
-    blocked = client.post("/api/scans", json={"target": candidate["target"], "profile": "quick", "authorized": True})
-    assert blocked.status_code == 403
+    monkeypatch.setattr(app, "start_scan", lambda target, profile: 34567)
+    # Discovery never starts scans itself, and scanning a candidate needs no registration or approval.
     assert found["scans_started"] == 0
+    assert client.post("/api/scans", json={"target": candidate["target"], "profile": "quick", "authorized": True}).status_code == 200
     missing_reference = client.patch(f"/api/assets/{candidate['id']}/scope", json={"scope_status": "in_scope", "authorized": True})
     assert missing_reference.status_code == 400
     assert "reference" in missing_reference.json()["detail"].lower()
@@ -777,7 +763,7 @@ def test_discovered_candidate_cannot_be_scanned_until_human_approves_it(monkeypa
     assert allowed.status_code == 200
 
 
-def test_discovered_candidate_can_be_rejected_with_audit_state(monkeypatch):
+def test_discovered_candidate_rejection_is_recorded_and_does_not_block_scans(monkeypatch):
     from uuid import uuid4
     root_domain = f"reject-{uuid4().hex}.example"
     root = client.post("/api/assets", json={"target": f"https://{root_domain}", "authorized": True, "scope_status": "in_scope"}).json()
@@ -792,8 +778,8 @@ def test_discovered_candidate_can_be_rejected_with_audit_state(monkeypatch):
     assert rejected.json()["review_decision"] == "rejected"
     assert rejected.json()["reviewed_at"]
     assert rejected.json()["notes"] == "Not owned by our organization"
-    blocked = client.post("/api/scans", json={"target": candidate["target"], "profile": "quick", "authorized": True})
-    assert blocked.status_code == 403
+    monkeypatch.setattr(app, "start_scan", lambda target, profile: 45678)
+    assert client.post("/api/scans", json={"target": candidate["target"], "profile": "quick", "authorized": True}).status_code == 200
 
 
 
@@ -1063,3 +1049,112 @@ def test_start_scan_enforces_capacity_atomically(monkeypatch):
     finally:
         with app.connect() as conn:
             conn.execute("DELETE FROM scans WHERE id=?", (running_id,))
+
+
+def _fake_zap(monkeypatch, queue_values, alerts=None):
+    """Patch ZAP's HTTP API; queue_values is a list of recordsToScan values, or an Exception, consumed per poll."""
+    import json
+    from urllib.parse import urlparse
+    monkeypatch.setattr(app, "diagnose_zap_api", lambda: {"status": "ready", "endpoint": "http://127.0.0.1:8090"})
+    monkeypatch.setattr(app, "zap_api_settings", lambda: ("http://127.0.0.1:8090", "test-key"))
+    monkeypatch.setattr(app.time, "sleep", lambda _s: None)
+    polls = {"n": 0}
+    class FakeResponse:
+        def __init__(self, payload): self.payload = payload
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self, _size): return json.dumps(self.payload).encode()
+    def fake_urlopen(request, timeout=4):
+        path = urlparse(request.full_url).path
+        if path.endswith("/accessUrl/"): return FakeResponse({"Result": "OK"})
+        if path.endswith("/recordsToScan/"):
+            value = queue_values[min(polls["n"], len(queue_values) - 1)]
+            polls["n"] += 1
+            if isinstance(value, Exception): raise value
+            return FakeResponse({"recordsToScan": str(value)})
+        if path.endswith("/alerts/"): return FakeResponse({"alerts": alerts or []})
+        raise AssertionError(path)
+    monkeypatch.setattr(app, "urlopen", fake_urlopen)
+    return polls
+
+
+def test_zap_passive_waits_for_two_consecutive_empty_polls(monkeypatch):
+    polls = _fake_zap(monkeypatch, [5, 0, 3, 0, 0])
+    findings, status = app.perform_zap_passive_check("http://app.example.test/")
+    assert status["status"] == "completed"
+    assert status["passive_queue_status"] == "drained"
+    assert status["passive_timeout_seconds"] == 30.0
+    assert polls["n"] == 5  # a single empty reading (poll 2) was not accepted as drained
+
+
+def test_zap_passive_timeout_is_reported_as_warning(monkeypatch):
+    monkeypatch.setenv("DKCISSP_ZAP_PASSIVE_TIMEOUT_SECONDS", "1")
+    _fake_zap(monkeypatch, [7])
+    ticks = iter(range(0, 1000, 2))
+    monkeypatch.setattr(app.time, "monotonic", lambda: next(ticks))
+    _, status = app.perform_zap_passive_check("http://app.example.test/")
+    assert status["status"] == "completed_with_warnings"
+    assert status["passive_queue_status"] == "timeout"
+    assert status["passive_timeout_seconds"] == 1.0
+    assert "did not drain" in status["reason"]
+
+
+def test_zap_passive_queue_error_is_reported_as_warning(monkeypatch):
+    _fake_zap(monkeypatch, [OSError("connection reset")])
+    _, status = app.perform_zap_passive_check("http://app.example.test/")
+    assert status["status"] == "completed_with_warnings"
+    assert status["passive_queue_status"] == "error"
+    assert "Could not confirm" in status["reason"]
+    assert "active" not in status["reason"].lower()
+    assert "no spider or active scan" in status["mode"]
+
+
+def test_zap_passive_queue_settings_are_bounded(monkeypatch):
+    monkeypatch.setenv("DKCISSP_ZAP_PASSIVE_TIMEOUT_SECONDS", "9999")
+    monkeypatch.setenv("DKCISSP_ZAP_PASSIVE_POLL_SECONDS", "0")
+    assert app.zap_passive_queue_settings() == (180.0, 0.1)
+    monkeypatch.setenv("DKCISSP_ZAP_PASSIVE_TIMEOUT_SECONDS", "0")
+    monkeypatch.setenv("DKCISSP_ZAP_PASSIVE_POLL_SECONDS", "50")
+    assert app.zap_passive_queue_settings() == (1.0, 2.0)
+    monkeypatch.setenv("DKCISSP_ZAP_PASSIVE_TIMEOUT_SECONDS", "junk")
+    monkeypatch.setenv("DKCISSP_ZAP_PASSIVE_POLL_SECONDS", "nan")
+    assert app.zap_passive_queue_settings() == (30.0, 0.5)
+
+
+def test_assessment_gaps_flag_unfinished_stages_but_not_deliberate_skips():
+    gaps = app.assessment_gaps({
+        "Built-in HTTP & headers": {"status": "completed", "detail": "ok"},
+        "Nikto": {"status": "skipped", "detail": "Deep only"},
+        "Nuclei": {"status": "unavailable", "detail": "Nuclei is not installed"},
+        "OWASP ZAP passive": {"status": "completed_with_warnings", "detail": "queue timeout"},
+        "WhatWeb": {"status": "running", "detail": "stuck"},
+    })
+    assert [g["tool"] for g in gaps] == ["Nuclei", "OWASP ZAP passive", "WhatWeb"]
+    assert app.assessment_gaps({"A": {"status": "completed"}, "B": {"status": "skipped"}}) == []
+
+
+def test_scan_with_unavailable_tool_is_completed_with_gaps(monkeypatch):
+    import json
+    monkeypatch.setattr(app, "perform_zap_passive_check", lambda *a, **k: ([], {"status": "api_unreachable", "reason": "ZAP down"}))
+    for name in ("perform_nuclei_check", "perform_whatweb_check", "perform_nikto_check", "perform_testssl_check"):
+        monkeypatch.setattr(app, name, lambda *a, **k: ([], {"status": "completed"}))
+    monkeypatch.setattr(app, "urlopen", lambda *a, **k: _FakeHTTP())
+    with app.connect() as conn:
+        scan_id = conn.execute("INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+                               ("http://gap-test.example/", "quick", "running", app.now())).lastrowid
+    app.perform_scan(scan_id, "http://gap-test.example/", "quick")
+    with app.connect() as conn:
+        row = dict(conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone())
+    summary = json.loads(row["summary"])
+    assert row["status"] == "completed_with_gaps"
+    assert [g["tool"] for g in summary["assessment_gaps"]] == ["OWASP ZAP passive"]
+    assert client.get(f"/api/scans/{scan_id}/comparison").status_code == 200
+
+
+class _FakeHTTP:
+    status = 200
+    headers = {"Content-Type": "text/html"}
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+    def geturl(self): return "http://gap-test.example/"
+    def read(self, _n=-1): return b"<html><title>t</title></html>"

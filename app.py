@@ -155,31 +155,6 @@ class FindingLifecycleUpdate(BaseModel):
     notes: str = Field(default="", max_length=2000)
 
 
-def require_in_scope_asset(target: str) -> dict:
-    """Require an exact hostname/port match to an explicitly In Scope inventory asset."""
-    parsed = urlparse(target)
-    hostname = (parsed.hostname or "").lower().rstrip(".")
-    try:
-        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
-    except ValueError as exc:
-        raise HTTPException(400, "Target URL has an invalid port.") from exc
-    with connect() as conn:
-        rows = conn.execute("SELECT * FROM assets WHERE scope_status='in_scope'").fetchall()
-    for row in rows:
-        registered = urlparse(row["target"])
-        registered_host = (registered.hostname or "").lower().rstrip(".")
-        try:
-            registered_port = registered.port or (443 if registered.scheme.lower() == "https" else 80)
-        except ValueError:
-            continue
-        if hostname == registered_host and port == registered_port:
-            return dict(row)
-    raise HTTPException(
-        403,
-        "Target is not approved for scanning. Register it in Asset Inventory and explicitly set its scope to In Scope first.",
-    )
-
-
 def validate_target(raw: str) -> str:
     raw = raw.strip()
     if any(ch in raw for ch in "\r\n\x00"):
@@ -393,6 +368,18 @@ def diagnose_zap_api() -> dict:
         return {"status": "api_mismatch", "message": "The endpoint did not return valid JSON from the ZAP version API. Another service may be using this port.", "endpoint": api_root}
 
 
+def zap_passive_queue_settings() -> tuple[float, float]:
+    """Return (timeout, poll interval) seconds for the ZAP passive queue, bounded to safe ranges."""
+    def bounded(name: str, default: float, low: float, high: float) -> float:
+        try:
+            value = float(os.environ.get(name, default))
+        except ValueError:
+            return default
+        return min(max(value, low), high) if value == value else default
+    return (bounded("DKCISSP_ZAP_PASSIVE_TIMEOUT_SECONDS", 30.0, 1.0, 180.0),
+            bounded("DKCISSP_ZAP_PASSIVE_POLL_SECONDS", 0.5, 0.1, 2.0))
+
+
 def perform_zap_passive_check(target: str, targets: list[str] | None = None) -> tuple[list[tuple], dict]:
     """Fetch only same-origin URLs in local ZAP and return passive alerts plus truthful status."""
     diagnostic = diagnose_zap_api()
@@ -440,16 +427,30 @@ def perform_zap_passive_check(target: str, targets: list[str] | None = None) -> 
         return [], {"status": "error", "reason": "ZAP could not fetch any approved same-origin URL",
                     "urls_requested": len(safe_targets), "urls_scanned": 0, "errors": failures[:3]}
 
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline:
+    # ZAP analyses fetched responses asynchronously. Alerts are only trustworthy once the
+    # passive-scan queue has been observed empty on two consecutive polls.
+    timeout_seconds, poll_seconds = zap_passive_queue_settings()
+    queue_status = "timeout"
+    queue_reason = f"Passive-scan queue did not drain within {timeout_seconds:g} seconds; alerts may be incomplete"
+    empty_polls = 0
+    deadline = time.monotonic() + timeout_seconds
+    while True:
         try:
             pending = zap_get("/JSON/pscan/view/recordsToScan/", {}).get("recordsToScan", "0")
-            if int(pending) <= 0:
-                break
+            empty_polls = empty_polls + 1 if int(pending) <= 0 else 0
         except (HTTPError, URLError, TimeoutError, OSError, ValueError, TypeError, json.JSONDecodeError):
-            failures.append("Could not confirm passive-scan queue status")
+            queue_status = "error"
+            queue_reason = "Could not confirm passive-scan queue status; alerts may be incomplete"
             break
-        time.sleep(0.4)
+        if empty_polls >= 2:
+            queue_status, queue_reason = "drained", ""
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(poll_seconds)
+    if queue_reason:
+        failures.append(queue_reason)
+    queue_fields = {"passive_queue_status": queue_status, "passive_timeout_seconds": timeout_seconds}
 
     # Filter alerts to the exact scheme/host/port origin, not a broad host prefix.
     origin = f"{root.scheme}://{root.netloc}/"
@@ -458,7 +459,8 @@ def perform_zap_passive_check(target: str, targets: list[str] | None = None) -> 
         alerts = payload.get("alerts", []) if isinstance(payload, dict) else []
     except Exception as exc:
         return [], {"status": "completed_with_warnings", "reason": "ZAP fetched approved URLs but could not retrieve alerts",
-                    "urls_requested": len(safe_targets), "urls_scanned": len(scanned), "errors": [str(exc)[:200]]}
+                    "urls_requested": len(safe_targets), "urls_scanned": len(scanned), "errors": [str(exc)[:200]],
+                    **queue_fields}
 
     normalized = []
     for alert in alerts:
@@ -485,9 +487,12 @@ def perform_zap_passive_check(target: str, targets: list[str] | None = None) -> 
         normalized.append((severity, "OWASP ZAP: " + title, alert_url[:2048], evidence, remediation, confidence))
 
     status = "completed_with_warnings" if failures else "completed"
-    return normalized, {"status": status, "urls_requested": len(safe_targets), "urls_scanned": len(scanned),
-                       "finding_count": len(normalized), "errors": failures[:3],
-                       "mode": "passive only; no spider or active scan; same-origin URLs only"}
+    result = {"status": status, "urls_requested": len(safe_targets), "urls_scanned": len(scanned),
+              "finding_count": len(normalized), "errors": failures[:3],
+              "mode": "passive only; no spider or active scan; same-origin URLs only", **queue_fields}
+    if failures:
+        result["reason"] = "; ".join(failures[:3])[:300]
+    return normalized, result
 
 def perform_testssl_check(target: str, timeout_seconds: int = 75) -> tuple[list[tuple], dict]:
     """Run a bounded testssl.sh fast assessment for an authorized HTTPS target."""
@@ -1016,6 +1021,22 @@ def update_scan_progress(scan_id: int, progress: int, stage: str, tools: dict | 
                          (progress, stage, json.dumps(tools), scan_id))
 
 
+FINISHED_SCAN_STATUSES = ("completed", "completed_with_gaps")
+# Stage statuses that do not mean "an expected check did not fully run".
+# "skipped" is only used for stages a profile or target type deliberately excludes.
+CLEAN_STAGE_STATUSES = {"completed", "skipped", "not_run", "ready"}
+
+
+def assessment_gaps(tool_status: dict) -> list[dict]:
+    """List stages that did not fully complete, so a scan is never reported as fully complete when they didn't."""
+    gaps = []
+    for name, state in tool_status.items():
+        status = str((state or {}).get("status", "unknown"))
+        if status not in CLEAN_STAGE_STATUSES:
+            gaps.append({"tool": name, "status": status, "detail": str((state or {}).get("detail", ""))[:300]})
+    return gaps
+
+
 def perform_scan(scan_id: int, target: str, profile: str) -> None:
     findings = []
     tool_status = {
@@ -1138,6 +1159,7 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                 )
 
         discovery_status = {"status": "skipped", "reason": "Endpoint discovery is enabled for Standard/Deep/Active scans only", "urls": [final_url]}
+        tool_status["Endpoint discovery"] = {"status": "skipped", "detail": "Not selected for this profile"}
         if profile in ("standard", "deep", "active"):
             tool_status["Endpoint discovery"] = {"status": "running", "detail": "Discovering same-origin links without submitting forms"}
             update_scan_progress(scan_id, 27, "Discovering same-origin pages", tool_status)
@@ -1261,22 +1283,23 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                 deduped.append(item)
         findings = deduped
 
+        gaps = assessment_gaps(tool_status)
         with connect() as conn:
             for item in findings:
                 add_finding(conn, scan_id, target, *item)
             conn.execute(
                 "UPDATE scans SET status=?,finished_at=?,summary=?,progress=100,current_stage=?,tool_status=? WHERE id=?",
                 (
-                    "completed", now(),
+                    "completed_with_gaps" if gaps else "completed", now(),
                     json.dumps({
                         "http_status": status_code, "final_url": final_url,
                         "checks": "passive HTTP/header checks, bounded same-origin discovery, curated Nuclei checks, WhatWeb fingerprinting, optional TLS assessment, Deep/Active Nikto checks, optional ZAP passive alerts, and explicitly approved Active-profile Wapiti tests",
                         "tls_check": tls_status, "whatweb_check": whatweb_status,
                         "nuclei_check": nuclei_status, "nikto_check": nikto_status, "wapiti_check": wapiti_status, "zap_check": zap_status,
                         "endpoint_discovery": discovery_status,
-                        "finding_count": len(findings),
+                        "finding_count": len(findings), "assessment_gaps": gaps,
                     }),
-                    "Assessment complete", json.dumps(tool_status), scan_id,
+                    "Assessment complete with gaps" if gaps else "Assessment complete", json.dumps(tool_status), scan_id,
                 ),
             )
     except Exception as exc:
@@ -1332,12 +1355,6 @@ def scheduler_loop() -> None:
                     if due <= current:
                         # Scheduled work must respect the same worker cap as manual requests.
                         if running_scan_count(conn) >= max_concurrent_scans():
-                            continue
-                        try:
-                            require_in_scope_asset(schedule["target"])
-                        except HTTPException:
-                            # Scope may have changed since scheduling; fail closed and pause the schedule.
-                            conn.execute("UPDATE schedules SET enabled=0 WHERE id=?", (schedule["id"],))
                             continue
                         start_scan(schedule["target"], schedule["profile"])
                         delta = timedelta(days=1 if schedule["frequency"] == "daily" else 7)
@@ -1544,22 +1561,7 @@ def create_scan(request: ScanRequest):
     if request.profile == "active" and not request.active_testing_approved:
         raise HTTPException(400, "Active profile requires the separate active-testing approval confirmation.")
     target = validate_target(request.target)
-    # Simple one-URL workflow: explicit authorization is enough for a newly entered target.
-    # If the target already exists in inventory, respect any review or out-of-scope decision.
-    parsed = urlparse(target)
-    hostname = (parsed.hostname or "").lower().rstrip(".")
-    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
-    with connect() as conn:
-        assets = conn.execute("SELECT * FROM assets").fetchall()
-    for asset in assets:
-        registered = urlparse(asset["target"])
-        registered_host = (registered.hostname or "").lower().rstrip(".")
-        try:
-            registered_port = registered.port or (443 if registered.scheme.lower() == "https" else 80)
-        except ValueError:
-            continue
-        if hostname == registered_host and port == registered_port and asset["scope_status"] != "in_scope":
-            raise HTTPException(403, "This target is marked " + asset["scope_status"].replace("_", " ") + " in Asset Inventory. Review its scope before scanning.")
+    # Simple one-URL workflow: the explicit authorization confirmation is enough for any entered target.
     with connect() as conn:
         active_scans = running_scan_count(conn)
     limit = max_concurrent_scans()
@@ -1615,12 +1617,12 @@ def compare_scan(scan_id: int, baseline_id: int | None = None):
         current = conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
         if not current:
             raise HTTPException(404, "Scan not found")
-        if current["status"] != "completed":
+        if current["status"] not in FINISHED_SCAN_STATUSES:
             raise HTTPException(409, "Only completed scans can be compared")
         current_target = validate_target(current["target"])
         if baseline_id is None:
             baseline = conn.execute(
-                """SELECT * FROM scans WHERE id<>? AND status='completed' AND profile=?
+                """SELECT * FROM scans WHERE id<>? AND status IN ('completed','completed_with_gaps') AND profile=?
                 ORDER BY COALESCE(finished_at,created_at) DESC,id DESC""",
                 (scan_id, current["profile"]),
             ).fetchall()
@@ -1629,7 +1631,7 @@ def compare_scan(scan_id: int, baseline_id: int | None = None):
             baseline = conn.execute("SELECT * FROM scans WHERE id=?", (baseline_id,)).fetchone()
             if not baseline:
                 raise HTTPException(404, "Baseline scan not found")
-            if baseline["status"] != "completed":
+            if baseline["status"] not in FINISHED_SCAN_STATUSES:
                 raise HTTPException(409, "Baseline scan must be completed")
             if baseline["id"] == scan_id:
                 raise HTTPException(400, "A scan cannot be compared with itself")
@@ -1673,6 +1675,8 @@ def compare_scan(scan_id: int, baseline_id: int | None = None):
     before_points = sum(finding_risk_points(f["severity"]) for f in baseline_findings)
     after_points = sum(finding_risk_points(f["severity"]) for f in current_findings)
     reduction = round((before_points - after_points) / before_points * 100, 1) if before_points else (100.0 if after_points == 0 else None)
+    gap_caveats = ["Scan #%d finished with assessment gaps (a tool was unavailable, declined, timed out or errored), so absent findings may reflect untested areas, not fixes." % row["id"]
+                   for row in (current, baseline) if row["status"] == "completed_with_gaps"]
     return {"scan_id": scan_id, "baseline": {"scan_id": baseline["id"], "target": baseline["target"],
             "profile": baseline["profile"], "finished_at": baseline["finished_at"]},
             "target": current_target, "profile": current["profile"], "finished_at": current["finished_at"],
@@ -1685,7 +1689,7 @@ def compare_scan(scan_id: int, baseline_id: int | None = None):
             "limitations": ["Finding matching uses normalized title and URL path; renamed detections may appear new or resolved.",
                             "Risk points are an internal prioritization heuristic, not CVSS or a formal risk measurement.",
                             "A finding absent from a later scan is not proof that the underlying vulnerability is remediated.",
-                            "For a meaningful comparison, use the same target and assessment profile after remediation."]}
+                            "For a meaningful comparison, use the same target and assessment profile after remediation."] + gap_caveats}
 
 
 @app.patch("/api/findings/{finding_id}/lifecycle")
@@ -1802,7 +1806,6 @@ def create_schedule(request: ScheduleRequest):
     if request.profile == "active":
         raise HTTPException(400, "Active payload testing cannot be scheduled; start it manually with explicit approval.")
     target = validate_target(request.target)
-    require_in_scope_asset(target)
     delta = timedelta(days=1 if request.frequency == "daily" else 7)
     if request.run_at:
         try:
