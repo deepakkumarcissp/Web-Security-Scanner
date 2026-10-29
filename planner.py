@@ -10,6 +10,8 @@ import re
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
+import platforms
+
 PROFILES = ("quick", "standard", "deep", "active")
 
 
@@ -23,6 +25,8 @@ class Rule:
     technologies: tuple = ()  # applies only when one of these technologies was detected
     needs_parameters: bool = False  # applies only when URLs with query parameters were found
     gap_note: str = ""       # what to tell the assessor when the engine is not available
+    needs_flags: tuple = ()  # applies only when these facts are true (for example "login_form")
+    tool_label: str = ""     # plain-language name of the missing capability, used in coverage notes
 
 
 RULES = (
@@ -32,12 +36,35 @@ RULES = (
     Rule("wordpress", "WordPress-specific checks", "wpscan", ("standard", "deep", "active"),
          "WordPress was detected", technologies=("wordpress",),
          gap_note="WordPress plugins, themes and user exposure were not checked."),
-    Rule("joomla", "Joomla-specific checks", "joomscan", ("standard", "deep", "active"),
+    Rule("joomla", "Joomla-specific checks", "droopescan", ("standard", "deep", "active"),
          "Joomla was detected", technologies=("joomla",),
-         gap_note="Joomla components and known core issues were not checked."),
+         gap_note="Joomla version, components and exposed files were not checked beyond general template checks."),
     Rule("drupal", "Drupal-specific checks", "droopescan", ("standard", "deep", "active"),
          "Drupal was detected", technologies=("drupal",),
-         gap_note="Drupal modules and known core issues were not checked."),
+         gap_note="Drupal version, modules and exposed files were not checked beyond general template checks."),
+    Rule("silverstripe", "SilverStripe-specific checks", "droopescan", ("standard", "deep", "active"),
+         "SilverStripe was detected", technologies=("silverstripe",),
+         gap_note="SilverStripe version and modules were not checked beyond general template checks."),
+    Rule("moodle", "Moodle-specific checks", "droopescan", ("standard", "deep", "active"),
+         "Moodle was detected", technologies=("moodle",),
+         gap_note="Moodle version and plugins were not checked beyond general template checks."),
+    Rule("forms_and_apis", "Form, API and script-endpoint analysis", "builtin-forms-api", ("standard", "deep", "active"),
+         "Standard and deeper profiles analyse forms, scripts and API descriptions"),
+    Rule("login_testing", "Login and authenticated-area testing", "credentialed-scanning", ("standard", "deep", "active"),
+         "A login form was found", needs_flags=("login_form",), tool_label="credentialed scanning",
+         gap_note="Login protection (lockout, brute-force resistance) and every page behind the login were not tested."),
+    Rule("upload_testing", "File-upload restriction testing", "upload-testing", ("standard", "deep", "active"),
+         "A file-upload form was found", needs_flags=("upload_form",), tool_label="an upload-testing engine",
+         gap_note="Allowed file types, size limits and content checks were not tested."),
+    Rule("authenticated_api", "Authenticated API testing", "credentialed-scanning", ("standard", "deep", "active"),
+         "API endpoints that require authentication were found", needs_flags=("api_requires_auth",), tool_label="credentialed scanning",
+         gap_note="Those endpoints answered 401 or 403 and were not tested behind a login."),
+    Rule("graphql_testing", "Dedicated GraphQL testing", "graphql-testing", ("standard", "deep", "active"),
+         "A GraphQL endpoint was found", needs_flags=("graphql",), tool_label="a GraphQL testing engine",
+         gap_note="Only introspection was checked; query depth limits, batching and field-level authorization were not tested."),
+    Rule("spa_crawling", "Single-page-app crawling", "spa-crawler", ("standard", "deep", "active"),
+         "This is a JavaScript single-page app", needs_flags=("is_spa",), tool_label="a browser-based crawler",
+         gap_note="Screens that exist only in the browser are not crawled. Endpoints named in the scripts were extracted and checked, but behaviour that only exists at runtime may be missed."),
     Rule("sql_injection", "Deep SQL injection testing", "sqlmap", ("active",),
          "URLs with query parameters were found and the Active profile was approved", needs_parameters=True,
          gap_note="Wapiti's general injection tests ran, but dedicated SQL injection testing did not."),
@@ -50,41 +77,22 @@ RULES = (
 @dataclass
 class Facts:
     profile: str
-    technologies: set = field(default_factory=set)
+    technologies: set = field(default_factory=set)   # detected platform ids (see platforms.py)
     has_parameters: bool = False
     url_count: int = 0
     https: bool = False
+    login_form: bool = False        # a form with a password field was found
+    upload_form: bool = False       # a file-upload form was found
+    is_spa: bool = False            # a JavaScript single-page app: most pages are built in the browser
+    graphql: bool = False           # a GraphQL endpoint answered
+    api_requires_auth: bool = False  # API endpoints answered 401/403
+    api_endpoints: int = 0
 
 
-_TECH_SIGNATURES = {
-    "wordpress": re.compile(r"wp-content|wp-includes|wp-json|content=[\"']wordpress", re.I),
-    "joomla": re.compile(r"/components/com_|content=[\"']joomla|joomla!", re.I),
-    "drupal": re.compile(r"drupal\.settings|sites/default/files|content=[\"']drupal", re.I),
-}
-_KNOWN_NAMES = ("wordpress", "joomla", "drupal")
-
-
-def detect_technologies(headers: dict | None, body: str | None, fingerprint_titles=()) -> set:
-    """Names of recognised technologies, from response headers, page markup and fingerprint results."""
-    found = set()
-    haystack_parts = [body or ""]
-    for key, value in (headers or {}).items():
-        haystack_parts.append(f"{key}: {value}")
-    haystack = "\n".join(haystack_parts)
-    for name, pattern in _TECH_SIGNATURES.items():
-        if pattern.search(haystack):
-            found.add(name)
-    # Servers and CMSs often name themselves in headers (X-Generator: Drupal 10, X-Powered-By: ...).
-    header_text = " ".join(f"{k} {v}" for k, v in (headers or {}).items()).lower()
-    for name in _KNOWN_NAMES:
-        if name in header_text:
-            found.add(name)
-    for title in fingerprint_titles:
-        lowered = str(title).lower()
-        for name in _KNOWN_NAMES:
-            if name in lowered:
-                found.add(name)
-    return found
+def detect_technologies(headers: dict | None, body: str | None, fingerprint_titles=(), cookie_names=(), urls=()) -> set:
+    """Ids of recognised platforms (WordPress, Joomla, Jira, Laravel, ...). See platforms.py for the catalogue."""
+    return set(platforms.detect_platforms(headers, body, cookie_names=cookie_names, urls=urls,
+                                          fingerprint_titles=fingerprint_titles))
 
 
 def has_query_parameters(urls) -> bool:
@@ -97,6 +105,8 @@ def rule_applies(rule: Rule, facts: Facts) -> bool:
     if rule.technologies and not (set(rule.technologies) & facts.technologies):
         return False
     if rule.needs_parameters and not facts.has_parameters:
+        return False
+    if any(not getattr(facts, flag, False) for flag in rule.needs_flags):
         return False
     return True
 
@@ -111,9 +121,26 @@ def plan_coverage(facts: Facts, available_tools: set) -> dict:
         if rule.tool in available_tools:
             planned.append(entry)
         else:
-            entry["message"] = (f"{rule.reason}. {rule.capability} ({rule.tool}) would normally run here, "
-                                f"but it is not available in this version. {rule.gap_note}").strip()
+            if rule.tool_label:
+                entry["message"] = f"{rule.reason}. {rule.capability} needs {rule.tool_label}, which is not available in this version. {rule.gap_note}".strip()
+            else:
+                entry["message"] = (f"{rule.reason}. {rule.capability} ({rule.tool}) would normally run here, "
+                                    f"but it is not available in this version. {rule.gap_note}").strip()
             not_covered.append(entry)
-    return {"planned": planned, "not_covered": not_covered,
+    covered = []
+    for row in platforms.describe(sorted(facts.technologies)):
+        platform = platforms.BY_ID[row["id"]]
+        if platform.dedicated_tool and platform.dedicated_tool in available_tools:
+            how = f"{platform.dedicated_tool} plus platform-targeted Nuclei templates"
+        elif platform.dedicated_tool:
+            how = "platform-targeted Nuclei templates only (the dedicated tool is not available in this version)"
+        elif platform.nuclei_tags:
+            how = "platform-targeted Nuclei templates"
+        else:
+            how = "front-end framework: affects how much of the site a crawler can see"
+        covered.append({**row, "covered_by": how})
+    return {"planned": planned, "not_covered": not_covered, "platforms": covered,
             "facts": {"technologies": sorted(facts.technologies), "has_parameters": facts.has_parameters,
-                      "urls_mapped": facts.url_count}}
+                      "urls_mapped": facts.url_count, "login_form": facts.login_form, "upload_form": facts.upload_form,
+                      "is_spa": facts.is_spa, "graphql": facts.graphql, "api_requires_auth": facts.api_requires_auth,
+                      "api_endpoints": facts.api_endpoints}}

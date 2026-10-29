@@ -23,6 +23,8 @@ from html.parser import HTMLParser
 from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler, HTTPSHandler
 
 import planner
+import platforms
+import signals
 from fastapi import FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -288,6 +290,8 @@ def discover_same_origin_pages(root_url: str, root_html: str, max_pages: int = 1
     discovered = [root]
     depths = {root: 0}
     queue = [(url, 0) for url in extract_same_origin_links(root, root_html)]
+    forms = list(signals.parse_forms(root_html, root_url))
+    scripts = list(signals.script_urls(root_html, root_url))
     seen = {root}
     opener = same_origin_opener(root)
     while queue and len(discovered) < max_pages:
@@ -320,10 +324,13 @@ def discover_same_origin_pages(root_url: str, root_html: str, max_pages: int = 1
             continue
         discovered.append(url)
         depths[url] = depth
+        forms.extend(signals.parse_forms(body, url))
+        scripts.extend(script for script in signals.script_urls(body, url) if script not in scripts)
         if depth < max_depth:
             queue.extend((link, depth + 1) for link in extract_same_origin_links(url, body) if link not in seen)
         time.sleep(0.2)
     return {"urls": discovered[:max_pages], "pages_visited": max(0, len(discovered) - 1),
+            "forms": forms[:60], "scripts": scripts[:30],
             "max_pages": max_pages, "max_depth": max_depth,
             "mode": "same-origin passive links only; forms not submitted; JavaScript not executed"}
 
@@ -569,7 +576,7 @@ def perform_testssl_check(target: str, timeout_seconds: int = 75) -> tuple[list[
 
 
 
-def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
+def select_nuclei_templates(max_templates: int = 60, platform_tags=None, platform_max: int = 0) -> tuple[list[str], dict]:
     """Select a bounded, locally installed set of low-impact HTTP templates.
 
     Template tags alone are not a safety boundary. This selector also excludes
@@ -597,6 +604,8 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
     excluded_tags = {"dos", "fuzz", "bruteforce", "brute-force", "intrusive", "headless", "token-spray", "default-login", "default-credentials", "filefuzz", "takeover"}
     severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "unknown": 5}
     category_order = ["misconfig", "misconfiguration", "exposure", "ssl", "headers", "config", "cve", "vulnerability", "token", "panel", "tech", "discovery"]
+    platform_set = {str(tag).lower() for tag in (platform_tags or [])} if platform_max > 0 else set()
+    platform_candidates = []
     scanned = 0
     for path in root.rglob("*.yaml"):
         scanned += 1
@@ -610,9 +619,10 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
             continue
         # Do not execute state-changing HTTP methods, raw handcrafted requests,
         # or payload-driven fuzzing in this bounded default profile.
-        if re.search(r"(?im)^\s*method\s*:\s*['\"]?(POST|PUT|PATCH|DELETE|OPTIONS)\b", text):
+        # Real templates list requests as "- method: POST" / "- raw:", so an optional leading "- " must be allowed.
+        if re.search(r"(?im)^\s*(?:-\s*)?method\s*:\s*['\"]?(POST|PUT|PATCH|DELETE|OPTIONS)\b", text):
             continue
-        if re.search(r"(?m)^\s*(payloads|attack|raw)\s*:", text):
+        if re.search(r"(?m)^\s*(?:-\s*)?(payloads|attack|raw)\s*:", text):
             continue
         id_match = re.search(r"(?m)^id\s*:\s*['\"]?([^\s'\"]+)", text)
         tags_match = re.search(r"(?m)^\s*tags\s*:\s*([^\n]+)", text)
@@ -621,12 +631,19 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
         if not id_match or not tags_match:
             continue
         tags = {tag.strip().lower() for tag in re.split(r"[,\s]+", tags_match.group(1).strip(" []\"'")) if tag.strip()}
-        if not (tags & allowed_tags) or tags & excluded_tags:
+        if tags & excluded_tags:
+            continue
+        platform_hit = sorted(tags & platform_set)
+        if not platform_hit and not (tags & allowed_tags):
             continue
         max_requests = int(request_match.group(1)) if request_match else 1
         if max_requests > 5:
             continue
         severity = (severity_match.group(1).strip("'\"").lower() if severity_match else "unknown")
+        if platform_hit:
+            # Templates written for a platform the scan detected; they passed every safety filter above.
+            platform_candidates.append((severity_rank.get(severity, 5), id_match.group(1), str(path), platform_hit[0]))
+            continue
         primary_category = next((tag for tag in category_order if tag in tags), "other")
         candidates.append((primary_category, severity_rank.get(severity, 5), id_match.group(1), str(path), tags))
 
@@ -650,23 +667,64 @@ def select_nuclei_templates(max_templates: int = 60) -> tuple[list[str], dict]:
                     break
         if not made_progress:
             break
-    return [item[3] for item in selected], {
-        "status": "ready" if selected else "unavailable",
+    # Platform-targeted templates: highest severity first, spread across the detected platforms so one platform
+    # with hundreds of templates cannot crowd out the others. They are added on top of the general selection.
+    by_tag = {}
+    for candidate in sorted(platform_candidates):
+        by_tag.setdefault(candidate[3], []).append(candidate)
+    platform_selected, order = [], sorted(by_tag, key=lambda tag: (by_tag[tag][0][0], tag))   # most severe template first
+    while order and len(platform_selected) < platform_max:
+        for tag in list(order):
+            if by_tag[tag]:
+                platform_selected.append(by_tag[tag].pop(0))
+                if len(platform_selected) >= platform_max:
+                    break
+            else:
+                order.remove(tag)
+    platform_counts = {}
+    for item in platform_selected:
+        platform_counts[item[3]] = platform_counts.get(item[3], 0) + 1
+    selected_paths = [item[2] for item in platform_selected] + [item[3] for item in selected]
+    return selected_paths, {
+        "status": "ready" if selected_paths else "unavailable",
+        "platform_tags": sorted(platform_set), "platform_templates_selected": platform_counts,
+        "platform_templates_available": {tag: len(group) + platform_counts.get(tag, 0) for tag, group in by_tag.items()},
         "template_root": str(root), "templates_considered": scanned,
-        "templates_eligible": len(candidates), "templates_selected": len(selected),
+        "templates_eligible": len(candidates), "templates_selected": len(selected_paths),
         "max_templates": max_templates,
         "selected_tags": sorted(allowed_tags), "excluded_tags": sorted(excluded_tags),
         "selection_note": "Local HTTP templates only; excludes explicit high-risk tags, flow/headless/code templates, and templates declaring over five requests.",
     }
 
 
+def nuclei_target_urls(target: str, urls, limit: int) -> list[str]:
+    """The few URLs worth running every template against: the origin first, then distinct pages and API endpoints.
+
+    Nuclei sends each template to each URL, so the URL count multiplies the work. Static files (scripts, styles,
+    images) and repeats of the same path with different query strings add requests without adding coverage.
+    """
+    static = re.compile(r"\.(js|mjs|css|map|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|eot|otf|mp4|webm|pdf|json|xml|txt)(\?|$)", re.I)
+    chosen, paths = [target], {urlparse(target).path.rstrip("/")}
+    for url in urls or []:
+        parsed = urlparse(str(url))
+        path = parsed.path.rstrip("/")
+        if str(url) == target or path in paths or static.search(parsed.path) or len(chosen) >= limit:
+            continue
+        paths.add(path)
+        chosen.append(str(url))
+    return chosen
+
+
 def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[str] | None = None,
-                         max_templates: int = 30) -> tuple[list[tuple], dict]:
+                         max_templates: int = 30, platform_tags=None, platform_max: int = 0) -> tuple[list[tuple], dict]:
     """Run bounded Nuclei checks and retain valid partial results if the runtime limit is reached."""
     binary = shutil.which(TOOL_CATALOG["nuclei"]["binary"])
     if not binary:
         return [], {"status": "unavailable", "reason": "Nuclei is not installed"}
-    selected_templates, selection_status = select_nuclei_templates(max_templates=max(1, min(max_templates, 60)))
+    selection_args = {"max_templates": max(1, min(max_templates, 60))}
+    if platform_tags and platform_max > 0:
+        selection_args.update(platform_tags=platform_tags, platform_max=min(platform_max, 40))
+    selected_templates, selection_status = select_nuclei_templates(**selection_args)
     if not selected_templates:
         return [], {"status": "unavailable", "reason": selection_status.get("reason", "No templates passed the safety filter"),
                     "template_selection": selection_status}
@@ -921,7 +979,7 @@ def parse_ffuf_report(report, target: str) -> tuple[list[tuple], list[str]]:
     return [finding for _, finding in ranked[:40]], found_urls
 
 
-def perform_ffuf_check(target: str, timeout_seconds: int = 60) -> tuple[list[tuple], dict]:
+def perform_ffuf_check(target: str, timeout_seconds: int = 60, extra_paths=None) -> tuple[list[tuple], dict]:
     """Bounded hidden-content discovery against the supplied origin only, using the built-in wordlist."""
     binary = shutil.which(TOOL_CATALOG["ffuf"]["binary"])
     if not binary:
@@ -932,7 +990,14 @@ def perform_ffuf_check(target: str, timeout_seconds: int = 60) -> tuple[list[tup
     base = target.rstrip("/")
     with tempfile.TemporaryDirectory(prefix="dkcissp-ffuf-") as temp_dir:
         report_path = str(Path(temp_dir) / "ffuf.json")
-        command = [binary, "-u", base + "/FUZZ", "-w", str(wordlist), "-ic", "-ac", "-s", "-noninteractive",
+        wordlist_path = str(wordlist)
+        extras = [p for p in (extra_paths or []) if re.fullmatch(r"[A-Za-z0-9_./!~@%+-]{1,120}", str(p))][:120]
+        if extras:  # the general list plus paths that matter for the recognised platforms, de-duplicated
+            lines = [l for l in wordlist.read_text(encoding="utf-8").splitlines() if l and not l.startswith("#")]
+            merged = list(dict.fromkeys(lines + [e.lstrip("/") for e in extras]))
+            wordlist_path = str(Path(temp_dir) / "wordlist.txt")
+            Path(wordlist_path).write_text("\n".join(merged) + "\n", encoding="utf-8")
+        command = [binary, "-u", base + "/FUZZ", "-w", wordlist_path, "-ic", "-ac", "-s", "-noninteractive",
                    "-rate", "10", "-t", "4", "-timeout", "6", "-maxtime", str(max(10, timeout_seconds - 10)),
                    "-mc", "200,204,301,302,307,308,401,403", "-H", "User-Agent: DKCISSP-WebSecurityScanner/0.1 (+authorized content discovery)",
                    "-of", "json", "-o", report_path]
@@ -1327,6 +1392,223 @@ def perform_wpscan_check(target: str, timeout_seconds: int = 300, profile: str =
     return findings, status
 
 
+DROOPESCAN_CMS = {"drupal": "Drupal", "joomla": "Joomla", "silverstripe": "SilverStripe", "moodle": "Moodle"}
+
+
+def parse_droopescan_output(text: str, cms_id: str, target: str) -> list[tuple]:
+    """Findings from droopescan's JSON output (it prints one JSON object per URL, and only when it found something)."""
+    name = DROOPESCAN_CMS.get(cms_id, cms_id)
+    findings = []
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            result = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(result, dict):
+            continue
+        version = result.get("version") if isinstance(result.get("version"), dict) else {}
+        versions = [str(v)[:40] for v in (version.get("finds") or []) if isinstance(v, (str, int, float))][:12]
+        if versions:
+            shown = versions[0] if len(versions) == 1 else f"{versions[0]} to {versions[-1]} ({len(versions)} candidates)"
+            findings.append(("Info", f"{name} version identified: {shown}", target[:2048],
+                             f"droopescan fingerprinted the {name} core files; candidate version(s): {', '.join(versions[:6])}. Fingerprint matching can be ambiguous, so confirm the exact version.",
+                             f"Keep {name} on a supported, fully patched release and check its security advisories for the identified version.", "Medium"))
+        for kind, label in (("plugins", "module/plugin"), ("themes", "theme")):
+            section = result.get(kind) if isinstance(result.get(kind), dict) else {}
+            for item in (section.get("finds") or [])[:30]:
+                if isinstance(item, dict) and (item.get("name") or item.get("url")):
+                    component = str(item.get("name") or item.get("url"))[:100]
+                    findings.append(("Info", f"{name} {label} detected: {component}", str(item.get("url") or target)[:2048],
+                                     f"droopescan found the {name} {label} '{component}' by probing its standard location.",
+                                     f"Keep the {label} updated and remove it if it is not needed.", "Medium"))
+        interesting = result.get("interesting urls") if isinstance(result.get("interesting urls"), dict) else {}
+        for item in (interesting.get("finds") or [])[:20]:
+            if not isinstance(item, dict) or not item.get("url"):
+                continue
+            description = str(item.get("description") or "Default file")[:160]
+            url = str(item["url"])[:2048]
+            installer = bool(re.search(r"install|setup", description + " " + url, re.I))
+            findings.append(("Medium" if installer else "Low", f"Default {name} file reachable: {description}", url,
+                             f"droopescan could request {url}; default files and installers reveal the platform and version and can be abused.",
+                             "Remove default documentation, changelog and installer files from production, or block them at the web server.", "Medium"))
+    seen, unique = set(), []
+    for finding in findings:
+        key = (finding[0], finding[1], finding[2])
+        if key not in seen:
+            seen.add(key)
+            unique.append(finding)
+    return unique
+
+
+def perform_droopescan_check(target: str, cms_ids, profile: str = "standard", timeout_seconds: int = 240) -> tuple[list[tuple], dict]:
+    """Version, module and exposed-file checks for the detected Drupal / Joomla / SilverStripe / Moodle site."""
+    cms_ids = [c for c in dict.fromkeys(cms_ids) if c in DROOPESCAN_CMS][:2]
+    if not cms_ids:
+        return [], {"status": "skipped", "reason": "No Drupal, Joomla, SilverStripe or Moodle site was detected"}
+    binary = shutil.which(TOOL_CATALOG["droopescan"]["binary"])
+    if not binary:
+        return [], {"status": "unavailable", "reason": "droopescan is not installed"}
+    deep = profile in ("deep", "active")
+    per_cms = max(60, timeout_seconds // len(cms_ids))
+    base = target.rstrip("/") + "/"
+    findings, timed_out, not_confirmed, errors = [], 0, 0, []
+    for cms in cms_ids:
+        command = [binary, "scan", cms, "-u", base, "-o", "json", "--hide-progressbar", "-t", "2", "--timeout", "10",
+                   "--timeout-host", str(per_cms - 10), "-n", "500" if deep else "100", "--no-follow-redirects",
+                   "--user-agent", "DKCISSP-WebSecurityScanner/0.1 (+authorized CMS assessment)"]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=per_cms, check=False,
+                                    env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"}, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            timed_out += 1
+            continue
+        except OSError as exc:
+            errors.append(str(exc)[:200])
+            continue
+        parsed = parse_droopescan_output(result.stdout, cms, target)
+        findings.extend(parsed)
+        if not parsed and re.search(r"not running", (result.stdout or "") + (result.stderr or ""), re.I):
+            not_confirmed += 1
+    if errors and not findings:
+        return [], {"status": "error", "reason": errors[0]}
+    if not_confirmed == len(cms_ids) and not findings:
+        return [], {"status": "skipped", "reason": "droopescan did not confirm that the target runs " + ", ".join(DROOPESCAN_CMS[c] for c in cms_ids)}
+    status = "completed"
+    reason = f"{', '.join(DROOPESCAN_CMS[c] for c in cms_ids)} checked with a {'500' if deep else '100'}-name module and theme list, 2 threads"
+    if timed_out:
+        status = "partial_timeout" if findings else "timeout"
+        reason = f"time limit reached on {timed_out} of {len(cms_ids)} CMS run(s); findings so far are kept"
+    return findings, {"status": status, "reason": reason, "finding_count": len(findings), "cms": cms_ids,
+                      "safety": "Runs only when the CMS is detected; same supplied origin; HEAD requests, 2 threads, bounded module and theme dictionary; no redirects followed; no authentication or password attacks"}
+
+
+API_PROBE_PATHS = ("swagger.json", "swagger/v1/swagger.json", "openapi.json", "v2/api-docs", "v3/api-docs", "api-docs", "api/swagger.json",
+                   "api/openapi.json", "swagger-ui/", "swagger-ui.html", "docs", "graphql", "api/graphql", "graphiql")
+GRAPHQL_PATHS = ("graphql", "api/graphql", "graphiql")
+FORMS_API_BUDGET_SECONDS = 60
+
+
+def analyze_forms_and_apis(target: str, discovery: dict, root_html: str, platform_ids, final_url: str | None = None) -> tuple[list[tuple], dict, dict]:
+    """Read forms, scripts and API descriptions on the approved origin. GET requests only; nothing is submitted.
+
+    Returns (findings, status, extras). extras holds URLs worth feeding to later stages and the facts the planner needs.
+    """
+    base = final_url or target
+    deadline = time.monotonic() + FORMS_API_BUDGET_SECONDS
+    opener = same_origin_opener(base)
+    headers = {"User-Agent": "DKCISSP-WebSecurityScanner/0.1 (+authorized API discovery)", "Accept": "application/json,text/javascript,*/*;q=0.5"}
+    stats = {"requests": 0, "failed": 0, "budget_reached": False}
+
+    def fetch(url: str, limit: int, timeout: int = 5):
+        if time.monotonic() > deadline:
+            stats["budget_reached"] = True
+            return None
+        stats["requests"] += 1
+        try:
+            with opener.open(Request(url, headers=headers), timeout=timeout) as response:
+                data = response.read(limit)
+                return response.status, str(response.headers.get("Content-Type", "")).lower(), data.decode("utf-8", "replace")
+        except HTTPError as exc:
+            try:
+                body = exc.read(2000).decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            return exc.code, str(exc.headers.get("Content-Type", "")).lower() if exc.headers else "", body
+        except (URLError, TimeoutError, OSError, ssl.SSLError, ValueError):
+            stats["failed"] += 1
+            return None
+        finally:
+            time.sleep(0.1)
+
+    findings, facts = [], {"graphql": False, "api_requires_auth": False}
+    forms = discovery.get("forms") or signals.parse_forms(root_html, base)
+    findings.extend(signals.form_findings(forms, target))
+    facts.update(signals.form_facts(forms))
+
+    # 1. API paths named in the site's own JavaScript (static reading; the scripts are not executed).
+    scripts = list(dict.fromkeys(list(discovery.get("scripts") or []) + signals.script_urls(root_html, base)))
+    ranked = sorted(scripts, key=lambda u: (0 if re.search(r"main|app|bundle|index|runtime|chunk", u, re.I) else 1, len(u)))
+    js_paths = []
+    for script in ranked[:6]:
+        result = fetch(script, 1_500_000, timeout=8)
+        if result and result[0] == 200:
+            for path in signals.extract_js_endpoints(result[2]):
+                if path not in js_paths:
+                    js_paths.append(path)
+    js_paths = js_paths[:60]
+
+    # 2. Well-known API documentation and GraphQL paths.
+    origin = base.rstrip("/") + "/"
+    docs, graphql_urls = [], []
+    for path in API_PROBE_PATHS:
+        url = urljoin(origin, path)
+        if path in GRAPHQL_PATHS:
+            result = fetch(url + "?query=%7B__typename%7D", 100_000)
+            if result and result[0] in (200, 400) and signals.classify_graphql(result[2])["graphql"]:
+                graphql_urls.append(url)
+            continue
+        result = fetch(url, 400_000)
+        if not result or result[0] != 200:
+            continue
+        summary = signals.openapi_summary(result[2], origin)
+        if summary:
+            docs.append({**summary, "url": url})
+        elif path.startswith("swagger-ui") or path == "docs":
+            if re.search(r"swagger|redoc|openapi", result[2][:5000], re.I):
+                docs.append({"title": "interactive API documentation", "version": "", "path_count": 0, "sample_paths": [], "testable_urls": [], "url": url})
+    for doc in docs:
+        detail = f" '{doc['title']}' {doc['version']}".rstrip() if doc["title"] else ""
+        evidence = f"The API description{detail} at {doc['url']} can be read without logging in" + (
+            f" and lists {doc['path_count']} paths, for example: {', '.join(doc['sample_paths'][:8])}." if doc["path_count"] else ".")
+        findings.append(("Low", "API documentation is publicly accessible", doc["url"][:2048], evidence[:1800],
+                         "Restrict API documentation to authenticated users or internal networks, and confirm no undocumented endpoints rely on obscurity.", "High"))
+    for url in graphql_urls:
+        facts["graphql"] = True
+        findings.append(("Info", "GraphQL endpoint found", url, f"{url} answers GraphQL queries.",
+                         "Confirm authentication, query depth and cost limits, and disable debugging interfaces in production.", "High"))
+        introspect = fetch(url + "?query=%7B__schema%7BqueryType%7Bname%7D%7D%7D", 200_000)
+        if introspect and signals.classify_graphql(introspect[2])["introspection"]:
+            findings.append(("Medium", "GraphQL introspection is enabled", url, f"{url} returned its schema to an introspection query, which hands an attacker a complete map of the API.",
+                             "Disable introspection in production (or restrict it to authenticated developers).", "High"))
+
+    # 3. Which of the script-named endpoints exist, and do they ask for a login?
+    checked = []
+    for path in [p for p in js_paths if "?" in p or not re.search(r"/(1|\d+)$", p)][:15]:
+        url = urljoin(origin, path.lstrip("/"))
+        result = fetch(url, 60_000)
+        if result:
+            checked.append({"path": path, "url": url, "status": result[0], "json": "json" in result[1] or result[2].lstrip()[:1] in "{["})
+    answering = [c for c in checked if c["status"] == 200 and c["json"]]
+    protected = [c for c in checked if c["status"] in (401, 403)]
+    if protected:
+        facts["api_requires_auth"] = True
+    if js_paths:
+        listing = "; ".join(f"{c['path']} (HTTP {c['status']})" for c in checked[:12]) or ", ".join(js_paths[:12])
+        findings.append(("Info", f"API endpoints referenced in JavaScript: {len(js_paths)}", origin[:2048],
+                         f"The site's scripts name {len(js_paths)} API path(s). Checked with GET: {len(answering)} answered with data, {len(protected)} require authentication. {listing}"[:1800],
+                         "Review each endpoint for authentication, authorization and input validation; the scanner could only read them, not log in.", "Medium"))
+    for item in answering[:8]:
+        findings.append(("Info", f"API endpoint answers without authentication: {item['path']}", item["url"][:2048],
+                         f"GET {item['url']} returned HTTP 200 with JSON data and no credentials were sent. Whether that is intended depends on the data.",
+                         "Confirm this endpoint is meant to be public, and that it does not expose another user's data.", "Medium"))
+
+    api_urls = [u for doc in docs for u in doc["testable_urls"]]
+    api_urls += [urljoin(origin, p.lstrip("/")) for p in js_paths if "?" in p]
+    facts["api_endpoints"] = len(js_paths) + sum(d["path_count"] for d in docs)
+    facts["is_spa"] = signals.looks_like_spa(root_html, platform_ids, len(discovery.get("urls") or []) - 1)
+    extras = {"merge_urls": [c["url"] for c in answering], "api_urls": list(dict.fromkeys(api_urls))[:20], "facts": facts}
+    status = {"status": "completed", "finding_count": len(findings), "forms": facts.get("forms", 0), "scripts_read": min(len(ranked), 6),
+              "js_endpoints": len(js_paths), "api_docs": len(docs), "graphql": len(graphql_urls), "requests": stats["requests"],
+              "safety": "GET requests only on the approved origin; nothing is submitted; scripts are read, never executed; at most about 40 requests and 60 seconds"}
+    if stats["budget_reached"] or (stats["requests"] and stats["failed"] == stats["requests"]):
+        status["status"] = "completed_with_warnings"
+        status["reason"] = "the time budget was reached before every check finished" if stats["budget_reached"] else "none of the requests could be completed"
+    return findings, status, extras
+
+
 def parse_wapiti_report(report, target: str) -> list[tuple]:
     """Normalize Wapiti JSON without storing raw requests, cookies, or curl commands."""
     if not isinstance(report, dict):
@@ -1513,6 +1795,16 @@ def assessment_gaps(tool_status: dict) -> list[dict]:
     return gaps
 
 
+def response_set_cookies(headers) -> list[str]:
+    """All Set-Cookie header values of a response (a plain dict has only one value per name)."""
+    getter = getattr(headers, "get_all", None)
+    values = getter("Set-Cookie") if getter else None
+    if not values and hasattr(headers, "get"):
+        single = headers.get("Set-Cookie") or headers.get("set-cookie")
+        values = [single] if single else []
+    return list(values or [])
+
+
 def perform_scan(scan_id: int, target: str, profile: str) -> None:
     findings = []
     tool_status = {
@@ -1521,7 +1813,9 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         "Nuclei": {"status": "queued", "detail": "Waiting for built-in checks"},
         "Nikto": {"status": "queued", "detail": "Runs in Deep and Active profiles"},
         "Content discovery (ffuf)": {"status": "queued", "detail": "Runs in Deep and Active profiles"},
+        "Forms & APIs (built-in)": {"status": "queued", "detail": "Runs in Standard, Deep and Active profiles"},
         "WordPress (wpscan)": {"status": "queued", "detail": "Runs when WordPress is detected"},
+        "CMS checks (droopescan)": {"status": "queued", "detail": "Runs when Drupal, Joomla, SilverStripe or Moodle is detected"},
         "SQL injection (sqlmap)": {"status": "queued", "detail": "Runs only in the Active profile"},
         "XSS (dalfox)": {"status": "queued", "detail": "Runs only in the Active profile"},
         "Wapiti active checks": {"status": "queued", "detail": "Runs only after explicit active-testing approval"},
@@ -1544,11 +1838,13 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             with urlopen(req, timeout=12, context=context) as response:
                 status_code = response.status
                 headers = {k.lower(): v for k, v in response.headers.items()}
+                set_cookie_names = platforms.cookie_names_from_headers(response_set_cookies(response.headers))
                 final_url = response.geturl()
                 body = response.read(500_000).decode("utf-8", "replace")
         except HTTPError as exc:
             status_code = exc.code
             headers = {k.lower(): v for k, v in exc.headers.items()}
+            set_cookie_names = platforms.cookie_names_from_headers(response_set_cookies(exc.headers))
             final_url = exc.geturl()
             body = exc.read(200_000).decode("utf-8", "replace")
         except (URLError, TimeoutError, ssl.SSLError, socket.timeout) as exc:
@@ -1691,13 +1987,18 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         ffuf_status = {"status": "not_run", "reason": "Content discovery runs in Deep and Active profiles only"}
         sqlmap_status = {"status": "not_run", "reason": "SQL injection testing runs only in the Active profile"}
         wpscan_status = {"status": "not_run", "reason": "WordPress checks run when WordPress is detected"}
+        forms_api_status = locals().get("forms_api_status") or {"status": "not_run", "reason": "Forms and API analysis runs in Standard, Deep and Active profiles"}
+        droopescan_status = {"status": "not_run", "reason": "CMS checks run when Drupal, Joomla, SilverStripe or Moodle is detected"}
         dalfox_status = {"status": "not_run", "reason": "XSS testing runs only in the Active profile"}
         nuclei_status = {"status": "not_run", "reason": "Nuclei checks are enabled for Standard/Deep/Active profiles only"}
         nikto_status = {"status": "not_run", "reason": "Nikto server checks are enabled for Deep/Active profiles only"}
+        # Recognise the platform(s) from headers, cookies, markup and crawled URLs: it decides which extra paths and templates are worth using.
+        platform_hits = platforms.detect_platforms(headers, body, set_cookie_names, discovery_status.get("urls", []))
         if profile in ("deep", "active"):
-            tool_status["Content discovery (ffuf)"] = {"status": "running", "detail": "Searching for hidden files and paths with a short built-in wordlist, 10 requests/second"}
+            ffuf_extra_paths = signals.platform_paths(sorted(platform_hits))
+            tool_status["Content discovery (ffuf)"] = {"status": "running", "detail": "Searching for hidden files and paths with a short built-in wordlist" + (f" plus {len(ffuf_extra_paths)} platform-specific paths" if ffuf_extra_paths else "") + ", 10 requests/second"}
             update_scan_progress(scan_id, 31, "Searching for hidden content", tool_status)
-            ffuf_findings, ffuf_status = perform_ffuf_check(target, timeout_seconds=90 if profile == "active" else 60)
+            ffuf_findings, ffuf_status = perform_ffuf_check(target, timeout_seconds=(90 if profile == "active" else 60) + (20 if ffuf_extra_paths else 0), extra_paths=ffuf_extra_paths)
             findings.extend(ffuf_findings)
             # Pages that answered 200 join the same-origin list so later stages cover them too (cap stays 12).
             merged = list(discovery_status.get("urls", [target]))
@@ -1708,14 +2009,37 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             tool_status["Content discovery (ffuf)"] = {"status": ffuf_status.get("status", "error"), "detail": f"{ffuf_status.get('finding_count', len(ffuf_findings))} finding(s); {ffuf_status.get('reason', 'check finished')}"}
         else:
             tool_status["Content discovery (ffuf)"] = {"status": "skipped", "detail": "Runs in Deep and Active profiles"}
+        # Forms, scripts and API descriptions: read-only analysis that also feeds the endpoints it finds to the stages below.
+        api_urls, signal_facts = [], {}
         if profile in ("standard", "deep", "active"):
-            nuclei_targets = discovery_status.get("urls", [target])
+            tool_status["Forms & APIs (built-in)"] = {"status": "running", "detail": "Reading forms and scripts, and checking API documentation and GraphQL paths (GET requests only)"}
+            update_scan_progress(scan_id, 33, "Analysing forms, scripts and APIs", tool_status)
+            try:
+                fa_findings, forms_api_status, fa_extras = analyze_forms_and_apis(target, discovery_status, body, sorted(platform_hits), final_url)
+            except Exception as exc:  # this analysis is an extra: it must never fail the whole scan
+                fa_findings, fa_extras = [], {"merge_urls": [], "api_urls": [], "facts": {}}
+                forms_api_status = {"status": "error", "reason": "analysis failed: " + str(exc)[:200]}
+            findings.extend(fa_findings)
+            merged = list(discovery_status.get("urls", [target]))
+            for extra_url in fa_extras.get("merge_urls", []):
+                if extra_url not in merged and len(merged) < 12:
+                    merged.append(extra_url)
+            discovery_status["urls"] = merged
+            api_urls, signal_facts = fa_extras.get("api_urls", []), fa_extras.get("facts", {})
+            tool_status["Forms & APIs (built-in)"] = {"status": forms_api_status.get("status", "error"), "detail": f"{forms_api_status.get('finding_count', len(fa_findings))} finding(s); {forms_api_status.get('forms', 0)} form(s), {forms_api_status.get('js_endpoints', 0)} script endpoint(s), {forms_api_status.get('api_docs', 0)} API description(s); {forms_api_status.get('reason', 'check finished')}"}
+        else:
+            tool_status["Forms & APIs (built-in)"] = {"status": "skipped", "detail": "Not selected for this profile"}
+        platform_tags = platforms.nuclei_tags_for(sorted(platform_hits))
+        if profile in ("standard", "deep", "active"):
+            nuclei_targets = nuclei_target_urls(target, discovery_status.get("urls", [target]), 5 if profile in ("deep", "active") else 6)
             nuclei_template_cap = 60 if profile in ("deep", "active") else 30
-            nuclei_timeout = 150 if profile in ("deep", "active") else 75
-            tool_status["Nuclei"] = {"status": "running", "detail": f"Running up to {nuclei_template_cap} safe templates across {len(nuclei_targets[:12])} same-origin URL(s); 5 requests/second maximum"}
+            nuclei_platform_cap = (40 if profile in ("deep", "active") else 20) if platform_tags else 0
+            nuclei_timeout = (150 if profile in ("deep", "active") else 75) + (30 if platform_tags else 0)
+            tool_status["Nuclei"] = {"status": "running", "detail": f"Running up to {nuclei_template_cap} safe templates" + (f" plus up to {nuclei_platform_cap} for the detected platform(s)" if nuclei_platform_cap else "") + f" across {len(nuclei_targets[:12])} same-origin URL(s); 5 requests/second maximum"}
             update_scan_progress(scan_id, 35, "Running Nuclei safe checks", tool_status)
             nuclei_findings, nuclei_status = perform_nuclei_check(target, timeout_seconds=nuclei_timeout,
-                                                                  targets=nuclei_targets, max_templates=nuclei_template_cap)
+                                                                  targets=nuclei_targets, max_templates=nuclei_template_cap,
+                                                                  platform_tags=platform_tags, platform_max=nuclei_platform_cap)
             findings.extend(nuclei_findings)
             nuclei_state = nuclei_status.get("status", "completed")
             nuclei_detail = f"{nuclei_status.get('finding_count', len(nuclei_findings))} finding(s) across {nuclei_status.get('target_count', len(nuclei_targets))} same-origin URL(s)"
@@ -1772,7 +2096,8 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         else:
             tool_status["Wapiti active checks"] = {"status": "skipped", "detail": "Requires the separate Active profile and explicit approval"}
 
-        wp_facts = planner.Facts(profile=profile, technologies=planner.detect_technologies(headers, body, [f[1] for f in whatweb_findings]))
+        platform_hits = platforms.detect_platforms(headers, body, set_cookie_names, discovery_status.get("urls", []), [f[1] for f in whatweb_findings])
+        wp_facts = planner.Facts(profile=profile, technologies=set(platform_hits))
         wp_rule = next(rule for rule in planner.RULES if rule.id == "wordpress")
         if planner.rule_applies(wp_rule, wp_facts):
             tool_status["WordPress (wpscan)"] = {"status": "running", "detail": "WordPress detected; checking core, plugins, themes and exposed files"}
@@ -1782,8 +2107,18 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             tool_status["WordPress (wpscan)"] = {"status": wpscan_status.get("status", "error"), "detail": f"{wpscan_status.get('finding_count', len(wp_findings))} finding(s); {wpscan_status.get('reason', 'check finished')}"}
         else:
             tool_status["WordPress (wpscan)"] = {"status": "skipped", "detail": "WordPress was not detected" if profile != "quick" else "Not selected for this profile"}
+        cms_found = [pid for pid in DROOPESCAN_CMS if pid in platform_hits]
+        if cms_found and profile != "quick":
+            names = ", ".join(DROOPESCAN_CMS[c] for c in cms_found[:2])
+            tool_status["CMS checks (droopescan)"] = {"status": "running", "detail": f"{names} detected; checking version, modules and default files"}
+            update_scan_progress(scan_id, 93, "Running CMS-specific checks", tool_status)
+            cms_findings, droopescan_status = perform_droopescan_check(target, cms_found, profile=profile)
+            findings.extend(cms_findings)
+            tool_status["CMS checks (droopescan)"] = {"status": droopescan_status.get("status", "error"), "detail": f"{droopescan_status.get('finding_count', len(cms_findings))} finding(s); {droopescan_status.get('reason', 'check finished')}"}
+        else:
+            tool_status["CMS checks (droopescan)"] = {"status": "skipped", "detail": "No Drupal, Joomla, SilverStripe or Moodle site was detected" if profile != "quick" else "Not selected for this profile"}
         if profile == "active":
-            injection_urls = discovery_status.get("urls", [target])
+            injection_urls = list(dict.fromkeys(list(discovery_status.get("urls", [target])) + list(api_urls)))
             for tool_id, runner, name in (("sqlmap", perform_sqlmap_check, "SQL injection (sqlmap)"), ("dalfox", perform_dalfox_check, "XSS (dalfox)")):
                 tool_status[name] = {"status": "running", "detail": "Active tests approved; testing same-origin URLs that have query parameters"}
                 update_scan_progress(scan_id, 94, f"Running approved {TOOL_CATALOG[tool_id]['label']} tests", tool_status)
@@ -1802,16 +2137,34 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         request_missing_tools(scan_id, profile, tool_status, {
             "nuclei": nuclei_status, "nikto": nikto_status, "whatweb": whatweb_status,
             "testssl": tls_status, "wapiti": wapiti_status, "ffuf": ffuf_status,
-            "sqlmap": sqlmap_status, "dalfox": dalfox_status, "wpscan": wpscan_status,
+            "sqlmap": sqlmap_status, "dalfox": dalfox_status, "wpscan": wpscan_status, "droopescan": droopescan_status,
         })
 
         # Plan what else this target deserves, and say plainly what no engine here covers yet.
         facts = planner.Facts(
             profile=profile, https=target.lower().startswith("https://"),
-            technologies=planner.detect_technologies(headers, body, [f[1] for f in whatweb_findings]),
+            technologies=set(platform_hits), login_form=bool(signal_facts.get("login_form")), upload_form=bool(signal_facts.get("upload_form")),
+            is_spa=bool(signal_facts.get("is_spa")), graphql=bool(signal_facts.get("graphql")),
+            api_requires_auth=bool(signal_facts.get("api_requires_auth")), api_endpoints=int(signal_facts.get("api_endpoints") or 0),
             has_parameters=planner.has_query_parameters(discovery_status.get("urls", [])),
             url_count=len(discovery_status.get("urls", [])))
-        coverage = planner.plan_coverage(facts, set(ENGINE_STAGES))
+        coverage = planner.plan_coverage(facts, set(ENGINE_STAGES) | {"builtin-forms-api"})
+        coverage["platform_detection"] = platform_hits
+        available_templates = (nuclei_status.get("template_selection") or {}).get("platform_templates_available", {})
+        for platform_id in sorted(platform_hits):
+            platform = platforms.BY_ID[platform_id]
+            if platform.hosted:
+                coverage["not_covered"].append({"rule": "hosted_platform", "capability": f"{platform.name} platform", "tool": "n/a",
+                                                "reason": f"{platform.name} was detected", "message": platform.note})
+            elif (platform.nuclei_tags and nuclei_status.get("status") in ("completed", "completed_with_warnings", "partial_timeout")
+                  and not sum(available_templates.get(tag, 0) for tag in platform.nuclei_tags) and not platform.dedicated_tool):
+                coverage["not_covered"].append({"rule": "platform_templates", "capability": f"{platform.name}-specific checks", "tool": "nuclei",
+                                                "reason": f"{platform.name} was detected",
+                                                "message": f"{platform.name} was detected, but no local Nuclei templates exist for it, so only the general checks ran."})
+            if platform.group != "frontend":
+                findings.append(("Info", f"Platform detected: {platform.name}", target[:2048],
+                                 f"Recognised from: {', '.join(platform_hits[platform_id]['evidence'])} ({platform_hits[platform_id]['confidence']} confidence).",
+                                 "Keep the platform and its plugins/extensions patched, remove anything unused, and avoid advertising exact versions.", "Medium" if platform_hits[platform_id]['confidence'] == "high" else "Low"))
 
         update_scan_progress(scan_id, 97, "Combining and deduplicating findings", tool_status)
         deduped = []
@@ -1837,7 +2190,8 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                         "tls_check": tls_status, "whatweb_check": whatweb_status,
                         "nuclei_check": nuclei_status, "nikto_check": nikto_status, "wapiti_check": wapiti_status, "zap_check": zap_status,
                         "endpoint_discovery": discovery_status, "ffuf_check": {k: v for k, v in ffuf_status.items() if k != "found_urls"},
-                        "sqlmap_check": sqlmap_status, "dalfox_check": dalfox_status, "wpscan_check": wpscan_status, "coverage": coverage,
+                        "sqlmap_check": sqlmap_status, "dalfox_check": dalfox_status, "wpscan_check": wpscan_status, "droopescan_check": droopescan_status, "forms_api": forms_api_status, "coverage": coverage,
+                        "platform_detection": platform_hits,
                         "finding_count": len(findings), "assessment_gaps": gaps,
                     }),
                     "Assessment complete with gaps" if gaps else "Assessment complete", json.dumps(tool_status), scan_id,
@@ -2411,6 +2765,7 @@ TOOL_CATALOG = {
     "nikto": {"label": "Nikto", "binary": "nikto", "package": "nikto", "version_args": ["-Version"], "purpose": "Deep-profile checks for common web-server files and misconfigurations"},
     "sqlmap": {"label": "sqlmap", "binary": "sqlmap", "package": "sqlmap", "version_args": ["--version"], "purpose": "Active SQL injection testing of URL parameters (Active profile only)"},
     "dalfox": {"label": "dalfox", "binary": "dalfox", "package": "dalfox", "version_args": ["version"], "purpose": "Active cross-site scripting testing of URL parameters (Active profile only)"},
+    "droopescan": {"label": "droopescan", "binary": "droopescan", "package": "droopescan", "version_args": ["stats"], "version_regex": r"v\d+(?:\.\d+)+", "purpose": "Drupal, Joomla, SilverStripe and Moodle version, module and exposed-file checks (only when one of them is detected)"},
     "wpscan": {"label": "WPScan", "binary": "wpscan", "package": "wpscan", "version_args": ["--version", "--no-banner"], "purpose": "WordPress core, plugin, theme and user-exposure checks (only when WordPress is detected)"},
     "ffuf": {"label": "ffuf", "binary": "ffuf", "package": "ffuf", "version_args": ["-V"], "purpose": "Hidden content and path discovery with a built-in wordlist"},
     "wapiti": {"label": "Wapiti", "binary": "wapiti", "package": "wapiti", "version_args": ["--version"], "purpose": "Explicitly approved active tests for web-application vulnerabilities"},
@@ -2424,6 +2779,11 @@ def _tool_version(tool: dict) -> str | None:
             capture_output=True, text=True, timeout=4, check=False,
             env={**os.environ, "NO_COLOR": "1"},
         )
+        full = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+        if tool.get("version_regex"):  # tools whose first output line is a banner rather than a version
+            match = re.search(tool["version_regex"], full)
+            if match:
+                return match.group(0)[:180]
         output = (result.stdout or result.stderr).strip().splitlines()
         return output[0][:180] if output else ("Available (version output unavailable)" if result.returncode == 0 else None)
     except (OSError, subprocess.TimeoutExpired):
@@ -2529,6 +2889,7 @@ ENGINE_STAGES = {
     "wapiti": {"stage": "Wapiti active checks", "summary_key": "wapiti_check"},
     "ffuf": {"stage": "Content discovery (ffuf)", "summary_key": "ffuf_check"},
     "wpscan": {"stage": "WordPress (wpscan)", "summary_key": "wpscan_check"},
+    "droopescan": {"stage": "CMS checks (droopescan)", "summary_key": "droopescan_check"},
     "sqlmap": {"stage": "SQL injection (sqlmap)", "summary_key": "sqlmap_check"},
     "dalfox": {"stage": "XSS (dalfox)", "summary_key": "dalfox_check"},
 }
@@ -2662,12 +3023,15 @@ def install_package(tool_id: str) -> tuple[bool, str]:
     return True, f"{spec['label']} was installed from the Kali repository."
 
 
-def run_engine_stage(tool_id: str, target: str, profile: str, urls: list[str]):
+def run_engine_stage(tool_id: str, target: str, profile: str, urls: list[str], platform_ids=None):
     """Run one engine stage on its own. Returns (findings, engine_status, stage_state)."""
     if tool_id == "nuclei":
         deep = profile in ("deep", "active")
-        findings, status = perform_nuclei_check(target, timeout_seconds=150 if deep else 75, targets=urls,
-                                                max_templates=60 if deep else 30)
+        tags = platforms.nuclei_tags_for(sorted(platform_ids or []))
+        findings, status = perform_nuclei_check(target, timeout_seconds=(150 if deep else 75) + (30 if tags else 0),
+                                                targets=nuclei_target_urls(target, urls, 5 if deep else 6),
+                                                max_templates=60 if deep else 30, platform_tags=tags,
+                                                platform_max=(40 if deep else 20) if tags else 0)
         label = "finding(s)"
     elif tool_id == "nikto":
         findings, status = perform_nikto_check(target)
@@ -2684,6 +3048,13 @@ def run_engine_stage(tool_id: str, target: str, profile: str, urls: list[str]):
     elif tool_id == "wpscan":
         findings, status = perform_wpscan_check(target, profile=profile)
         label = "finding(s)"
+    elif tool_id == "droopescan":
+        cms_ids = [pid for pid in (platform_ids or []) if pid in DROOPESCAN_CMS]
+        if not cms_ids:
+            findings, status = [], {"status": "skipped", "reason": "No Drupal, Joomla, SilverStripe or Moodle site was detected"}
+        else:
+            findings, status = perform_droopescan_check(target, cms_ids, profile=profile)
+        label = "finding(s)"
     elif tool_id in ("sqlmap", "dalfox"):
         runner = perform_sqlmap_check if tool_id == "sqlmap" else perform_dalfox_check
         if profile != "active":
@@ -2695,7 +3066,8 @@ def run_engine_stage(tool_id: str, target: str, profile: str, urls: list[str]):
         if profile not in ("deep", "active"):
             findings, status = [], {"status": "skipped", "reason": "Content discovery runs in the Deep and Active profiles"}
         else:
-            findings, status = perform_ffuf_check(target, timeout_seconds=90 if profile == "active" else 60)
+            extras = signals.platform_paths(platform_ids)
+            findings, status = perform_ffuf_check(target, timeout_seconds=(90 if profile == "active" else 60) + (20 if extras else 0), extra_paths=extras)
         label = "finding(s)"
     elif tool_id == "wapiti":
         if profile != "active":
@@ -2743,7 +3115,8 @@ def apply_tool_decision(request_id: int, wait: bool = True) -> None:
         except ValueError:
             summary = {}
         urls = (summary.get("endpoint_discovery") or {}).get("urls") or [scan["target"]]
-        findings, engine_status, state = run_engine_stage(tool_id, scan["target"], scan["profile"], urls)
+        findings, engine_status, state = run_engine_stage(tool_id, scan["target"], scan["profile"], urls,
+                                                          platform_ids=list((summary.get("platform_detection") or {}).keys()))
         with connect() as conn:
             known = {(r["severity"], r["title"], r["affected_url"]) for r in conn.execute(
                 "SELECT severity,title,affected_url FROM findings WHERE scan_id=?", (scan_id,))}

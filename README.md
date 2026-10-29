@@ -16,6 +16,7 @@ A free, community-built vulnerability scanner that runs on your own Kali Linux m
 [How it works](#how-it-works) ·
 [Assessment profiles](#assessment-profiles) ·
 [Engines](#engines) ·
+[Platform coverage](#platform-coverage) ·
 [Scan results and status](#scan-results-and-status) ·
 [Tool approvals](#tool-approvals) ·
 [Planner and coverage notes](#planner-and-coverage-notes) ·
@@ -107,12 +108,16 @@ New here? Practice on the intentionally vulnerable [local lab](#local-practice-l
                                      │ starts a scan worker (2 at a time by default)
                                      ▼
    1. Built-in checks      HTTP, security headers, cookies, CSP, TLS use
-   2. Discovery            same-origin crawl (≤12 URLs); Deep/Active add ffuf hidden-content discovery
-   3. Specialist engines   Nuclei · WhatWeb · testssl.sh · Nikto · wpscan · Wapiti · sqlmap · dalfox
-                           OWASP ZAP (passive alerts) when its API is running
-   4. Planner (planner.py) which specialist checks apply to this target; honest "not covered" notes
-   5. Normalise            severity · evidence · confidence · remediation, deduplicated
-   6. Status               completed  or  completed_with_gaps  (listing every gap)
+   2. Discovery            same-origin crawl (≤12 URLs); collects forms and script URLs as it goes
+   3. Platform detection   which of 60+ platforms the site runs (platforms.py)
+   4. Deep/Active          ffuf hidden-content discovery, plus extra paths for the detected framework
+   5. Forms & APIs         forms, API paths named in the site's scripts, API documentation, GraphQL (signals.py)
+   6. Specialist engines   Nuclei (general + platform-targeted templates) · WhatWeb · testssl.sh · Nikto
+                           wpscan (WordPress) · droopescan (Drupal, Joomla, SilverStripe, Moodle)
+                           Wapiti · sqlmap · dalfox (Active) · OWASP ZAP passive alerts when its API is running
+   7. Planner (planner.py) which checks applied, and honest "not covered" notes for what no engine here can do
+   8. Normalise            severity · evidence · confidence · remediation, deduplicated
+   9. Status               completed  or  completed_with_gaps  (listing every gap)
                                      │
         missing tool? ───────────────┘──► Approvals page ──► you approve ► install that one package
                                                                  │         ► run only that stage
@@ -126,9 +131,9 @@ Everything runs on your machine. The dashboard is bound to `127.0.0.1`. The only
 | Profile | What it adds | Notes |
 |---|---|---|
 | **Quick** | built-in HTTP, header and cookie checks | lowest impact; also asks ZAP for passive alerts if its API is running |
-| **Standard** | same-origin discovery (up to 12 URLs), Nuclei (30 safe templates), WhatWeb, testssl.sh (HTTPS targets), wpscan *only if WordPress is detected* (passive) | recommended starting point |
-| **Deep** | Nikto, ffuf hidden-content discovery, Nuclei (60 templates), wpscan with bounded active detection and user enumeration | more requests; use on targets you control |
-| **Active** | Wapiti, sqlmap and dalfox payload testing | can submit payloads and change application state; needs a separate approval tick box; cannot be scheduled |
+| **Standard** | same-origin discovery (up to 12 URLs), platform detection, forms and API analysis, Nuclei (30 general templates plus up to 20 for the detected platform), WhatWeb, testssl.sh (HTTPS targets), wpscan if WordPress is detected (passive), droopescan if Drupal, Joomla, SilverStripe or Moodle is detected | recommended starting point |
+| **Deep** | Nikto, ffuf hidden-content discovery (plus framework-specific paths), Nuclei (60 general plus up to 40 platform templates), wpscan with bounded active detection and user enumeration, a larger droopescan module list | more requests; use on targets you control |
+| **Active** | Wapiti, sqlmap and dalfox payload testing, including parameterised API URLs found in scripts and API descriptions | can submit payloads and change application state; needs a separate approval tick box; cannot be scheduled |
 
 Use staging or a lab target for Active scans.
 
@@ -139,19 +144,38 @@ All tools are run with fixed, bounded arguments from a built-in allow-list. Noth
 | Engine | What it checks | Profiles | Limits and behaviour |
 |---|---|---|---|
 | Built-in checks | response headers, CSP, cookie flags, directory listing, redaction of cookie values in evidence | all | low-impact requests only |
-| Discovery | links, resources and form targets on the same origin | Standard+ | ≤12 URLs, depth 2, forms never submitted, no JavaScript executed, redirects off-origin rejected |
-| [Nuclei](https://github.com/projectdiscovery/nuclei) | known exposures and misconfigurations from a curated local template set | Standard+ | 30 (Standard) or 60 templates, 5 requests/second, redirects and OAST off, partial results kept on timeout |
+| Discovery | links, resources, form targets and script URLs on the same origin | Standard+ | ≤12 URLs, depth 2, forms never submitted, no JavaScript executed, redirects off-origin rejected |
+| Platform detection | which of 60+ platforms the site runs, from headers, cookies, markup, URLs and WhatWeb results | all | conservative: generic hints alone are never enough; reported as an Info finding with its evidence |
+| Forms & APIs (built-in) | forms (HTTP logins, GET passwords, cross-origin posts, missing CSRF token as a labelled guess, upload forms); API paths named in the site's scripts, checked with GET; OpenAPI/Swagger documents; GraphQL and introspection | Standard+ | GET only, same origin, nothing submitted, scripts are read and never run; about 40 requests and 60 seconds at most |
+| [Nuclei](https://github.com/projectdiscovery/nuclei) | known exposures and misconfigurations from a curated local template set, **plus templates written for the detected platform** (for example Jenkins, Spring Boot, Jira) | Standard+ | 30 general (60 in Deep) plus up to 20 (40) platform templates; GET-only templates, with state-changing, raw-request, payload, fuzzing and brute-force templates excluded; at most 5–6 URLs per run; 5 requests/second; redirects and OAST off; partial results kept on timeout. The first run on a fresh machine can be slow while Nuclei prepares its templates |
 | [WhatWeb](https://github.com/urbanadventurer/WhatWeb) | technology fingerprinting | Standard+ | aggression level 1, no redirect following |
 | [testssl.sh](https://github.com/drwetter/testssl.sh) | TLS configuration | Standard+ (HTTPS) | 75-second cap, JSON report |
 | [OWASP ZAP](https://www.zaproxy.org/) | passive alerts on the approved URLs | all, when its API is ready | passive only (no spider, no active scan); waits for ZAP's queue to drain; see [ZAP](#owasp-zap) |
 | [wpscan](https://github.com/wpscanteam/wpscan) | WordPress core, plugins, themes, exposed files, user enumeration | Standard+ when WordPress is detected | Standard is passive; Deep adds bounded active detection and user enumeration; plugins and themes are detected passively (no slug brute-forcing); 2 threads; see [wpscan token](#wpscan-api-token) |
+| [droopescan](https://github.com/SamJoan/droopescan) | version, modules/plugins, themes and default files for Drupal, Joomla, SilverStripe and Moodle | Standard+ when one is detected | HEAD requests, 2 threads, 100-name (Deep: 500) module and theme list, no redirects, no authentication or password attacks; needs an older Python than the newest releases, which Kali's package handles |
 | [Nikto](https://github.com/sullo/nikto) | common web-server files and misconfigurations | Deep+ | bounded runtime and request delay, low-risk test groups only |
-| [ffuf](https://github.com/ffuf/ffuf) | hidden files and directories (admin, backup, `.git`, `.env`, config) | Deep+ | built-in list of about 230 paths, 10 requests/second, 4 threads, no recursion, no redirects followed; response bodies are not inspected, so exposed-file findings say "verify manually" |
+| [ffuf](https://github.com/ffuf/ffuf) | hidden files and directories (admin, backup, `.git`, `.env`, config) **plus paths specific to the detected framework** (for example Spring Boot actuator, Laravel Telescope, Tomcat manager) | Deep+ | built-in list of about 230 paths plus up to 120 platform paths, 10 requests/second, 4 threads, no recursion, no redirects followed; response bodies are not inspected, so exposed-file findings say "verify manually" |
 | [Wapiti](https://wapiti-scanner.github.io/) | injection, file and configuration weaknesses | Active | depth 2, polite mode, 75-second budget; excludes SSRF, upload, stored XSS, brute force, time-based SQL and takeover modules |
-| [sqlmap](https://sqlmap.org/) | SQL injection | Active | up to 4 same-origin parameterised URLs; detection only: level 1, risk 1, boolean/error/union techniques (no stacked queries), no data extraction or shell options |
+| [sqlmap](https://sqlmap.org/) | SQL injection | Active | up to 4 same-origin parameterised URLs (including API URLs); detection only: level 1, risk 1, boolean/error/union techniques (no stacked queries), no data extraction or shell options |
 | [dalfox](https://github.com/hahwul/dalfox) | reflected cross-site scripting | Active | up to 3 URLs; known parameter names only; no headless browser, parameter mining, blind callbacks or BAV; stops at the first verified payload per URL |
 
-Tested against the real tools: ffuf 2.1, sqlmap 1.8, dalfox and wpscan 4.2 on local fixtures (a vulnerable test app and a WordPress-style test site). That proves invocation, scope limits and result parsing. It is not a benchmark of detection rates or false positives across real-world applications.
+Tested against the real tools: ffuf 2.1, Nuclei with the full public template library, sqlmap 1.8, dalfox, wpscan 4.2 and droopescan on local fixtures (a vulnerable test app, a WordPress-style site, a Drupal-style site and a single-page app on Spring Boot with APIs and GraphQL). That proves invocation, scope limits and result parsing. It is not a benchmark of detection rates or false positives across real-world applications.
+
+## Platform coverage
+
+The scanner recognises these platforms and chooses its checks accordingly. "Templates" are Nuclei templates that passed the scanner's safety filters in the public template library at the time of testing. A dedicated tool goes deeper than templates where a good one exists.
+
+| Group | Platforms | How they are checked |
+|---|---|---|
+| **Content management** | WordPress, Joomla, Drupal, TYPO3, SilverStripe, Ghost, Umbraco, Craft CMS, MODX, Concrete CMS, Adobe Experience Manager, Liferay, Sitecore | WordPress: wpscan + about 900 templates. Joomla and Drupal: droopescan + templates (150 and 16). SilverStripe: droopescan only (no templates exist). The rest: platform templates (2 to 41 each) |
+| **E-commerce** | Magento / Adobe Commerce, PrestaShop, OpenCart, WooCommerce, Shopify | platform templates; WooCommerce is checked through the WordPress tools; Shopify is a hosted service, so only the storefront can be assessed (shown as a coverage note) |
+| **Learning and community** | Moodle, MediaWiki, phpBB, Discourse, vBulletin | Moodle: droopescan + templates; phpBB, Discourse, vBulletin: templates; MediaWiki has no safe templates yet (coverage note) |
+| **Admin and DevOps consoles** | Jenkins, GitLab, Gitea, Grafana, Kibana, SonarQube, Nexus, Artifactory, Portainer, phpMyAdmin, Adminer, Apache Tomcat, Webmin, cPanel, Plesk | platform templates plus framework paths for ffuf (for example Tomcat manager, Jenkins script console) |
+| **Business applications** | Confluence, Jira, Nextcloud, ownCloud, Roundcube, Zimbra, SharePoint, Outlook Web App | platform templates (3 to 30 each) |
+| **Frameworks and servers** | Laravel, Symfony, Django, Flask, Ruby on Rails, Spring Boot, Express, ASP.NET, Next.js, Nuxt, Struts, ColdFusion | platform templates plus framework-specific paths (Spring actuator, Laravel Telescope and `.env`, Rails routes, ASP.NET `trace.axd`) |
+| **Front-end frameworks** | Angular, React, Vue | not a vulnerability target; they mark the site as a single-page app, which limits what a link crawler can see (coverage note, plus script-endpoint extraction) |
+
+Platforms without safe templates, hosted platforms and front-end frameworks are reported in the scan as coverage notes, never silently ignored.
 
 ## Scan results and status
 
@@ -186,13 +210,20 @@ The scanner never installs software on its own. If a tool a profile needs is mis
 - **Skip** installs nothing. The report records: "*Tool* was not installed: installation was not approved by the assessor. Triggered by: *what needed it*. This area was not assessed."
 - A failed install keeps the gap, shows the manual `sudo apt install …` command, and can be retried.
 
-Every decision is stored with who and when (see **Decision history**). Decisions are accepted only from the local machine, and package names come only from the built-in list, never from scan output or user input. Tools that can be requested: Nuclei, Nikto, WhatWeb, testssl.sh, Wapiti, ffuf, wpscan, sqlmap, dalfox. OWASP ZAP is not offered for automatic install because it needs a configured API service, not just a package.
+Every decision is stored with who and when (see **Decision history**). Decisions are accepted only from the local machine, and package names come only from the built-in list, never from scan output or user input. Tools that can be requested: Nuclei, Nikto, WhatWeb, testssl.sh, Wapiti, ffuf, wpscan, droopescan, sqlmap, dalfox. OWASP ZAP is not offered for automatic install because it needs a configured API service, not just a package.
 
 ## Planner and coverage notes
 
-`planner.py` holds the rules for which specialist checks apply to a target: the profile, technologies detected from headers, page markup and WhatWeb results, and whether URLs with query parameters were found. After each scan, `summary.coverage` lists what was planned and what applied but has **no engine in this version**. For example, if Joomla is detected, the dashboard shows a "Coverage note" that Joomla-specific checks are not available yet. Notes do not change the scan status, but they are never hidden.
+`planner.py` decides which specialist checks apply to a target from the profile, the detected platforms, and what the forms and API analysis found (a login form, a file-upload form, a single-page app, a GraphQL endpoint, API endpoints that want authentication, URLs with query parameters). After each scan, `summary.coverage` lists what was planned, which platforms were recognised and how each is covered, and what applied but **cannot be done by any engine in this version**. For example:
 
-Known rules without an engine yet: joomscan (Joomla) and droopescan (Drupal). Adding an engine means adding its rule in `planner.py`, its stage in `app.py`, tests, and documentation.
+- a login form was found, but credentialed scanning is not available, so login protection and the pages behind the login were not tested;
+- API endpoints answered 401/403 and were not tested behind a login;
+- a file-upload form was found, but upload restrictions were not tested;
+- a GraphQL endpoint was found, but only introspection was checked;
+- the site is a JavaScript single-page app, so screens that exist only in the browser were not crawled (endpoints named in its scripts were still read and checked);
+- a platform was detected but has no safe Nuclei templates, or is a hosted service.
+
+These appear as "Coverage note" cards in the dashboard. Notes do not change the scan status, but they are never hidden. Adding an engine means adding its rule in `planner.py`, its stage in `app.py`, tests and documentation. Platform signatures live in `platforms.py`; form, script, API and GraphQL reading lives in `signals.py`.
 
 ## Configuration
 
@@ -280,6 +311,7 @@ An older asset-inventory API (`/api/assets…`, including passive certificate-tr
 - The service binds to loopback. Do not expose it, or its tool-install endpoints, to an untrusted network.
 - Active testing needs a second, separate approval and cannot be scheduled. Its payload tools run detection-only settings; there is no data extraction, no shell access and no brute forcing.
 - External tools run from fixed argument lists with timeouts and request limits, never through a shell, and only against the origin you entered. Findings from tools are filtered back to that origin.
+- Nuclei only runs templates that pass the scanner's own safety filter: HTTP only, GET only, no state-changing methods, no raw requests, payloads, fuzzing or brute-force, and no more than five requests each. Templates written for a detected platform go through the same filter.
 - Software is never installed silently. Installs are limited to a built-in allow-list, need your approval each time, and are recorded.
 - Secrets (the ZAP key and the wpscan token) are never printed, stored in scan data or placed on command lines.
 - Tool status is verified (executable, version, service readiness), not assumed. A timeout or error is a gap, never a clean result.
@@ -292,13 +324,15 @@ python -m pip install pytest httpx
 pytest -q
 ```
 
-The suite (over 110 tests) uses a throwaway database, so it never touches your real `data.sqlite3`. GitHub Actions runs compilation and the suite on Ubuntu with Python 3.11. CI does not prove a clean Kali install, browser behaviour, or live tool integrations; before a release, follow the [Public-Release Verification Checklist](RELEASE_CHECKLIST.md).
+The suite (over 140 tests) uses a throwaway database, so it never touches your real `data.sqlite3`. GitHub Actions runs compilation and the suite on Ubuntu with Python 3.11. CI does not prove a clean Kali install, browser behaviour, or live tool integrations; before a release, follow the [Public-Release Verification Checklist](RELEASE_CHECKLIST.md).
 
 ## Repository layout
 
 ```text
 app.py                 FastAPI application: scan engine, engine adapters, approval flow, API
 planner.py             which specialist checks apply to a target; coverage notes
+platforms.py           the platform catalogue and detection (60+ platforms)
+signals.py             forms, script endpoints, API descriptions, GraphQL, framework paths
 static/index.html      the dashboard (single page, no external assets)
 wordlists/             built-in content-discovery list used by ffuf
 scripts/               local validation scripts (Juice Shop smoke test)
@@ -316,21 +350,25 @@ The goal is a free, community-maintained alternative to commercial vulnerability
 
 | Stage | Status |
 |---|---|
-| Web-application engine: discovery, passive and active checks, approvals, honest status | **working** (this release) |
-| More technology-specific engines (Joomla, Drupal) and wider wordlists | next |
-| Smarter planning: choose tools from more signals (forms, APIs, frameworks) | next |
+| Web-application engine: discovery, passive and active checks, approvals, honest status | **working** |
+| Platform detection (60+ platforms) and platform-targeted checks (Nuclei templates, wpscan, droopescan, framework paths) | **working** |
+| Forms, script-endpoint, API-documentation and GraphQL analysis | **working** |
+| Credentialed (authenticated) scanning: login handling, authenticated crawl and API testing | next |
+| Browser-based crawler for single-page apps | next |
+| Dedicated GraphQL, upload and API-authorization testing | planned |
 | Network engine: host discovery, ports, service and version detection | planned |
 | CVE matching of detected services (NVD, CISA KEV, EPSS) with prioritisation | planned |
-| Credentialed (authenticated) scanning | planned |
 | Compliance and hardening checks, richer reports, multi-user and a service-grade scheduler | planned |
 
 ## Known limitations
 
-- Web engine only. There is no network, host or credentialed scanning yet.
-- Detection quality has been verified on local fixtures, not benchmarked against real-world applications; expect false negatives and false positives like any scanner.
-- Discovery is a bounded link crawler: it does not run JavaScript, so client-side routes and pages behind a login are missed.
+- Web engine only. There is no network, host or credentialed scanning yet, so anything behind a login is not tested.
+- Detection quality has been verified on local fixtures, not benchmarked against real-world applications; expect false negatives and false positives like any scanner. Platform detection is signature-based and conservative; a heavily customised site may not be recognised.
+- Discovery is a bounded link crawler: it does not run JavaScript. For single-page apps the scanner reads script files for API paths, but screens that only exist in the browser are missed.
+- Platform-targeted checks are only as good as the local Nuclei template library; a platform with no safe templates gets general checks only (shown as a coverage note). Keep the library updated.
 - ffuf uses a short built-in list on purpose; it finds common exposures, not every hidden path. wpscan's vulnerability data needs an API token.
-- Active scans of several URLs can take several minutes (dalfox needs up to about 2.5 minutes per clean URL).
+- droopescan's fingerprint version detection can be ambiguous (it reports a range) and it needs an older Python than the newest releases.
+- Active scans of several URLs can take several minutes (dalfox needs up to about 2.5 minutes per clean URL). The first Nuclei run on a fresh machine can be slow.
 - Pages found by ffuf are not given the built-in header checks (Nuclei and ZAP still cover them).
 - The Schedules and Scanner Setup pages are hidden from the menu in this version; the scheduler needs the app running.
 
