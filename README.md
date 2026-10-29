@@ -70,6 +70,14 @@ Standard/Deep scans now discover up to 12 same-origin URLs, with a maximum link 
 
 **Scan status semantics.** A scan is `completed` only when every stage the profile selected finished cleanly. If any stage was unavailable, timed out, errored, or finished with warnings, the scan is `completed_with_gaps` and the scan summary lists each gap under `assessment_gaps`. Stages a profile or target type deliberately excludes are reported as `skipped` and are not gaps. Findings are still saved, but the absence of findings does not cover a gap. Comparison caveats are added when either scan has gaps.
 
+**Tool approvals.** The scanner never installs software on its own. If a tool a profile needs (Nuclei, Nikto, WhatWeb, testssl.sh or Wapiti) is missing, the scan keeps going, records an approval request that names what needed the tool, and finishes as `completed_with_gaps`. Open **Approvals** in the dashboard (the menu badge and a dashboard banner show how many are waiting):
+
+- **Approve install** installs that one allow-listed package from the Kali repository with `apt-get` (using `pkexec`, or non-interactive `sudo -n`, when not root), then runs only the missing stage and merges its findings into the same scan. If nothing else is missing, the scan becomes `completed`.
+- **Skip** installs nothing. The scan report records `skipped_install_not_permitted`: "*Tool* was not installed: installation was not approved by the assessor. Triggered by: *what needed it*. This area was not assessed."
+- A failed install keeps the gap, shows the manual `sudo apt install` command, and can be retried.
+
+Every decision is stored with who decided and when (shown under Decision history). Decisions are accepted only from the local machine. Package names come only from the built-in allow-list, never from scan output or user input. OWASP ZAP is not offered for automatic install because it needs a configured API service, not just a package.
+
 **ZAP passive-queue handling.** ZAP analyses fetched pages asynchronously, so the adapter polls ZAP's passive-scan queue and treats it as drained only after two consecutive empty readings. If the queue does not drain in time, or its status cannot be read, the ZAP stage is `completed_with_warnings` with `passive_queue_status` set to `timeout` or `error` and a clear reason. The status also reports `passive_timeout_seconds`. This remains passive only: no ZAP spider or active scan is started. Tunables: `DKCISSP_ZAP_PASSIVE_TIMEOUT_SECONDS` (default 30, bounded 1-180) and `DKCISSP_ZAP_PASSIVE_POLL_SECONDS` (default 0.5, bounded 0.1-2).
 
 ## Current capabilities

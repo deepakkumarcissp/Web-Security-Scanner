@@ -1158,3 +1158,151 @@ class _FakeHTTP:
     def __exit__(self, *args): return False
     def geturl(self): return "http://gap-test.example/"
     def read(self, _n=-1): return b"<html><title>t</title></html>"
+
+
+# ---- tool approval flow -------------------------------------------------------------------------
+
+def _scan_with_missing_nuclei(monkeypatch, target="http://approval-test.example/"):
+    """Run a Standard scan in which Nuclei is not installed; everything else is stubbed and clean."""
+    monkeypatch.setattr(app, "perform_zap_passive_check", lambda *a, **k: ([], {"status": "completed"}))
+    for name in ("perform_whatweb_check", "perform_nikto_check", "perform_testssl_check"):
+        monkeypatch.setattr(app, name, lambda *a, **k: ([], {"status": "completed"}))
+    monkeypatch.setattr(app, "perform_nuclei_check", lambda *a, **k: ([], {"status": "unavailable", "reason": "Nuclei is not installed"}))
+    monkeypatch.setattr(app.shutil, "which", lambda binary: None if binary == "nuclei" else "/usr/bin/" + str(binary))
+    fake_page = _FakeHTTP()
+    fake_page.geturl = lambda: target
+    monkeypatch.setattr(app, "urlopen", lambda *a, **k: fake_page)
+    monkeypatch.setattr(app, "discover_same_origin_pages", lambda url, body: {"status": "completed", "urls": [url, url + "about"]})
+    with app.connect() as conn:
+        scan_id = conn.execute("INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+                               (target, "standard", "running", app.now())).lastrowid
+    app.perform_scan(scan_id, target, "standard")
+    return scan_id
+
+
+def _scan_row(scan_id):
+    import json
+    with app.connect() as conn:
+        row = dict(conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone())
+    return row, json.loads(row["tool_status"]), json.loads(row["summary"])
+
+
+def test_missing_tool_creates_request_and_scan_finishes_with_gap(monkeypatch):
+    scan_id = _scan_with_missing_nuclei(monkeypatch)
+    row, tools, summary = _scan_row(scan_id)
+    assert row["status"] == "completed_with_gaps"
+    assert tools["Nuclei"]["status"] == "needs_tool_approval"
+    assert "Triggered by" in tools["Nuclei"]["detail"]
+    assert [g["tool"] for g in summary["assessment_gaps"]] == ["Nuclei"]
+    requests = client.get(f"/api/tool-requests?scan_id={scan_id}").json()
+    assert len(requests) == 1 and requests[0]["tool_id"] == "nuclei" and requests[0]["status"] == "pending"
+    assert requests[0]["package"] == "nuclei" and requests[0]["scan_target"] == "http://approval-test.example/"
+    assert client.get(f"/api/scans/{scan_id}").json()["tool_requests"][0]["id"] == requests[0]["id"]
+
+
+def test_tool_request_is_unique_per_scan_and_allow_listed():
+    with app.connect() as conn:
+        scan_id = conn.execute("INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)",
+                               ("http://unique.example/", "standard", "completed", app.now())).lastrowid
+    first = app.create_tool_request(scan_id, "nuclei", "profile", "reason")
+    second = app.create_tool_request(scan_id, "nuclei", "profile", "other reason")
+    assert first["id"] == second["id"]
+    import pytest
+    with pytest.raises(ValueError):
+        app.create_tool_request(scan_id, "rm-rf", "profile", "x")
+    with pytest.raises(ValueError):
+        app.create_tool_request(scan_id, "zaproxy", "profile", "x")  # ZAP needs a configured service, not just a package
+
+
+def test_declined_install_is_reported_as_not_permitted(monkeypatch):
+    scan_id = _scan_with_missing_nuclei(monkeypatch, "http://decline-test.example/")
+    monkeypatch.setattr(app, "_spawn", lambda function, *args: function(*args))
+    installs = []
+    monkeypatch.setattr(app, "install_package", lambda tool_id: installs.append(tool_id) or (True, "x"))
+    request = client.get(f"/api/tool-requests?scan_id={scan_id}").json()[0]
+    response = client.post(f"/api/tool-requests/{request['id']}/decision", json={"decision": "decline"})
+    assert response.status_code == 200 and response.json()["status"] == "declined"
+    assert installs == []  # declining never installs anything
+    row, tools, summary = _scan_row(scan_id)
+    assert tools["Nuclei"]["status"] == "skipped_install_not_permitted"
+    assert "not approved by the assessor" in tools["Nuclei"]["detail"]
+    assert "Triggered by: the Standard profile" in tools["Nuclei"]["detail"]
+    assert "not assessed" in tools["Nuclei"]["detail"]
+    assert row["status"] == "completed_with_gaps"
+    assert summary["assessment_gaps"][0]["status"] == "skipped_install_not_permitted"
+    assert client.post(f"/api/tool-requests/{request['id']}/decision", json={"decision": "approve"}).status_code == 409
+
+
+def test_approved_install_runs_the_stage_and_closes_the_gap(monkeypatch):
+    scan_id = _scan_with_missing_nuclei(monkeypatch, "http://approve-test.example/")
+    monkeypatch.setattr(app, "_spawn", lambda function, *args: function(*args))
+    monkeypatch.setattr(app, "install_package", lambda tool_id: (True, "Nuclei was installed from the Kali repository."))
+    seen = {}
+    def fake_nuclei(target, timeout_seconds=60, targets=None, max_templates=30):
+        seen.update(targets=targets, templates=max_templates)
+        return [("Medium", "Exposed admin panel", target + "admin", "evidence", "fix", "High")], {"status": "completed", "finding_count": 1}
+    monkeypatch.setattr(app, "perform_nuclei_check", fake_nuclei)
+    request = client.get(f"/api/tool-requests?scan_id={scan_id}").json()[0]
+    before = len(client.get(f"/api/scans/{scan_id}").json()["findings"])
+    response = client.post(f"/api/tool-requests/{request['id']}/decision", json={"decision": "approve"})
+    assert response.status_code == 200
+    row, tools, summary = _scan_row(scan_id)
+    assert seen["targets"] == ["http://approve-test.example/", "http://approve-test.example/about"]  # reuses discovery
+    assert seen["templates"] == 30
+    assert tools["Nuclei"]["status"] == "completed"
+    assert row["status"] == "completed"  # no gaps left
+    assert summary["assessment_gaps"] == [] and summary["finding_count"] == before + 1
+    assert summary["nuclei_check"]["status"] == "completed"
+    stored = client.get(f"/api/tool-requests?scan_id={scan_id}").json()[0]
+    assert stored["status"] == "completed" and stored["decided_by"].startswith("local assessor")
+    assert any(f["title"] == "Exposed admin panel" for f in client.get(f"/api/scans/{scan_id}").json()["findings"])
+
+
+def test_failed_install_keeps_the_gap_and_can_be_retried(monkeypatch):
+    scan_id = _scan_with_missing_nuclei(monkeypatch, "http://fail-test.example/")
+    monkeypatch.setattr(app, "_spawn", lambda function, *args: function(*args))
+    monkeypatch.setattr(app, "install_package", lambda tool_id: (False, "Installation failed: no network. You can also run: sudo apt install nuclei"))
+    request = client.get(f"/api/tool-requests?scan_id={scan_id}").json()[0]
+    client.post(f"/api/tool-requests/{request['id']}/decision", json={"decision": "approve"})
+    row, tools, _ = _scan_row(scan_id)
+    assert tools["Nuclei"]["status"] == "install_failed" and "sudo apt install nuclei" in tools["Nuclei"]["detail"]
+    assert row["status"] == "completed_with_gaps"
+    assert client.get(f"/api/tool-requests?scan_id={scan_id}").json()[0]["status"] == "failed"
+    monkeypatch.setattr(app, "install_package", lambda tool_id: (True, "ok"))
+    monkeypatch.setattr(app, "perform_nuclei_check", lambda *a, **k: ([], {"status": "completed", "finding_count": 0}))
+    assert client.post(f"/api/tool-requests/{request['id']}/decision", json={"decision": "approve"}).status_code == 200
+    assert _scan_row(scan_id)[0]["status"] == "completed"
+
+
+def test_tool_decisions_are_local_only_and_validated(monkeypatch):
+    scan_id = _scan_with_missing_nuclei(monkeypatch, "http://local-only.example/")
+    request = client.get(f"/api/tool-requests?scan_id={scan_id}").json()[0]
+    assert client.post(f"/api/tool-requests/{request['id']}/decision", json={"decision": "maybe"}).status_code == 422
+    assert client.post("/api/tool-requests/999999/decision", json={"decision": "approve"}).status_code == 404
+    remote = TestClient(app.app, client=("203.0.113.9", 50000))
+    assert remote.post(f"/api/tool-requests/{request['id']}/decision", json={"decision": "approve"}).status_code == 403
+    assert client.get(f"/api/tool-requests?scan_id={scan_id}").json()[0]["status"] == "pending"
+
+
+def test_install_package_uses_only_the_allow_listed_package(monkeypatch):
+    calls = []
+    present = {"installed": False}
+    monkeypatch.setattr(app.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(app.shutil, "which", lambda b: ("/usr/bin/" + b) if (b != "nuclei" or present["installed"]) else None)
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        present["installed"] = True
+        return SimpleNamespaceResult()
+    class SimpleNamespaceResult: returncode = 0; stdout = ""; stderr = ""
+    monkeypatch.setattr(app.subprocess, "run", fake_run)
+    ok, message = app.install_package("nuclei")
+    assert ok and calls == [["/usr/bin/pkexec", "/usr/bin/apt-get", "install", "-y", "--no-install-recommends", "nuclei"]]
+    import pytest
+    with pytest.raises(KeyError):
+        app.install_package("not-a-tool")
+
+
+def test_dashboard_exposes_the_approval_page():
+    page = client.get("/").text
+    assert 'data-page="approvals"' in page and 'id="approvals"' in page
+    assert "loadApprovals" in page and "decideTool" in page

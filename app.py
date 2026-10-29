@@ -75,6 +75,16 @@ def init_db() -> None:
                 next_run TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS tool_requests(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL, tool_id TEXT NOT NULL,
+                trigger_type TEXT NOT NULL DEFAULT 'profile', trigger_detail TEXT NOT NULL DEFAULT '',
+                finding_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','declined','approved','installing','running','completed','failed')),
+                created_at TEXT NOT NULL, decided_at TEXT, decided_by TEXT NOT NULL DEFAULT '',
+                result_message TEXT NOT NULL DEFAULT '',
+                UNIQUE(scan_id, tool_id), FOREIGN KEY(scan_id) REFERENCES scans(id)
+            );
             CREATE TABLE IF NOT EXISTS assets(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 target TEXT NOT NULL UNIQUE,
@@ -1273,6 +1283,12 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         else:
             tool_status["Wapiti active checks"] = {"status": "skipped", "detail": "Requires the separate Active profile and explicit approval"}
 
+        # A missing tool is never installed silently: record a request naming what needed it.
+        request_missing_tools(scan_id, profile, tool_status, {
+            "nuclei": nuclei_status, "nikto": nikto_status, "whatweb": whatweb_status,
+            "testssl": tls_status, "wapiti": wapiti_status,
+        })
+
         update_scan_progress(scan_id, 97, "Combining and deduplicating findings", tool_status)
         deduped = []
         seen = set()
@@ -1594,7 +1610,9 @@ def scan_detail(scan_id: int):
                 (scan_id,),
             )
         ]
-        return {"scan": dict(scan), "findings": findings}
+        requests = [tool_request_view(row) for row in conn.execute(
+            "SELECT * FROM tool_requests WHERE scan_id=? ORDER BY id", (scan_id,))]
+        return {"scan": dict(scan), "findings": findings, "tool_requests": requests}
 
 
 def finding_fingerprint(finding: dict) -> tuple[str, str]:
@@ -1962,3 +1980,267 @@ def install_tool(tool_id: str, request: ToolInstallRequest, client: FastAPIReque
         "message": "Installation command completed; executable status was checked again.",
         "tools": statuses,
     }
+
+
+# ---------------------------------------------------------------------------
+# Tool approval flow
+#
+# A scan never installs software on its own. When a tool a profile needs is missing, the scan
+# records a request that names what needed it, keeps going, and finishes with a gap. The assessor
+# then approves the install (the missing stage runs and its findings are merged into the same scan)
+# or declines it (the report states that the area was not assessed, and why).
+# Only tools in TOOL_CATALOG that have a scan stage here can be requested; package names never
+# come from scan output or user input.
+# ---------------------------------------------------------------------------
+ENGINE_STAGES = {
+    "nuclei": {"stage": "Nuclei", "summary_key": "nuclei_check"},
+    "nikto": {"stage": "Nikto", "summary_key": "nikto_check"},
+    "whatweb": {"stage": "WhatWeb", "summary_key": "whatweb_check"},
+    "testssl": {"stage": "TLS (testssl.sh)", "summary_key": "tls_check"},
+    "wapiti": {"stage": "Wapiti active checks", "summary_key": "wapiti_check"},
+}
+LOCAL_CLIENTS = {"127.0.0.1", "::1", "testclient"}
+
+
+def _spawn(function, *args) -> None:
+    """Run background work on a thread. Tests replace this to run the work inline."""
+    threading.Thread(target=function, args=args, daemon=True).start()
+
+
+def tool_request_view(row) -> dict:
+    spec = TOOL_CATALOG.get(row["tool_id"], {})
+    return {
+        **dict(row), "tool_name": spec.get("label", row["tool_id"]), "purpose": spec.get("purpose", ""),
+        "package": spec.get("package", ""), "install_source": "Kali package repository (apt)",
+    }
+
+
+def _trigger_text(row) -> str:
+    return str(row["trigger_detail"] or "the selected assessment profile")
+
+
+def create_tool_request(scan_id: int, tool_id: str, trigger_type: str, trigger_detail: str, finding_id: int | None = None):
+    if tool_id not in ENGINE_STAGES or tool_id not in TOOL_CATALOG:
+        raise ValueError("Tool is not in the approved install allow-list.")
+    with connect() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO tool_requests(scan_id,tool_id,trigger_type,trigger_detail,finding_id,created_at)
+            VALUES(?,?,?,?,?,?)""",
+            (scan_id, tool_id, trigger_type, trigger_detail[:500], finding_id, now()),
+        )
+        return conn.execute("SELECT * FROM tool_requests WHERE scan_id=? AND tool_id=?", (scan_id, tool_id)).fetchone()
+
+
+def request_missing_tools(scan_id: int, profile: str, tool_status: dict, statuses: dict) -> list[int]:
+    """Turn 'tool not installed' stage results into approval requests and mark the stage accordingly."""
+    created = []
+    for tool_id, status in statuses.items():
+        spec = TOOL_CATALOG.get(tool_id)
+        stage = ENGINE_STAGES.get(tool_id)
+        if not spec or not stage or (status or {}).get("status") != "unavailable" or shutil.which(spec["binary"]):
+            continue
+        trigger = f"the {profile.title()} profile includes {spec['purpose'].lower()}"
+        row = create_tool_request(scan_id, tool_id, "profile", trigger)
+        tool_status[stage["stage"]] = {
+            "status": "needs_tool_approval",
+            "detail": f"{spec['label']} is not installed. Waiting for your approval to install it. Triggered by: {trigger}.",
+        }
+        created.append(row["id"])
+    return created
+
+
+def _update_scan_after_tool(scan_id: int, stage_name: str, state: dict, summary_key: str | None = None,
+                            summary_value: dict | None = None) -> None:
+    """Record one stage's new state and recompute the scan's gaps and overall status."""
+    with connect() as conn:
+        scan = conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not scan:
+            return
+        try:
+            tools = json.loads(scan["tool_status"] or "{}")
+        except ValueError:
+            tools = {}
+        try:
+            summary = json.loads(scan["summary"] or "{}")
+        except ValueError:
+            summary = {}
+        tools[stage_name] = state
+        if summary_key:
+            summary[summary_key] = summary_value or {}
+        gaps = assessment_gaps(tools)
+        summary["assessment_gaps"] = gaps
+        summary["finding_count"] = conn.execute("SELECT COUNT(*) FROM findings WHERE scan_id=?", (scan_id,)).fetchone()[0]
+        status = scan["status"]
+        stage_label = scan["current_stage"]
+        if status in FINISHED_SCAN_STATUSES:
+            status = "completed_with_gaps" if gaps else "completed"
+            stage_label = "Assessment complete with gaps" if gaps else "Assessment complete"
+        conn.execute("UPDATE scans SET status=?,summary=?,tool_status=?,current_stage=? WHERE id=?",
+                     (status, json.dumps(summary), json.dumps(tools), stage_label, scan_id))
+
+
+def _set_request(request_id: int, **fields) -> None:
+    columns = ", ".join(f"{name}=?" for name in fields)
+    with connect() as conn:
+        conn.execute(f"UPDATE tool_requests SET {columns} WHERE id=?", (*fields.values(), request_id))
+
+
+def _wait_until_scan_settles(scan_id: int, limit_seconds: int = 1200) -> None:
+    deadline = time.monotonic() + limit_seconds
+    while time.monotonic() < deadline:
+        with connect() as conn:
+            row = conn.execute("SELECT status FROM scans WHERE id=?", (scan_id,)).fetchone()
+        if not row or row["status"] != "running":
+            return
+        time.sleep(2)
+
+
+def install_package(tool_id: str) -> tuple[bool, str]:
+    """Install one allow-listed tool from the Kali repositories. Returns (ok, message)."""
+    spec = TOOL_CATALOG[tool_id]
+    manual = f"sudo apt update && sudo apt install {spec['package']}"
+    if shutil.which(spec["binary"]):
+        return True, f"{spec['label']} is already installed."
+    apt = shutil.which("apt-get")
+    pkexec = shutil.which("pkexec")
+    sudo = shutil.which("sudo")
+    if not apt:
+        return False, f"Automatic installation needs apt-get. Install it yourself with: {manual}"
+    if os.geteuid() == 0:
+        prefix = []
+    elif pkexec:
+        prefix = [pkexec]
+    elif sudo:
+        prefix = [sudo, "-n"]  # non-interactive: fails fast instead of waiting for a password
+    else:
+        return False, f"No privilege helper (pkexec or sudo) was found. Install it yourself with: {manual}"
+    try:
+        result = subprocess.run([*prefix, apt, "install", "-y", "--no-install-recommends", spec["package"]],
+                                capture_output=True, text=True, timeout=600, check=False)
+    except subprocess.TimeoutExpired:
+        return False, f"The package installation timed out. Check the package manager, or run: {manual}"
+    except OSError as exc:
+        return False, f"Could not start the package manager ({exc}). Run: {manual}"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "Package installation failed").strip()[-400:]
+        return False, f"Installation failed: {detail}. You can also run: {manual}"
+    if not shutil.which(spec["binary"]):
+        return False, f"The package installed but {spec['binary']} was not found on PATH. Run: {manual}"
+    return True, f"{spec['label']} was installed from the Kali repository."
+
+
+def run_engine_stage(tool_id: str, target: str, profile: str, urls: list[str]):
+    """Run one engine stage on its own. Returns (findings, engine_status, stage_state)."""
+    if tool_id == "nuclei":
+        deep = profile in ("deep", "active")
+        findings, status = perform_nuclei_check(target, timeout_seconds=150 if deep else 75, targets=urls,
+                                                max_templates=60 if deep else 30)
+        label = "finding(s)"
+    elif tool_id == "nikto":
+        findings, status = perform_nikto_check(target)
+        label = "finding(s)"
+    elif tool_id == "whatweb":
+        findings, status = perform_whatweb_check(target)
+        label = "technology signal(s)"
+    elif tool_id == "testssl":
+        if target.lower().startswith("https://"):
+            findings, status = perform_testssl_check(target)
+        else:
+            findings, status = [], {"status": "skipped", "reason": "TLS assessment requires an HTTPS target"}
+        label = "finding(s)"
+    elif tool_id == "wapiti":
+        if profile != "active":
+            findings, status = [], {"status": "skipped", "reason": "Wapiti runs only in the Active profile"}
+        else:
+            findings, status = perform_wapiti_check(target)
+        label = "finding(s)"
+    else:
+        raise ValueError("Unsupported tool")
+    detail = f"{status.get('finding_count', len(findings))} {label}; {status.get('reason', 'check finished')}"
+    return findings, status, {"status": status.get("status", "completed"), "detail": detail}
+
+
+def apply_tool_decision(request_id: int, wait: bool = True) -> None:
+    """Carry out an approved or declined request. Runs on a background thread."""
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM tool_requests WHERE id=?", (request_id,)).fetchone()
+        scan = conn.execute("SELECT * FROM scans WHERE id=?", (row["scan_id"],)).fetchone() if row else None
+    if not row or not scan:
+        return
+    tool_id, scan_id = row["tool_id"], row["scan_id"]
+    spec, stage = TOOL_CATALOG[tool_id], ENGINE_STAGES[tool_id]
+    if wait:
+        _wait_until_scan_settles(scan_id)
+        with connect() as conn:  # the scan may have finished and changed while we waited
+            scan = conn.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
+    if row["status"] == "declined":
+        message = (f"{spec['label']} was not installed: installation was not approved by the assessor. "
+                   f"Triggered by: {_trigger_text(row)}. This area was not assessed.")
+        _update_scan_after_tool(scan_id, stage["stage"], {"status": "skipped_install_not_permitted", "detail": message})
+        _set_request(request_id, result_message=message)
+        return
+    try:
+        _set_request(request_id, status="installing")
+        _update_scan_after_tool(scan_id, stage["stage"], {"status": "installing", "detail": f"Installing {spec['label']} from the Kali repository…"})
+        ok, message = install_package(tool_id)
+        if not ok:
+            _set_request(request_id, status="failed", result_message=message)
+            _update_scan_after_tool(scan_id, stage["stage"], {"status": "install_failed", "detail": message})
+            return
+        _set_request(request_id, status="running", result_message=message)
+        _update_scan_after_tool(scan_id, stage["stage"], {"status": "running", "detail": f"{spec['label']} installed; running its checks…"})
+        try:
+            summary = json.loads(scan["summary"] or "{}")
+        except ValueError:
+            summary = {}
+        urls = (summary.get("endpoint_discovery") or {}).get("urls") or [scan["target"]]
+        findings, engine_status, state = run_engine_stage(tool_id, scan["target"], scan["profile"], urls)
+        with connect() as conn:
+            known = {(r["severity"], r["title"], r["affected_url"]) for r in conn.execute(
+                "SELECT severity,title,affected_url FROM findings WHERE scan_id=?", (scan_id,))}
+            for item in findings:
+                if (item[0], item[1], item[2]) not in known:
+                    add_finding(conn, scan_id, scan["target"], *item)
+        _update_scan_after_tool(scan_id, stage["stage"], state, stage["summary_key"], engine_status)
+        _set_request(request_id, status="completed", result_message=f"{message} {state['detail']}")
+    except Exception as exc:  # never leave a request stuck in 'installing'
+        message = f"The tool stage failed: {str(exc)[:300]}"
+        _set_request(request_id, status="failed", result_message=message)
+        _update_scan_after_tool(scan_id, stage["stage"], {"status": "install_failed", "detail": message})
+
+
+class ToolDecision(BaseModel):
+    decision: str = Field(pattern="^(approve|decline)$")
+
+
+@app.get("/api/tool-requests")
+def list_tool_requests(status: str | None = None, scan_id: int | None = None):
+    clauses, params = [], []
+    if status:
+        clauses.append("status=?"); params.append(status)
+    if scan_id is not None:
+        clauses.append("scan_id=?"); params.append(scan_id)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    with connect() as conn:
+        rows = conn.execute(f"SELECT * FROM tool_requests {where} ORDER BY id DESC LIMIT 200", params).fetchall()
+        scans = {r["id"]: r["target"] for r in conn.execute("SELECT id,target FROM scans")}
+    return [{**tool_request_view(row), "scan_target": scans.get(row["scan_id"], "")} for row in rows]
+
+
+@app.post("/api/tool-requests/{request_id}/decision")
+def decide_tool_request(request_id: int, request: ToolDecision, client: FastAPIRequest):
+    # Package installs change the machine, so only the local operator may decide.
+    if client.client.host not in LOCAL_CLIENTS:
+        raise HTTPException(403, "Tool approvals are available only from the local machine.")
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM tool_requests WHERE id=?", (request_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Tool request not found.")
+    if row["status"] not in ("pending", "failed"):
+        raise HTTPException(409, f"This request is already {row['status']}.")
+    new_status = "approved" if request.decision == "approve" else "declined"
+    _set_request(request_id, status=new_status, decided_at=now(), decided_by=f"local assessor ({client.client.host})")
+    _spawn(apply_tool_decision, request_id)
+    with connect() as conn:
+        updated = conn.execute("SELECT * FROM tool_requests WHERE id=?", (request_id,)).fetchone()
+    return tool_request_view(updated)
