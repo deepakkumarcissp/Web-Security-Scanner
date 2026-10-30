@@ -2330,11 +2330,11 @@ def test_scan_feeds_api_findings_to_later_stages_and_records_what_cannot_be_test
     assert "http://api-run.example/rest/products/search?q=" in seen["nuclei_targets"]            # endpoints found in scripts get scanned too
     assert tools["Forms & APIs (built-in)"]["status"] == "completed" and summary["forms_api"]["js_endpoints"] == 3
     notes = {n["rule"]: n["message"] for n in summary["coverage"]["not_covered"]}
-    assert set(notes) == {"login_testing", "login_hardening", "upload_testing", "authenticated_api", "graphql_testing", "spa_crawling"}
+    assert set(notes) == {"login_testing", "login_hardening", "upload_testing", "authenticated_api", "graphql_testing", "spa_interaction"}
     assert notes["login_testing"].startswith("A login form was found, but no credentials were provided") and "Authenticated scan" in notes["login_testing"]
     assert "never guesses passwords" in notes["login_hardening"]
-    assert "401 or 403" in notes["authenticated_api"] and "single-page app" in notes["spa_crawling"]
-    assert "forms_and_apis" in [p["rule"] for p in summary["coverage"]["planned"]]
+    assert "401 or 403" in notes["authenticated_api"] and "nothing was clicked" in notes["spa_interaction"]
+    assert {"forms_and_apis", "spa_crawling"} <= {p["rule"] for p in summary["coverage"]["planned"]}
     assert summary["coverage"]["facts"]["login_form"] is True and row["status"] == "completed"   # notes are information, not failures
 
 
@@ -2570,7 +2570,7 @@ def test_scan_api_requires_consent_valid_login_details_and_never_schedules_crede
     assert schedule.status_code == 400 and "never stored" in schedule.json()["detail"]
 
 
-def _auth_scan(monkeypatch, base, site, settings=None, profile="standard", nuclei=None, second=None, role="peer"):
+def _auth_scan(monkeypatch, base, site, settings=None, profile="standard", nuclei=None, second=None, role="peer", which_missing=()):
     """A real scan (real login, crawl and analysis) of the test site; only the external tools are stubbed."""
     import auth
     monkeypatch.setattr("time.sleep", lambda seconds: None)         # the politeness delays are not what these tests are about
@@ -2578,7 +2578,7 @@ def _auth_scan(monkeypatch, base, site, settings=None, profile="standard", nucle
     for name in ("perform_whatweb_check", "perform_nikto_check", "perform_testssl_check", "perform_ffuf_check", "perform_wpscan_check", "perform_droopescan_check"):
         monkeypatch.setattr(app, name, lambda *a, **k: ([], {"status": "completed"}))
     monkeypatch.setattr(app, "perform_nuclei_check", nuclei or (lambda *a, **k: ([], {"status": "completed"})))
-    monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/" + str(binary))
+    monkeypatch.setattr(app.shutil, "which", lambda binary: None if binary in which_missing else "/usr/bin/" + str(binary))
     with app.connect() as conn:
         scan_id = conn.execute("INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)", (base, profile, "running", app.now())).lastrowid
     app.perform_scan(scan_id, base, profile, *([auth.AuthSettings(**settings)] if settings else []), *([(auth.AuthSettings(**second), role)] if second else []))
@@ -2889,3 +2889,142 @@ def test_second_account_api_rules(monkeypatch):
     assert client.post("/api/scans", json=dict(body, auth=second, auth_second=second, second_account_role="boss")).status_code == 422
     assert client.post("/api/scans", json=dict(body, auth=second, auth_second=second)).status_code == 200
     assert client.post("/api/schedules", json=dict(body, name="x", auth=second, auth_second=second)).status_code == 400
+
+
+# ---- browser-based crawler ---------------------------------------------------------------------------------------------
+import pytest  # noqa: E402
+
+CHROME_FOR_TESTS = "/opt/pw-browsers/chromium-1243/chrome-linux64/chrome"
+
+
+@pytest.fixture
+def real_browser(monkeypatch):
+    import browser
+    if not browser.find_browser():
+        if not os.path.exists(CHROME_FOR_TESTS):
+            pytest.skip("no Chromium on this machine")
+        monkeypatch.setenv("DKCISSP_BROWSER", CHROME_FOR_TESTS)
+    for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+        monkeypatch.delenv(name, raising=False)       # the browser must reach the loopback test site directly
+    return browser
+
+
+def test_browser_gate_allows_only_get_and_never_sends_credentials_to_other_hosts():
+    import browser
+    page = browser.Page.__new__(browser.Page)
+    page.origin, page.extra_headers = "https://app.example", {"Authorization": "Bearer abc"}
+    page.blocked_writes, page.blocked_unsafe, page.blocked_cross, page.third_party, page.mixed = [], [], set(), set(), []
+    assert page.decide("https://app.example/api/items", "GET", "XHR") == (True, {"Authorization": "Bearer abc"})
+    assert page.decide("https://app.example/api/items", "POST", "Fetch")[0] is False and page.blocked_writes == [("POST", "/api/items")]
+    assert page.decide("https://app.example/api/items", "DELETE", "XHR")[0] is False and page.decide("https://app.example/x", "OPTIONS", "XHR")[0] is False
+    assert page.decide("https://app.example/logout", "GET", "Document")[0] is False and page.decide("https://app.example/users/5/delete", "GET", "XHR")[0] is False
+    assert page.blocked_unsafe == ["/logout", "/users/5/delete"]
+    assert page.decide("https://cdn.example/lib.js", "GET", "Script") == (True, {}) and page.third_party == {"cdn.example"}       # no credentials
+    assert page.decide("https://cdn.example/collect", "GET", "XHR")[0] is False and page.decide("https://cdn.example/", "GET", "Document")[0] is False
+    assert page.decide("https://cdn.example/lib.js", "POST", "Script")[0] is False
+    assert page.decide("http://app.example/old.png", "GET", "Image")[0] is False and page.mixed == ["app.example/old.png"]
+    assert page.decide("file:///etc/passwd", "GET", "Document")[0] is False and page.decide("ftp://app.example/x", "GET", "Document")[0] is False
+    assert page.blocked_cross == {"cdn.example"}
+
+
+def test_browser_crawl_reports_unavailable_when_chromium_is_missing(monkeypatch):
+    import browser
+    monkeypatch.setattr(browser, "find_browser", lambda: None)
+    assert browser.crawl("http://127.0.0.1:9", ["http://127.0.0.1:9/"]) == ([], {"status": "unavailable", "reason": "Chromium is not installed"})
+
+
+def test_websocket_frames_round_trip_with_masking_and_fragments():
+    import socket, threading, browser
+    server = socket.socket(); server.bind(("127.0.0.1", 0)); server.listen(1)
+    received = {}
+    def serve():
+        conn, _ = server.accept()
+        data = b""
+        while b"\r\n\r\n" not in data:
+            data += conn.recv(4096)
+        conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+        head = conn.recv(2)
+        length = head[1] & 0x7F
+        import struct
+        if length == 126:
+            length = struct.unpack(">H", conn.recv(2))[0]
+        mask = conn.recv(4)
+        body = b""
+        while len(body) < length:
+            body += conn.recv(65536)
+        received["text"] = bytes(b ^ mask[i % 4] for i, b in enumerate(body)).decode()
+        big = ("x" * 70000).encode()
+        conn.sendall(bytes([0x01, 126]) + struct.pack(">H", 10) + b"hello, wor" + bytes([0x80, 3]) + b"ld!")        # fragmented text message
+        conn.sendall(bytes([0x89, 2]) + b"hi")                                                                         # a ping in between
+        conn.sendall(bytes([0x81, 127]) + struct.pack(">Q", len(big)) + big)                                           # 64-bit length
+        conn.close()
+    threading.Thread(target=serve, daemon=True).start()
+    ws = browser.WebSocket("127.0.0.1", server.getsockname()[1], "/devtools/page/x")
+    ws.send("é" * 200)                                                                                                  # 126-bit length class, multi-byte
+    assert ws.receive(5) == "hello, world!" and ws.receive(5) == "x" * 70000
+    assert received["text"] == "é" * 200
+    server.close()
+
+
+def test_browser_renders_the_app_finds_pages_the_plain_crawler_cannot_and_never_sends_a_write(site_factory, real_browser):
+    base, site = site_factory()
+    findings, status = real_browser.crawl(base, [base + "/spa/"])
+    assert status["status"] == "completed" and status["authenticated"] is False
+    urls = {u.replace(base, "") for u in status["urls"]}
+    assert {"/spa/", "/spa/products", "/spa/login", "/spa/#/faq"} <= urls and "/spa/billing" not in urls     # the nav is built by JavaScript; billing needs a login
+    assert "/api/items?limit=2" in " ".join(status["api_urls"]) and any(u.endswith("/api/me") for u in status["api_urls"])
+    assert status["blocked_writes"] == ["POST /api/track"]
+    assert not [e for e in site.log if e["method"] != "GET"], site.log                                           # the POST was blocked in the browser
+    assert any(f["has_password"] for f in status["forms"])                                                         # a form that only exists after JavaScript ran
+    assert len([u for u in status["urls"] if u.endswith("#/faq")]) == 1                                           # one hash route, not one per page
+
+
+def test_browser_crawl_as_a_logged_in_user_sees_more_and_never_visits_risky_links(site_factory, real_browser):
+    base, site = site_factory()
+    session = _session(base, kind="form", username="alice", password="alicepw")
+    assert session.login()
+    findings, status = real_browser.crawl(base, [base + "/spa/"], session=session)
+    urls = {u.replace(base, "") for u in status["urls"]}
+    assert {"/spa/billing", "/spa/profile"} <= urls and status["authenticated"] is True
+    assert "/logout" not in {e["path"].split("?")[0] for e in site.log} and not [e for e in site.log if e["method"] != "GET" and e["path"] != "/login"]
+    tokens = [f for f in findings if f[1].startswith("Access token stored in browser storage")]
+    assert len(tokens) == 1 and tokens[0][0] == "Low" and "eyJ" not in tokens[0][3] and "'token'" in tokens[0][3]   # reported once, value not recorded
+    assert not any(secret in json.dumps(status) for secret in session.secret_values())
+
+
+def test_scan_of_a_single_page_app_uses_the_browser_and_feeds_what_it_found_to_the_rest(site_factory, monkeypatch, real_browser):
+    base, site = site_factory()
+    scan_id, row, tools, summary, findings = _auth_scan(monkeypatch, base + "/spa/", site, dict(ALICE, login_url=base + "/login"))
+    assert tools["Browser crawl (Chromium)"]["status"] == "completed" and "(logged in)" in tools["Browser crawl (Chromium)"]["detail"]
+    assert tools["Authentication"]["status"] == "completed"
+    assert "/spa/billing" in {u.replace(base, "") for u in summary["endpoint_discovery"]["urls"]}      # a page that exists only after login and JavaScript
+    assert any(f["title"].startswith("Access token stored in browser storage") for f in findings)
+    rules = {p["rule"] for p in summary["coverage"]["planned"]}
+    assert "spa_crawling" in rules and "spa_interaction" in {n["rule"] for n in summary["coverage"]["not_covered"]}
+    paths = {e["path"].split("?")[0] for e in site.log}
+    assert "/logout" not in paths and "/api/track" not in paths and "/delete-account" not in paths
+
+
+def test_scan_of_a_single_page_app_asks_before_installing_the_browser_and_records_a_decline(site_factory, monkeypatch):
+    import browser
+    monkeypatch.setattr(browser, "find_browser", lambda: None)
+    monkeypatch.setattr(app, "_spawn", lambda function, *args: function(*args))          # run the decision inline
+    base, site = site_factory()
+    scan_id, row, tools, summary, findings = _auth_scan(monkeypatch, base + "/spa/", site, which_missing=("chromium",))
+    assert tools["Browser crawl (Chromium)"]["status"] == "needs_tool_approval" and row["status"] == "completed_with_gaps"
+    request = next(r for r in client.get("/api/tool-requests", params={"scan_id": scan_id}).json() if r["tool_id"] == "chromium")
+    assert request["status"] == "pending" and request["package"] == "chromium" and "single-page" in request["purpose"].lower()
+    installs = []
+    monkeypatch.setattr(app.subprocess, "run", lambda *a, **k: installs.append(a) or None)
+    assert client.post(f"/api/tool-requests/{request['id']}/decision", json={"decision": "decline"}).status_code == 200
+    after = _scan_row(scan_id)[1]["Browser crawl (Chromium)"]
+    assert after["status"] == "skipped_install_not_permitted" and "not approved by the assessor" in after["detail"] and "not assessed" in after["detail"]
+    assert installs == []                                                                      # nothing was installed
+    assert "chromium" in app.TOOL_CATALOG and app.ENGINE_STAGES["chromium"]["stage"] == "Browser crawl (Chromium)"
+
+
+def test_engine_stage_for_the_browser_runs_alone_after_an_approved_install(monkeypatch):
+    calls = []
+    monkeypatch.setattr(app.browser, "crawl", lambda target, starts, **kw: calls.append((target, starts, kw)) or ([], {"status": "completed", "reason": "rendered 3 page(s)"}))
+    findings, status, state = app.run_engine_stage("chromium", "http://t.example/", "standard", ["http://t.example/"])
+    assert calls[0][0] == "http://t.example/" and calls[0][2]["max_pages"] == 10 and state["status"] == "completed" and "rendered 3 page(s)" in state["detail"]

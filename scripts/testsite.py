@@ -22,6 +22,25 @@ USERS = {"alice": {"password": "alicepw", "id": 1, "role": "user"},
          "admin": {"password": "adminpw", "id": 3, "role": "admin"}}
 
 
+SPA_JS = """
+const nav = document.getElementById('nav'), app = document.getElementById('app');
+function link(href, text) { const a = document.createElement('a'); a.href = href; a.textContent = text; nav.appendChild(a); nav.appendChild(document.createTextNode(' ')); }
+link('/spa/', 'Home'); link('/spa/products', 'Products'); link('#/faq', 'FAQ');
+fetch('/api/items?limit=2').then(r => r.json()).then(d => { const n = document.createElement('p'); n.textContent = 'Items: ' + d.items.length; app.appendChild(n); });
+fetch('/api/track', {method: 'POST', body: '{}'});
+fetch('/api/me').then(r => r.ok ? r.json() : null).then(me => {
+  if (me) {
+    link('/spa/billing', 'Billing'); link('/logout', 'Log out'); link('/spa/profile', 'Profile');
+    localStorage.setItem('token', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl');
+  } else {
+    link('/spa/login', 'Sign in');
+    const f = document.createElement('form'); f.action = '/api/login'; f.method = 'post';
+    f.innerHTML = '<input name="username"><input type="password" name="password"><input type="submit" value="Sign in">'; app.appendChild(f);
+  }
+});
+"""
+
+
 def _b64(data: dict) -> str:
     return base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
 
@@ -114,6 +133,13 @@ def make_handler(site: Site):
                 self.reply(200, '<html><body><a href="/login">Sign in</a> <a href="/about">about</a><script src="/app.js"></script></body></html>')
             elif path == "/login":
                 self.login_page()
+            elif path == "/spa/app.js":
+                self.reply(200, SPA_JS, "application/javascript")
+            elif path.startswith("/spa/") and path.endswith(".js"):
+                self.reply(200, "/* bundle */", "application/javascript")
+            elif path == "/spa" or path.startswith("/spa/"):
+                # A single-page app: every path returns the same empty shell; the links, form and API calls are built by JavaScript.
+                self.reply(200, '<html><head><title>Shop</title></head><body><nav id="nav"></nav><div id="app"></div><script src="/spa/runtime.js"></script><script src="/spa/vendor.js"></script><script src="/spa/app.js"></script></body></html>')
             elif path == "/app.js":
                 self.reply(200, 'fetch("/api/me");fetch("/api/items?limit=1");', "application/javascript")
             elif path == "/api/items":
@@ -201,6 +227,8 @@ def make_handler(site: Site):
                 sid = site.fixed_sid if not site.rotate_session else secrets.token_hex(12)
                 site.sessions[sid] = name
                 self.redirect("/dashboard", [("Set-Cookie", f"sid={sid}; Path=/; {site.cookie_flags}")])
+            elif path == "/api/track":
+                self.reply(200, '{"ok": true}', "application/json")          # a write the browser crawler must never send
             elif path == "/api/login":
                 try:
                     data = json.loads(raw)

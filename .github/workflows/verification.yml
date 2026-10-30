@@ -30,9 +30,11 @@ jobs:
           python -m pip install -r requirements.txt pytest httpx
 
       - name: Compile application and tests
-        run: python -m py_compile app.py planner.py platforms.py signals.py auth.py access.py scripts/selftest.py scripts/testsite.py tests/test_app.py
+        run: python -m py_compile app.py planner.py platforms.py signals.py auth.py access.py browser.py scripts/selftest.py scripts/testsite.py tests/test_app.py
 
       - name: Run automated tests
+        env:
+          DKCISSP_BROWSER_NO_SANDBOX: "1"   # the runner's OS may forbid Chromium's sandbox; browser tests use only a local test site
         run: pytest -q
 
       - name: Report verification boundary

@@ -24,6 +24,7 @@ from urllib.request import Request, urlopen, build_opener, HTTPCookieProcessor, 
 
 import access
 import auth
+import browser
 import planner
 import platforms
 import signals
@@ -874,6 +875,14 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
                      "target_count": len(safe_targets), "target_limit": 12,
                      "rate_limit_per_second": 5, "concurrency": 3, "redirects_disabled": True,
                      "interactsh_disabled": True, "timeout_seconds": timeout_seconds, "authenticated": session is not None}
+
+
+def perform_browser_crawl(target: str, start_urls: list[str], session=None, profile: str = "standard") -> tuple[list[tuple], dict]:
+    """Render the app in a headless browser (GET only; see browser.py for the safety rules)."""
+    deep = profile in ("deep", "active")
+    findings, status = browser.crawl(target, start_urls, session=session, max_pages=14 if deep else 10, budget_seconds=75 if deep else 45)
+    status.setdefault("authenticated", session is not None)
+    return findings, status
 
 
 def parse_nikto_report(report, target: str) -> list[tuple]:
@@ -2158,6 +2167,55 @@ def perform_scan(scan_id: int, target: str, profile: str, auth_settings=None, se
             tool_status["Content discovery (ffuf)"] = {"status": ffuf_status.get("status", "error"), "detail": f"{ffuf_status.get('finding_count', len(ffuf_findings))} finding(s); {ffuf_status.get('reason', 'check finished')}" + (" (logged in)" if ffuf_status.get("authenticated") else "")}
         else:
             tool_status["Content discovery (ffuf)"] = {"status": "skipped", "detail": "Runs in Deep and Active profiles"}
+        # Single-page apps build their pages in the browser: render them in a headless browser (GET only) so their links, forms and API calls are seen.
+        browser_status = {"status": "not_run", "reason": "The site does not look like a JavaScript single-page app"}
+        browser_public_api, browser_auth_api = [], []
+        tool_status["Browser crawl (Chromium)"] = {"status": "skipped", "detail": "Runs when the site is a JavaScript single-page app"}
+        if profile in ("standard", "deep", "active") and signals.looks_like_spa(body, sorted(platform_hits), len(discovery_status.get("urls", [])) - 1):
+            tool_status["Browser crawl (Chromium)"] = {"status": "running", "detail": "This looks like a JavaScript app: rendering its pages in a headless browser (GET only, nothing clicked or submitted)"}
+            update_scan_progress(scan_id, 30, "Rendering the app in a browser", tool_status)
+            try:
+                b_findings, browser_status = perform_browser_crawl(final_url, [final_url], profile=profile)
+            except Exception as exc:
+                b_findings, browser_status = [], {"status": "error", "reason": f"The browser crawl failed ({type(exc).__name__})."}
+            if browser_status.get("status") == "completed":
+                findings.extend(b_findings)
+                known = set(discovery_status.get("urls", []))
+                new_public = [u for u in browser_status.get("urls", []) if u not in known]
+                discovery_status["urls"] = (list(discovery_status.get("urls", [])) + new_public)[:16]
+                discovered_urls = list(discovered_urls) + new_public
+                discovery_status["forms"] = (discovery_status.get("forms") or []) + browser_status.get("forms", [])
+                discovery_status["scripts"] = list(dict.fromkeys((discovery_status.get("scripts") or []) + browser_status.get("scripts", [])))
+                browser_public_api = list(browser_status.get("api_urls", []))
+                detail = f"{browser_status['reason']}; {len(new_public)} page(s) the plain crawler could not see"
+                if session_ok:
+                    try:
+                        l_findings, l_status = perform_browser_crawl(final_url, list(dict.fromkeys([final_url, session.landing_url])), session=session, profile=profile)
+                        if l_status.get("status") == "completed":
+                            findings.extend(l_findings)
+                            auth_known = set(auth_pages) | set(discovered_urls)
+                            new_auth = [u for u in l_status.get("urls", []) if u not in auth_known]
+                            auth_pages = list(auth_pages) + new_auth
+                            discovery_status["urls"] = (list(new_auth) + list(discovery_status.get("urls", [])))[:16]
+                            auth_discovery = auth_discovery or {"urls": [], "forms": [], "scripts": []}
+                            auth_discovery["urls"] = list(dict.fromkeys(list(auth_discovery.get("urls", [])) + l_status.get("urls", [])))
+                            auth_discovery["forms"] = (auth_discovery.get("forms") or []) + l_status.get("forms", [])
+                            auth_discovery["scripts"] = list(dict.fromkeys((auth_discovery.get("scripts") or []) + l_status.get("scripts", [])))
+                            browser_auth_api = list(l_status.get("api_urls", []))
+                            browser_status["authenticated"] = True
+                            browser_status["logged_in_pages"] = len(l_status.get("urls", []))
+                            browser_status["blocked_writes"] = list(dict.fromkeys(browser_status.get("blocked_writes", []) + l_status.get("blocked_writes", [])))
+                            detail += f"; logged in: {len(new_auth)} more page(s)"
+                        else:
+                            detail += f"; the logged-in browser crawl did not complete ({l_status.get('reason', 'unknown')})"
+                    except Exception as exc:
+                        detail += f"; the logged-in browser crawl failed ({type(exc).__name__})"
+                    browser_status.setdefault("authenticated", False)
+                tool_status["Browser crawl (Chromium)"] = {"status": "completed", "detail": detail + (" (logged in)" if browser_status.get("authenticated") else "")}
+            elif browser_status.get("status") == "unavailable":
+                tool_status["Browser crawl (Chromium)"] = {"status": "unavailable", "detail": browser_status.get("reason", "Chromium is not installed")}
+            else:
+                tool_status["Browser crawl (Chromium)"] = {"status": browser_status.get("status", "error"), "detail": browser_status.get("reason", "The browser crawl did not complete")}
         # Forms, scripts and API descriptions: read-only analysis that also feeds the endpoints it finds to the stages below.
         api_urls, signal_facts, public_api_urls = [], {}, []
         if profile in ("standard", "deep", "active"):
@@ -2195,6 +2253,8 @@ def perform_scan(scan_id: int, target: str, profile: str, auth_settings=None, se
                     tool_status["Forms & APIs (built-in)"]["detail"] += f"; logged-in pass: {len(fa2_findings)} finding(s)"
                 except Exception as exc:
                     tool_status["Forms & APIs (built-in)"]["detail"] += f"; the logged-in pass failed ({type(exc).__name__})"
+            api_urls = list(dict.fromkeys(list(api_urls) + browser_public_api + browser_auth_api))[:30]
+            public_api_urls = list(dict.fromkeys(list(public_api_urls) + browser_public_api))
         else:
             tool_status["Forms & APIs (built-in)"] = {"status": "skipped", "detail": "Not selected for this profile"}
         if session_ok:  # is the session still alive after the crawl? Restore it at most twice, never guess anything new.
@@ -2347,6 +2407,7 @@ def perform_scan(scan_id: int, target: str, profile: str, auth_settings=None, se
             "nuclei": nuclei_status, "nikto": nikto_status, "whatweb": whatweb_status,
             "testssl": tls_status, "wapiti": wapiti_status, "ffuf": ffuf_status,
             "sqlmap": sqlmap_status, "dalfox": dalfox_status, "wpscan": wpscan_status, "droopescan": droopescan_status,
+            "chromium": browser_status,
         })
 
         # Plan what else this target deserves, and say plainly what no engine here covers yet.
@@ -2364,7 +2425,7 @@ def perform_scan(scan_id: int, target: str, profile: str, auth_settings=None, se
             ran = ("completed", "completed_with_warnings", "partial_timeout", "timeout", "error")
             stages = [("Nuclei", nuclei_status), ("Content discovery (ffuf)", ffuf_status), ("SQL injection (sqlmap)", sqlmap_status), ("XSS (dalfox)", dalfox_status),
                       ("Nikto", nikto_status), ("WhatWeb", whatweb_status), ("TLS (testssl.sh)", tls_status), ("OWASP ZAP passive", zap_status),
-                      ("Wapiti active checks", wapiti_status), ("WordPress (wpscan)", wpscan_status), ("CMS checks (droopescan)", droopescan_status)]
+                      ("Wapiti active checks", wapiti_status), ("Browser crawl (Chromium)", browser_status), ("WordPress (wpscan)", wpscan_status), ("CMS checks (droopescan)", droopescan_status)]
             auth_info["tools_with_login"] = [name for name, st in stages if st.get("status") in ran and st.get("authenticated")]
             auth_info["tools_without_login"] = [name for name, st in stages if st.get("status") in ran and not st.get("authenticated")]
             if auth_info["tools_without_login"]:
@@ -3039,6 +3100,7 @@ TOOL_CATALOG = {
     "droopescan": {"label": "droopescan", "binary": "droopescan", "package": "droopescan", "version_args": ["stats"], "version_regex": r"v\d+(?:\.\d+)+", "purpose": "Drupal, Joomla, SilverStripe and Moodle version, module and exposed-file checks (only when one of them is detected)"},
     "wpscan": {"label": "WPScan", "binary": "wpscan", "package": "wpscan", "version_args": ["--version", "--no-banner"], "purpose": "WordPress core, plugin, theme and user-exposure checks (only when WordPress is detected)"},
     "ffuf": {"label": "ffuf", "binary": "ffuf", "package": "ffuf", "version_args": ["-V"], "purpose": "Hidden content and path discovery with a built-in wordlist"},
+    "chromium": {"label": "Chromium (headless)", "binary": "chromium", "package": "chromium", "version_args": ["--version"], "purpose": "Browser-based crawling of JavaScript single-page apps (renders pages, reads links, forms and API calls; GET only)"},
     "wapiti": {"label": "Wapiti", "binary": "wapiti", "package": "wapiti", "version_args": ["--version"], "purpose": "Explicitly approved active tests for web-application vulnerabilities"},
 }
 
@@ -3163,6 +3225,7 @@ ENGINE_STAGES = {
     "droopescan": {"stage": "CMS checks (droopescan)", "summary_key": "droopescan_check"},
     "sqlmap": {"stage": "SQL injection (sqlmap)", "summary_key": "sqlmap_check"},
     "dalfox": {"stage": "XSS (dalfox)", "summary_key": "dalfox_check"},
+    "chromium": {"stage": "Browser crawl (Chromium)", "summary_key": "browser_crawl"},
 }
 LOCAL_CLIENTS = {"127.0.0.1", "::1", "testclient"}
 
@@ -3339,6 +3402,9 @@ def run_engine_stage(tool_id: str, target: str, profile: str, urls: list[str], p
         else:
             extras = signals.platform_paths(platform_ids)
             findings, status = perform_ffuf_check(target, timeout_seconds=(90 if profile == "active" else 60) + (20 if extras else 0), extra_paths=extras)
+        label = "finding(s)"
+    elif tool_id == "chromium":
+        findings, status = perform_browser_crawl(target, [target], profile=profile)
         label = "finding(s)"
     elif tool_id == "wapiti":
         if profile != "active":

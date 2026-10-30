@@ -266,6 +266,29 @@ def run(args) -> int:
                 report.add(PASS if login_site.login_posts == 3 else FAIL, "each account's password was tried once per scan", f"{login_site.login_posts} login submission(s) in total")
                 report.add(PASS if not {e["path"].split("?")[0] for e in login_site.log} & {"/logout", "/delete-account"} else FAIL, "no logout or delete link was ever requested, even with two accounts")
                 report.add(PASS if "bobpw" not in json.dumps(bdetail) else FAIL, "the second account's password does not appear in stored results")
+            # 8. A JavaScript single-page app: with a browser the scanner renders it; without one it must ask, never install silently.
+            status, created = get_json(base, "/api/scans", method="POST", body={"target": login_target + "/spa/", "profile": "standard", "authorized": True})
+            if status == 200 and "id" in created:
+                deadline = time.time() + args.scan_timeout
+                while time.time() < deadline:
+                    status, sdetail = get_json(base, f"/api/scans/{created['id']}")
+                    if status == 200 and sdetail["scan"]["status"] != "running":
+                        break
+                    time.sleep(3)
+                stages = json.loads(sdetail["scan"].get("tool_status") or "{}")
+                browser_stage = stages.get("Browser crawl (Chromium)", {})
+                state = browser_stage.get("status")
+                if state == "completed":
+                    ssummary = json.loads(sdetail["scan"].get("summary") or "{}")
+                    seen = " ".join(ssummary.get("endpoint_discovery", {}).get("urls", []))
+                    report.add(PASS if "/spa/products" in seen else FAIL, "the browser crawl finds pages that only exist after JavaScript runs", browser_stage.get("detail", "")[:100])
+                    report.add(PASS if not any(e["method"] != "GET" and e["path"] != "/login" for e in login_site.log) else FAIL, "the browser never sent a write request (the app's POST was blocked)")
+                elif state == "needs_tool_approval":
+                    report.add(PASS, "without a browser, the scan asks for approval instead of installing one", browser_stage.get("detail", "")[:100])
+                else:
+                    report.add(WARN, "the browser crawl did not run on this machine", f"{state}: {browser_stage.get('detail', '')[:100]}")
+            else:
+                report.add(FAIL, "a single-page-app scan starts", f"HTTP {status}")
         finally:
             login_server.shutdown()
     finally:

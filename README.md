@@ -22,6 +22,7 @@ A free, community-built vulnerability scanner that runs on your own Kali Linux m
 [Tool approvals](#tool-approvals) ·
 [Planner and coverage notes](#planner-and-coverage-notes) ·
 [Authenticated scanning](#authenticated-scanning) ·
+[Browser crawling](#browser-crawling-single-page-apps) ·
 [Configuration](#configuration) ·
 [Local practice lab](#local-practice-lab) ·
 [Scheduling, comparison, reports](#scheduling-retest-comparison-and-reports) ·
@@ -165,6 +166,7 @@ All tools are run with fixed, bounded arguments from a built-in allow-list. Noth
 | Discovery | links, resources, form targets and script URLs on the same origin | Standard+ | ≤12 URLs, depth 2, forms never submitted, no JavaScript executed, redirects off-origin rejected |
 | Platform detection | which of 60+ platforms the site runs, from headers, cookies, markup, URLs and WhatWeb results | all | conservative: generic hints alone are never enough; reported as an Info finding with its evidence |
 | Forms & APIs (built-in) | forms (HTTP logins, GET passwords, cross-origin posts, missing CSRF token as a labelled guess, upload forms); API paths named in the site's scripts, checked with GET; OpenAPI/Swagger documents; GraphQL and introspection | Standard+ | GET only, same origin, nothing submitted, scripts are read and never run; about 40 requests and 60 seconds at most |
+| [Chromium](https://www.chromium.org/) (headless) | **renders JavaScript single-page apps** so links, forms and API calls that only exist in the browser are found; token-in-browser-storage and mixed-content checks | Standard+ when the site looks like a single-page app | needs your approval to install (`apt install chromium`); ≤10 pages (Deep 14), 45 s (Deep 75 s); GET only; see [Browser crawling](#browser-crawling-single-page-apps) |
 | [Nuclei](https://github.com/projectdiscovery/nuclei) | known exposures and misconfigurations from a curated local template set, **plus templates written for the detected platform** (for example Jenkins, Spring Boot, Jira) | Standard+ | 30 general (60 in Deep) plus up to 20 (40) platform templates; GET-only templates, with state-changing, raw-request, payload, fuzzing and brute-force templates excluded; at most 5–6 URLs per run; 5 requests/second; redirects and OAST off; partial results kept on timeout. The first run on a fresh machine can be slow while Nuclei prepares its templates |
 | [WhatWeb](https://github.com/urbanadventurer/WhatWeb) | technology fingerprinting | Standard+ | aggression level 1, no redirect following |
 | [testssl.sh](https://github.com/drwetter/testssl.sh) | TLS configuration | Standard+ (HTTPS) | 75-second cap, JSON report |
@@ -267,7 +269,19 @@ Add an optional **second account** and the scanner compares who can open what, u
 
 Give each account a text that identifies its pages (an e-mail or username) for stronger results; the username is used if you leave it empty. Findings never contain page text, only status, size and similarity. The scan always notes what this cannot test: actions that change data, object IDs that no page links to, and role-specific buttons or fields. A shared page that was meant to be shared can look like a finding, so treat results as leads to verify.
 
-Not supported yet: MFA, CAPTCHA, SSO/OAuth browser flows and JavaScript-only logins.
+Not supported yet: MFA, CAPTCHA, SSO/OAuth flows and logins that only work through JavaScript. For logged-in single-page apps see [Browser crawling](#browser-crawling-single-page-apps).
+
+## Browser crawling (single-page apps)
+
+Many modern sites send an almost empty page and build everything with JavaScript, so a link crawler sees very little. When a site looks like a single-page app (React, Angular, Vue and similar), the scanner opens it in a headless Chromium and reads what the browser ends up with: links that exist only in the rendered page (including `#/route` pages), forms built by scripts, and the API calls the app makes. Those pages, forms and endpoints then go through the same checks as everything else. With a login, a second browser pass runs as the logged-in user.
+
+- **Approval first.** Chromium is installed only when you approve it (Kali: `apt install chromium`). If you decline, the report says the browser crawl was not assessed. If Chromium or Google Chrome is already installed it is used; set `DKCISSP_BROWSER` to point at a specific browser binary.
+- **Read-only.** The scanner never clicks, types or submits anything. Inside the browser every request passes a gate: only GET leaves the browser (the app's own POST/PUT/DELETE calls are blocked and listed as "not sent"), same-origin links that look like logout, delete, pay or reset are blocked, other hosts are reachable only for GET downloads of scripts, styles, fonts and images and never receive your credentials, dialogs are dismissed, and downloads and pop-ups are refused.
+- **Private.** Each run uses a throwaway browser profile that is deleted afterwards; a login session is handed to the browser in memory, never written to disk or put on a command line. Page text is not stored, and token-like values found in browser storage are reported by name only.
+- **Extra findings:** access tokens kept in `localStorage`/`sessionStorage` (readable by any script on the page), mixed content, and which other hosts supply scripts.
+- **Sandbox:** the browser keeps Chromium's sandbox, except when running as root or when you set `DKCISSP_BROWSER_NO_SANDBOX=1` (needed on some CI machines).
+
+What it cannot do yet: it does not click through the app, so screens that appear only after clicking a button, scrolling or filling a form are not reached (the report says so), and JavaScript-only logins are not supported.
 
 ## Configuration
 
@@ -368,13 +382,14 @@ python -m pip install pytest httpx
 pytest -q
 ```
 
-The suite (over 170 tests) uses a throwaway database, so it never touches your real `data.sqlite3`. GitHub Actions runs compilation and the suite on Ubuntu with Python 3.11. CI does not prove a clean Kali install, browser behaviour, or live tool integrations; before a release, follow the [Public-Release Verification Checklist](RELEASE_CHECKLIST.md).
+The suite (over 180 tests) uses a throwaway database, so it never touches your real `data.sqlite3`. GitHub Actions runs compilation and the suite on Ubuntu with Python 3.11. CI does not prove a clean Kali install, browser behaviour, or live tool integrations; before a release, follow the [Public-Release Verification Checklist](RELEASE_CHECKLIST.md).
 
 ## Repository layout
 
 ```text
 app.py                 FastAPI application: scan engine, engine adapters, approval flow, API
 auth.py                login handling, session, safety rules and token checks for authenticated scans
+browser.py             headless-browser crawler for single-page apps (own DevTools client, read-only gate)
 access.py              access-control comparison between a visitor and one or two accounts
 planner.py             which specialist checks apply to a target; coverage notes
 platforms.py           the platform catalogue and detection (60+ platforms)
@@ -402,7 +417,7 @@ The goal is a free, community-maintained alternative to commercial vulnerability
 | Forms, script-endpoint, API-documentation and GraphQL analysis | **working** |
 | Credentialed (authenticated) scanning: login handling, authenticated crawl, API checks | **working** (MFA/SSO next) |
 | Access-control comparison: visitor vs user vs second user (IDOR, vertical access) on crawled pages | **working** (ID enumeration and POST actions not covered) |
-| Browser-based crawler for single-page apps | next |
+| Browser-based crawler for single-page apps (render, read links, forms and API calls; logged-in pass) | **working** (no clicking or form filling yet) |
 | Dedicated GraphQL, upload and API-authorization testing | planned |
 | Network engine: host discovery, ports, service and version detection | planned |
 | CVE matching of detected services (NVD, CISA KEV, EPSS) with prioritisation | planned |
@@ -412,7 +427,7 @@ The goal is a free, community-maintained alternative to commercial vulnerability
 
 - Web engine only; there is no network or host scanning yet. Authenticated scanning covers common logins but not MFA, CAPTCHA or SSO, and tools that cannot carry a session run as a visitor.
 - Detection quality has been verified on local fixtures, not benchmarked against real-world applications; expect false negatives and false positives like any scanner. Platform detection is signature-based and conservative; a heavily customised site may not be recognised.
-- Discovery is a bounded link crawler: it does not run JavaScript. For single-page apps the scanner reads script files for API paths, but screens that only exist in the browser are missed.
+- Discovery is a bounded link crawler that does not run JavaScript. Single-page apps are rendered in a headless browser once you approve installing Chromium, but the browser never clicks or types, so screens reachable only through interaction are missed.
 - Platform-targeted checks are only as good as the local Nuclei template library; a platform with no safe templates gets general checks only (shown as a coverage note). Keep the library updated.
 - ffuf uses a short built-in list on purpose; it finds common exposures, not every hidden path. wpscan's vulnerability data needs an API token.
 - droopescan's fingerprint version detection can be ambiguous (it reports a range) and it needs an older Python than the newest releases.
