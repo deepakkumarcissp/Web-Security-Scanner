@@ -20,14 +20,15 @@ from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urlencode, urljoin, urldefrag
 from html.parser import HTMLParser
-from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler, HTTPSHandler
+from urllib.request import Request, urlopen, build_opener, HTTPCookieProcessor, HTTPRedirectHandler, HTTPSHandler
 
+import auth
 import planner
 import platforms
 import signals
 from fastapi import FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("DKCISSP_DB", ROOT / "data.sqlite3"))
@@ -131,11 +132,30 @@ def init_db() -> None:
 init_db()
 
 
+class AuthConfig(BaseModel):
+    """Login details for an authenticated scan. Secrets are SecretStr, so they print as ********** and are never stored."""
+    kind: str = Field(pattern="^(form|json|bearer|cookie|header|basic)$")
+    login_url: str = Field(default="", max_length=2048)
+    username: str = Field(default="", max_length=200)
+    password: SecretStr = Field(default=SecretStr(""), max_length=500)
+    username_field: str = Field(default="", pattern=r"^[A-Za-z0-9_.\-\[\]]{0,80}$")
+    password_field: str = Field(default="", pattern=r"^[A-Za-z0-9_.\-\[\]]{0,80}$")
+    token: SecretStr = Field(default=SecretStr(""), max_length=8000)
+    cookie: SecretStr = Field(default=SecretStr(""), max_length=8000)
+    header_name: str = Field(default="", pattern=r"^[A-Za-z0-9\-]{0,80}$")
+    header_value: SecretStr = Field(default=SecretStr(""), max_length=8000)
+    verify_url: str = Field(default="", max_length=2048)
+    success_text: str = Field(default="", max_length=200)
+    logged_out_text: str = Field(default="", max_length=200)
+
+
 class ScanRequest(BaseModel):
     target: str = Field(min_length=8, max_length=2048)
     profile: str = Field(default="standard", pattern="^(quick|standard|deep|active)$")
     authorized: bool = False
     active_testing_approved: bool = False
+    auth: AuthConfig | None = None
+    authenticated_testing_approved: bool = False
 
 
 class ScheduleRequest(ScanRequest):
@@ -279,11 +299,14 @@ class _SameOriginRedirectHandler(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def same_origin_opener(origin_url: str):
-    return build_opener(_SameOriginRedirectHandler(origin_url), HTTPSHandler(context=ssl.create_default_context()))
+def same_origin_opener(origin_url: str, jar=None):
+    handlers = [_SameOriginRedirectHandler(origin_url), HTTPSHandler(context=ssl.create_default_context())]
+    if jar is not None:
+        handlers.append(HTTPCookieProcessor(jar))
+    return build_opener(*handlers)
 
 
-def discover_same_origin_pages(root_url: str, root_html: str, max_pages: int = 12, max_depth: int = 2) -> dict:
+def discover_same_origin_pages(root_url: str, root_html: str, max_pages: int = 12, max_depth: int = 2, opener=None, url_filter=None) -> dict:
     """Bounded, low-rate, same-origin page discovery; never submits forms or executes JS."""
     root = root_url.rstrip("/") or root_url
     root_origin = urlparse(root)
@@ -293,10 +316,12 @@ def discover_same_origin_pages(root_url: str, root_html: str, max_pages: int = 1
     forms = list(signals.parse_forms(root_html, root_url))
     scripts = list(signals.script_urls(root_html, root_url))
     seen = {root}
-    opener = same_origin_opener(root)
+    opener = opener or same_origin_opener(root)
     while queue and len(discovered) < max_pages:
         url, depth = queue.pop(0)
         if url in seen or depth > max_depth:
+            continue
+        if url_filter and url_filter(url):   # for example links that would log out or delete something
             continue
         seen.add(url)
         parsed = urlparse(url)
@@ -716,7 +741,7 @@ def nuclei_target_urls(target: str, urls, limit: int) -> list[str]:
 
 
 def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[str] | None = None,
-                         max_templates: int = 30, platform_tags=None, platform_max: int = 0) -> tuple[list[tuple], dict]:
+                         max_templates: int = 30, platform_tags=None, platform_max: int = 0, session=None) -> tuple[list[tuple], dict]:
     """Run bounded Nuclei checks and retain valid partial results if the runtime limit is reached."""
     binary = shutil.which(TOOL_CATALOG["nuclei"]["binary"])
     if not binary:
@@ -761,6 +786,8 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
             "-duc", "-disable-redirects", "-no-interactsh", "-silent",
             "-jsonl-export", jsonl_path,
         ]
+        if session is not None:  # the session travels in a private file, never on the command line
+            command += ["-H", write_private_file(str(Path(temp_dir) / "session-headers.txt"), session.headers_file_text(target))]
         timed_out = False
         try:
             result = subprocess.run(
@@ -791,7 +818,8 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
                         "reason": reason, "finding_count": 0, "partial_results_retained": False,
                         "template_selection": selection_status, "target_count": len(safe_targets),
                         "rate_limit_per_second": 5, "concurrency": 3,
-                        "redirects_disabled": True, "interactsh_disabled": True}
+                        "redirects_disabled": True, "interactsh_disabled": True,
+                        "authenticated": session is not None}
         malformed = 0
         with open(jsonl_path, encoding="utf-8", errors="replace") as report_file:
             for line in report_file:
@@ -841,7 +869,7 @@ def perform_nuclei_check(target: str, timeout_seconds: int = 60, targets: list[s
                      "malformed_records": malformed, "template_selection": selection_status,
                      "target_count": len(safe_targets), "target_limit": 12,
                      "rate_limit_per_second": 5, "concurrency": 3, "redirects_disabled": True,
-                     "interactsh_disabled": True, "timeout_seconds": timeout_seconds}
+                     "interactsh_disabled": True, "timeout_seconds": timeout_seconds, "authenticated": session is not None}
 
 
 def parse_nikto_report(report, target: str) -> list[tuple]:
@@ -979,7 +1007,7 @@ def parse_ffuf_report(report, target: str) -> tuple[list[tuple], list[str]]:
     return [finding for _, finding in ranked[:40]], found_urls
 
 
-def perform_ffuf_check(target: str, timeout_seconds: int = 60, extra_paths=None) -> tuple[list[tuple], dict]:
+def perform_ffuf_check(target: str, timeout_seconds: int = 60, extra_paths=None, session=None) -> tuple[list[tuple], dict]:
     """Bounded hidden-content discovery against the supplied origin only, using the built-in wordlist."""
     binary = shutil.which(TOOL_CATALOG["ffuf"]["binary"])
     if not binary:
@@ -992,14 +1020,23 @@ def perform_ffuf_check(target: str, timeout_seconds: int = 60, extra_paths=None)
         report_path = str(Path(temp_dir) / "ffuf.json")
         wordlist_path = str(wordlist)
         extras = [p for p in (extra_paths or []) if re.fullmatch(r"[A-Za-z0-9_./!~@%+-]{1,120}", str(p))][:120]
-        if extras:  # the general list plus paths that matter for the recognised platforms, de-duplicated
+        skipped_for_safety = 0
+        if extras or session is not None:  # the general list plus platform paths, de-duplicated (and, when logged in, stripped of risky paths)
             lines = [l for l in wordlist.read_text(encoding="utf-8").splitlines() if l and not l.startswith("#")]
             merged = list(dict.fromkeys(lines + [e.lstrip("/") for e in extras]))
+            if session is not None:   # a path like /logout or /delete would end the session or change data
+                safe = [m for m in merged if not auth.is_unsafe_url("/" + m)]
+                skipped_for_safety, merged = len(merged) - len(safe), safe
             wordlist_path = str(Path(temp_dir) / "wordlist.txt")
             Path(wordlist_path).write_text("\n".join(merged) + "\n", encoding="utf-8")
-        command = [binary, "-u", base + "/FUZZ", "-w", wordlist_path, "-ic", "-ac", "-s", "-noninteractive",
+        if session is not None:   # the logged-in request (with its cookies/headers) is read from a private file
+            request_file = write_private_file(str(Path(temp_dir) / "session-request.txt"), session.raw_request(base + "/FUZZ"))
+            target_args = ["-request", request_file, "-request-proto", urlparse(base).scheme]
+        else:
+            target_args = ["-u", base + "/FUZZ", "-H", "User-Agent: DKCISSP-WebSecurityScanner/0.1 (+authorized content discovery)"]
+        command = [binary, *target_args, "-w", wordlist_path, "-ic", "-ac", "-s", "-noninteractive",
                    "-rate", "10", "-t", "4", "-timeout", "6", "-maxtime", str(max(10, timeout_seconds - 10)),
-                   "-mc", "200,204,301,302,307,308,401,403", "-H", "User-Agent: DKCISSP-WebSecurityScanner/0.1 (+authorized content discovery)",
+                   "-mc", "200,204,301,302,307,308,401,403",
                    "-of", "json", "-o", report_path]
         try:
             result = subprocess.run(command, capture_output=True, text=True, timeout=timeout_seconds, check=False,
@@ -1019,7 +1056,7 @@ def perform_ffuf_check(target: str, timeout_seconds: int = 60, extra_paths=None)
     findings, found_urls = parse_ffuf_report(report, target)
     return findings, {"status": "completed" if result.returncode == 0 else "completed_with_warnings",
                       "return_code": result.returncode, "finding_count": len(findings), "found_urls": found_urls[:40],
-                      "timeout_seconds": timeout_seconds,
+                      "timeout_seconds": timeout_seconds, "authenticated": session is not None, "paths_skipped_for_safety": skipped_for_safety,
                       "safety": "Deep/Active profiles only; same supplied origin; GET requests from a short built-in wordlist; 10 requests/second, 4 threads; no redirects followed; no recursion"}
 
 
@@ -1081,7 +1118,7 @@ def parse_sqlmap_log(text: str, url: str) -> list[tuple]:
     return findings
 
 
-def perform_sqlmap_check(target: str, urls, timeout_seconds: int = 240) -> tuple[list[tuple], dict]:
+def perform_sqlmap_check(target: str, urls, timeout_seconds: int = 240, session=None) -> tuple[list[tuple], dict]:
     """Detection-only SQL injection testing of a few same-origin parameterised URLs (Active profile only)."""
     test_urls = select_test_urls(target, urls)
     if not test_urls:
@@ -1094,18 +1131,32 @@ def perform_sqlmap_check(target: str, urls, timeout_seconds: int = 240) -> tuple
     with tempfile.TemporaryDirectory(prefix="dkcissp-sqlmap-") as temp_dir:
         for index, url in enumerate(test_urls):
             out_dir = str(Path(temp_dir) / f"run{index}")
-            command = [binary, "-u", url, "--batch", "--level=1", "--risk=1", "--technique=BEU", "--threads=1",
+            if session is not None:  # the logged-in request is read from a private file
+                request_file = write_private_file(str(Path(temp_dir) / f"request{index}.txt"), session.raw_request(url))
+                target_args = ["-r", request_file] + (["--force-ssl"] if urlparse(url).scheme == "https" else [])
+            else:
+                target_args = ["-u", url, "--user-agent=DKCISSP-WebSecurityScanner/0.1 (+authorized active testing)"]
+            command = [binary, *target_args, "--batch", "--level=1", "--risk=1", "--technique=BEU", "--threads=1",
                        "--timeout=10", "--retries=1", "--delay=0.2", "--ignore-redirects", "--flush-session",
-                       "--disable-coloring", "--user-agent=DKCISSP-WebSecurityScanner/0.1 (+authorized active testing)",
-                       "--output-dir=" + out_dir]
+                       "--disable-coloring", "--output-dir=" + out_dir]
+            terminal = None
             try:
+                if session is not None:   # sqlmap only reads a request file (-r) when its stdin is a terminal, so give it a pseudo-terminal
+                    import pty
+                    terminal = pty.openpty()
                 subprocess.run(command, capture_output=True, text=True, timeout=per_url, check=False,
-                               env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"})
+                               env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"}, stdin=terminal[1] if terminal else None)
             except subprocess.TimeoutExpired:
                 timed_out += 1
             except OSError as exc:
                 errors.append(str(exc)[:200])
                 continue
+            finally:
+                for descriptor in terminal or ():
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
             for log_path in Path(out_dir).glob("*/log"):  # partial results survive a timeout
                 try:
                     findings.extend(parse_sqlmap_log(log_path.read_text(encoding="utf-8", errors="replace"), url))
@@ -1118,7 +1169,7 @@ def perform_sqlmap_check(target: str, urls, timeout_seconds: int = 240) -> tuple
     elif timed_out:
         status = "partial_timeout" if findings else "timeout"
         reason = f"time limit reached on {timed_out} of {len(test_urls)} URL(s); results so far are kept"
-    return findings, {"status": status, "reason": reason, "finding_count": len(findings), "urls_tested": len(test_urls),
+    return findings, {"status": status, "reason": reason, "finding_count": len(findings), "urls_tested": len(test_urls), "authenticated": session is not None,
                       "safety": "Active profile only; same-origin parameterised URLs; level 1, risk 1; boolean, error and union techniques only (no stacked queries); no data extraction; 0.2 s delay; redirects not followed"}
 
 
@@ -1169,7 +1220,7 @@ def parse_dalfox_lines(text: str, target: str) -> list[tuple]:
     return findings
 
 
-def perform_dalfox_check(target: str, urls, timeout_seconds: int = 540) -> tuple[list[tuple], dict]:
+def perform_dalfox_check(target: str, urls, timeout_seconds: int = 540, session=None) -> tuple[list[tuple], dict]:
     """Detection-only reflected-XSS testing of a few same-origin parameterised URLs (Active profile only)."""
     test_urls = select_test_urls(target, urls, limit=3)
     if not test_urls:
@@ -1178,6 +1229,7 @@ def perform_dalfox_check(target: str, urls, timeout_seconds: int = 540) -> tuple
     if not binary:
         return [], {"status": "unavailable", "reason": "dalfox is not installed"}
     per_url = max(60, min(timeout_seconds // len(test_urls), 180))
+    use_session = session is not None and session.cookie_only   # a bearer token or API key cannot be given to dalfox without a command line
     findings, timed_out, errors = [], 0, []
     with tempfile.TemporaryDirectory(prefix="dkcissp-dalfox-") as temp_dir:
         for index, url in enumerate(test_urls):
@@ -1190,6 +1242,8 @@ def perform_dalfox_check(target: str, urls, timeout_seconds: int = 540) -> tuple
                        "--skip-headless", "--skip-grepping", "--skip-discovery",
                        *[arg for name in names for arg in ("-p", name)], "--limit-result", "1", "--limit-result-type", "v",
                        "--user-agent", "DKCISSP-WebSecurityScanner/0.1 (+authorized active testing)"]
+            if use_session:
+                command += ["--cookie-from-raw", write_private_file(str(Path(temp_dir) / f"cookies{index}.txt"), session.raw_request(url))]
             try:
                 subprocess.run(command, capture_output=True, text=True, timeout=per_url, check=False,
                                env={**os.environ, "NO_COLOR": "1", "TERM": "dumb"})
@@ -1212,7 +1266,9 @@ def perform_dalfox_check(target: str, urls, timeout_seconds: int = 540) -> tuple
         # An unfinished payload run is an incomplete test, not a clean result.
         status = "partial_timeout" if findings else "timeout"
         reason = f"time limit reached before dalfox finished testing {timed_out} of {len(test_urls)} URL(s); findings so far are kept, but those URLs were not fully tested"
-    return findings, {"status": status, "reason": reason, "finding_count": len(findings), "urls_tested": len(test_urls),
+    if session is not None and not use_session:
+        reason += "; this tool can only use cookie sessions, so it ran without your login"
+    return findings, {"status": status, "reason": reason, "finding_count": len(findings), "urls_tested": len(test_urls), "authenticated": use_session,
                       "safety": "Active profile only; same-origin parameterised URLs; reflected payloads only; no headless browser, parameter mining, blind-XSS callbacks or BAV; 3 workers, 150 ms delay; stops at the first verified result per URL"}
 
 
@@ -1491,14 +1547,15 @@ GRAPHQL_PATHS = ("graphql", "api/graphql", "graphiql")
 FORMS_API_BUDGET_SECONDS = 60
 
 
-def analyze_forms_and_apis(target: str, discovery: dict, root_html: str, platform_ids, final_url: str | None = None) -> tuple[list[tuple], dict, dict]:
+def analyze_forms_and_apis(target: str, discovery: dict, root_html: str, platform_ids, final_url: str | None = None,
+                           opener=None, authenticated: bool = False) -> tuple[list[tuple], dict, dict]:
     """Read forms, scripts and API descriptions on the approved origin. GET requests only; nothing is submitted.
 
     Returns (findings, status, extras). extras holds URLs worth feeding to later stages and the facts the planner needs.
     """
     base = final_url or target
     deadline = time.monotonic() + FORMS_API_BUDGET_SECONDS
-    opener = same_origin_opener(base)
+    opener = opener or same_origin_opener(base)
     headers = {"User-Agent": "DKCISSP-WebSecurityScanner/0.1 (+authorized API discovery)", "Accept": "application/json,text/javascript,*/*;q=0.5"}
     stats = {"requests": 0, "failed": 0, "budget_reached": False}
 
@@ -1595,6 +1652,20 @@ def analyze_forms_and_apis(target: str, discovery: dict, root_html: str, platfor
                          f"GET {item['url']} returned HTTP 200 with JSON data and no credentials were sent. Whether that is intended depends on the data.",
                          "Confirm this endpoint is meant to be public, and that it does not expose another user's data.", "Medium"))
 
+    if authenticated:  # the same checks, but what they find is only reachable with the login: say so
+        relabelled = []
+        for severity, title, url, evidence, fix, confidence in findings:
+            if title == "API documentation is publicly accessible":
+                severity, title = "Info", "API documentation is accessible while logged in"
+            elif title in ("GraphQL endpoint found", "GraphQL introspection is enabled"):
+                title += " (logged in)"
+            elif title.startswith("API endpoint answers without authentication:"):
+                title = title.replace("answers without authentication", "answers to the logged-in user")
+                evidence = evidence.replace("and no credentials were sent", "while logged in")
+            elif title.startswith("API endpoints referenced in JavaScript"):
+                title = title.replace("JavaScript", "JavaScript (logged in)", 1)
+            relabelled.append((severity, title, url, evidence, fix, confidence))
+        findings = relabelled
     api_urls = [u for doc in docs for u in doc["testable_urls"]]
     api_urls += [urljoin(origin, p.lstrip("/")) for p in js_paths if "?" in p]
     facts["api_endpoints"] = len(js_paths) + sum(d["path_count"] for d in docs)
@@ -1795,6 +1866,34 @@ def assessment_gaps(tool_status: dict) -> list[dict]:
     return gaps
 
 
+def write_private_file(path: str, text: str) -> str:
+    """Write a file only its owner can read (used for credentials handed to external tools; never a command line)."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    return path
+
+
+COOKIE_ATTRIBUTES = {"path", "domain", "expires", "max-age", "samesite", "secure", "httponly", "priority", "partitioned"}
+
+
+def redact_cookie_values(text: str) -> str:
+    """Keep cookie names and attributes, drop the values: 'sid=abc; Path=/' becomes 'sid=[redacted]; Path=/'."""
+    def replace(match):
+        name = match.group(2)
+        return match.group(0) if name.lower() in COOKIE_ATTRIBUTES else f"{match.group(1)}{name}=[redacted]"
+    return re.sub(r"(^|[;,]\s*)([^=;,\s]+)=([^;,]*)", replace, str(text or ""))
+
+
+def scrub_secrets(value, secrets) -> str:
+    """Remove every known secret (password, token, session cookie value) from text before it is stored."""
+    text = str(value if value is not None else "")
+    for secret in sorted({str(x) for x in secrets if x and len(str(x)) >= 6}, key=len, reverse=True):
+        for form in {secret, json.dumps(secret)[1:-1]}:   # as written, and as it would appear inside JSON
+            text = text.replace(form, "[redacted]")
+    return text
+
+
 def response_set_cookies(headers) -> list[str]:
     """All Set-Cookie header values of a response (a plain dict has only one value per name)."""
     getter = getattr(headers, "get_all", None)
@@ -1805,10 +1904,11 @@ def response_set_cookies(headers) -> list[str]:
     return list(values or [])
 
 
-def perform_scan(scan_id: int, target: str, profile: str) -> None:
+def perform_scan(scan_id: int, target: str, profile: str, auth_settings=None) -> None:
     findings = []
     tool_status = {
         "Built-in HTTP & headers": {"status": "running", "detail": "Requesting the supplied URL and inspecting response headers"},
+        "Authentication": {"status": "skipped", "detail": "No login credentials were provided"},
         "Endpoint discovery": {"status": "queued", "detail": "Waiting for the initial page response"},
         "Nuclei": {"status": "queued", "detail": "Waiting for built-in checks"},
         "Nikto": {"status": "queued", "detail": "Runs in Deep and Active profiles"},
@@ -1912,12 +2012,12 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         cookies = headers.get("set-cookie", "")
         if cookies and final_url.startswith("https://") and "secure" not in cookies.lower():
             finding(
-                "Medium", "Cookie may lack Secure attribute", cookies[:220],
+                "Medium", "Cookie may lack Secure attribute", redact_cookie_values(cookies)[:220],
                 "Set Secure on cookies that should only be sent over HTTPS.", "Medium",
             )
         if cookies and "httponly" not in cookies.lower():
             finding(
-                "Low", "Cookie may lack HttpOnly attribute", cookies[:220],
+                "Low", "Cookie may lack HttpOnly attribute", redact_cookie_values(cookies)[:220],
                 "Set HttpOnly for session cookies that do not require JavaScript access.", "Medium",
             )
         if profile in ("standard", "deep", "active"):
@@ -1934,6 +2034,23 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                     "Disable directory listing or restrict access.", "Medium",
                 )
 
+        # Authentication: log in once (never guessing) and keep the session for the stages that can use it.
+        session, session_ok, auth_info, auth_pages, auth_discovery, landing_html, landing_final = None, False, None, [], None, "", final_url
+        if auth_settings:
+            tool_status["Authentication"] = {"status": "running", "detail": "Logging in once with the credentials you provided; browsing afterwards is read-only"}
+            update_scan_progress(scan_id, 12, "Logging in", tool_status)
+            session = auth.AuthSession(final_url, auth_settings, lambda jar: same_origin_opener(final_url, jar))
+            try:
+                session_ok = session.login()
+            except Exception as exc:  # a login problem must never end the scan
+                session.status, session.reason = "failed", f"The login could not be completed ({type(exc).__name__})."
+            findings.extend(session.findings)
+            auth_info = session.describe()
+            if session_ok:
+                tool_status["Authentication"] = {"status": "completed", "detail": f"Logged in ({auth_settings.kind}); {session.verified_by}"}
+            else:
+                tool_status["Authentication"] = {"status": "login_failed", "detail": session.reason + " The scan continued without a login."}
+            auth_settings = None  # the session keeps what it needs; this reference is dropped now
         discovery_status = {"status": "skipped", "reason": "Endpoint discovery is enabled for Standard/Deep/Active scans only", "urls": [final_url]}
         tool_status["Endpoint discovery"] = {"status": "skipped", "detail": "Not selected for this profile"}
         if profile in ("standard", "deep", "active"):
@@ -1942,16 +2059,28 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             discovery_status = discover_same_origin_pages(final_url, body)
             discovered_urls = discovery_status.get("urls", [final_url])
             tool_status["Endpoint discovery"] = {"status": "completed", "detail": f"Mapped {len(discovered_urls)} same-origin URL(s); bounded passive discovery"}
+            if session_ok:
+                try:  # the same bounded crawl again, as the logged-in user, skipping links that could log out or change data
+                    _, _, landing_html, landing_final = session.request(session.landing_url)
+                    auth_discovery = discover_same_origin_pages(landing_final, landing_html, opener=session.opener, url_filter=auth.is_unsafe_url)
+                    auth_pages = [u for u in auth_discovery.get("urls", []) if u not in set(discovered_urls) and not auth.is_unsafe_url(u)]
+                    tool_status["Endpoint discovery"]["detail"] += f"; {len(auth_pages)} more page(s) found while logged in"
+                    discovery_status["urls"] = (auth_pages + list(discovered_urls))[:16]
+                    discovery_status["forms"] = (discovery_status.get("forms") or []) + (auth_discovery.get("forms") or [])
+                    discovery_status["scripts"] = list(dict.fromkeys((discovery_status.get("scripts") or []) + (auth_discovery.get("scripts") or [])))
+                except Exception as exc:
+                    tool_status["Endpoint discovery"]["detail"] += f"; the logged-in crawl failed ({type(exc).__name__})"
             # Extend low-impact response-header checks to discovered pages. Each URL is
             # fetched with a short timeout; only same-origin results are accepted.
             root_parsed = urlparse(final_url)
             root_port = root_parsed.port or (443 if root_parsed.scheme == "https" else 80)
-            for page_url in discovered_urls:
+            auth_page_set = set(auth_pages)
+            for page_url in list(discovered_urls) + list(auth_pages):
                 if page_url == final_url:
                     continue
                 try:
                     page_req = Request(page_url, headers={"User-Agent": "DKCISSP-WebSecurityScanner/0.1 (+authorized passive checks)", "Accept": "text/html,*/*;q=0.5"})
-                    with same_origin_opener(final_url).open(page_req, timeout=4) as page_response:
+                    with (session.opener if page_url in auth_page_set else same_origin_opener(final_url)).open(page_req, timeout=4) as page_response:
                         page_final = urlparse(page_response.geturl())
                         page_port = page_final.port or (443 if page_final.scheme == "https" else 80)
                         if page_final.scheme != root_parsed.scheme or page_final.hostname != root_parsed.hostname or page_port != root_port:
@@ -1969,9 +2098,9 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                         findings.append(("Low", "Referrer-Policy header missing", page_url_final, "Discovered same-origin response does not include Referrer-Policy.", "Set an appropriate Referrer-Policy.", "High"))
                     page_cookies = page_headers.get("set-cookie", "")
                     if page_cookies and page_url_final.startswith("https://") and "secure" not in page_cookies.lower():
-                        findings.append(("Medium", "Cookie may lack Secure attribute", page_url_final, page_cookies[:220], "Set Secure on cookies that should only be sent over HTTPS.", "Medium"))
+                        findings.append(("Medium", "Cookie may lack Secure attribute", page_url_final, redact_cookie_values(page_cookies)[:220], "Set Secure on cookies that should only be sent over HTTPS.", "Medium"))
                     if page_cookies and "httponly" not in page_cookies.lower():
-                        findings.append(("Low", "Cookie may lack HttpOnly attribute", page_url_final, page_cookies[:220], "Set HttpOnly for session cookies that do not require JavaScript access.", "Medium"))
+                        findings.append(("Low", "Cookie may lack HttpOnly attribute", page_url_final, redact_cookie_values(page_cookies)[:220], "Set HttpOnly for session cookies that do not require JavaScript access.", "Medium"))
                     if re.search(r"<title>\s*Index of /", page_body, re.I):
                         findings.append(("Medium", "Directory listing appears enabled", page_url_final, "Page title resembles a directory index. Validate manually before treating as confirmed.", "Disable directory listing or restrict access.", "Medium"))
                 except (HTTPError, URLError, TimeoutError, OSError, ssl.SSLError, ValueError):
@@ -1998,7 +2127,8 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             ffuf_extra_paths = signals.platform_paths(sorted(platform_hits))
             tool_status["Content discovery (ffuf)"] = {"status": "running", "detail": "Searching for hidden files and paths with a short built-in wordlist" + (f" plus {len(ffuf_extra_paths)} platform-specific paths" if ffuf_extra_paths else "") + ", 10 requests/second"}
             update_scan_progress(scan_id, 31, "Searching for hidden content", tool_status)
-            ffuf_findings, ffuf_status = perform_ffuf_check(target, timeout_seconds=(90 if profile == "active" else 60) + (20 if ffuf_extra_paths else 0), extra_paths=ffuf_extra_paths)
+            ffuf_findings, ffuf_status = perform_ffuf_check(target, timeout_seconds=(90 if profile == "active" else 60) + (20 if ffuf_extra_paths else 0), extra_paths=ffuf_extra_paths,
+                                                            **({"session": session} if session_ok else {}))
             findings.extend(ffuf_findings)
             # Pages that answered 200 join the same-origin list so later stages cover them too (cap stays 12).
             merged = list(discovery_status.get("urls", [target]))
@@ -2006,7 +2136,7 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                 if found not in merged and len(merged) < 12:
                     merged.append(found)
             discovery_status["urls"] = merged
-            tool_status["Content discovery (ffuf)"] = {"status": ffuf_status.get("status", "error"), "detail": f"{ffuf_status.get('finding_count', len(ffuf_findings))} finding(s); {ffuf_status.get('reason', 'check finished')}"}
+            tool_status["Content discovery (ffuf)"] = {"status": ffuf_status.get("status", "error"), "detail": f"{ffuf_status.get('finding_count', len(ffuf_findings))} finding(s); {ffuf_status.get('reason', 'check finished')}" + (" (logged in)" if ffuf_status.get("authenticated") else "")}
         else:
             tool_status["Content discovery (ffuf)"] = {"status": "skipped", "detail": "Runs in Deep and Active profiles"}
         # Forms, scripts and API descriptions: read-only analysis that also feeds the endpoints it finds to the stages below.
@@ -2027,8 +2157,37 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             discovery_status["urls"] = merged
             api_urls, signal_facts = fa_extras.get("api_urls", []), fa_extras.get("facts", {})
             tool_status["Forms & APIs (built-in)"] = {"status": forms_api_status.get("status", "error"), "detail": f"{forms_api_status.get('finding_count', len(fa_findings))} finding(s); {forms_api_status.get('forms', 0)} form(s), {forms_api_status.get('js_endpoints', 0)} script endpoint(s), {forms_api_status.get('api_docs', 0)} API description(s); {forms_api_status.get('reason', 'check finished')}"}
+            if session_ok and auth_discovery is not None:
+                try:  # the same analysis as the logged-in user: forms, scripts and API paths that only exist behind the login
+                    # Forms come from the logged-in crawl; script files include the public page's, since that is where the app's JavaScript is loaded.
+                    logged_in_view = dict(auth_discovery, scripts=discovery_status.get("scripts"), forms=auth_discovery.get("forms"))
+                    fa2_findings, fa2_status, fa2_extras = analyze_forms_and_apis(target, logged_in_view, landing_html, sorted(platform_hits), final_url,
+                                                                                  opener=session.opener, authenticated=True)
+                    findings.extend(fa2_findings)
+                    merged = list(discovery_status.get("urls", [target]))
+                    for extra_url in fa2_extras.get("merge_urls", []):
+                        if extra_url not in merged and len(merged) < 16:
+                            merged.append(extra_url)
+                    discovery_status["urls"] = merged
+                    api_urls = list(dict.fromkeys(list(api_urls) + list(fa2_extras.get("api_urls", []))))[:20]
+                    for key, value in (fa2_extras.get("facts") or {}).items():
+                        signal_facts[key] = (signal_facts.get(key) or value) if isinstance(value, bool) else max(signal_facts.get(key) or 0, value or 0)
+                    tool_status["Forms & APIs (built-in)"]["detail"] += f"; logged-in pass: {len(fa2_findings)} finding(s)"
+                except Exception as exc:
+                    tool_status["Forms & APIs (built-in)"]["detail"] += f"; the logged-in pass failed ({type(exc).__name__})"
         else:
             tool_status["Forms & APIs (built-in)"] = {"status": "skipped", "detail": "Not selected for this profile"}
+        if session_ok:  # is the session still alive after the crawl? Restore it at most twice, never guess anything new.
+            try:
+                if not session.still_logged_in():
+                    if session.logins < 3 and session.login():
+                        auth_info["session_note"] = "The session ended during the scan and was restored by logging in again."
+                    else:
+                        session_ok = False
+                        auth_info["session_note"] = "The session ended during the scan and could not be restored."
+                        tool_status["Authentication"] = {"status": "completed_with_warnings", "detail": "The session ended during the scan and could not be restored; later stages ran without it."}
+            except Exception:
+                pass
         platform_tags = platforms.nuclei_tags_for(sorted(platform_hits))
         if profile in ("standard", "deep", "active"):
             nuclei_targets = nuclei_target_urls(target, discovery_status.get("urls", [target]), 5 if profile in ("deep", "active") else 6)
@@ -2039,7 +2198,8 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             update_scan_progress(scan_id, 35, "Running Nuclei safe checks", tool_status)
             nuclei_findings, nuclei_status = perform_nuclei_check(target, timeout_seconds=nuclei_timeout,
                                                                   targets=nuclei_targets, max_templates=nuclei_template_cap,
-                                                                  platform_tags=platform_tags, platform_max=nuclei_platform_cap)
+                                                                  platform_tags=platform_tags, platform_max=nuclei_platform_cap,
+                                                                  **({"session": session} if session_ok else {}))
             findings.extend(nuclei_findings)
             nuclei_state = nuclei_status.get("status", "completed")
             nuclei_detail = f"{nuclei_status.get('finding_count', len(nuclei_findings))} finding(s) across {nuclei_status.get('target_count', len(nuclei_targets))} same-origin URL(s)"
@@ -2049,7 +2209,7 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                 nuclei_detail += "; time limit reached before a report was produced"
             elif nuclei_status.get("reason"):
                 nuclei_detail += "; " + str(nuclei_status["reason"])
-            tool_status["Nuclei"] = {"status": nuclei_state, "detail": nuclei_detail}
+            tool_status["Nuclei"] = {"status": nuclei_state, "detail": nuclei_detail + (" (logged in)" if nuclei_status.get("authenticated") else "")}
         if profile in ("deep", "active"):
             tool_status["Nikto"] = {"status": "running", "detail": "Checking common web-server exposures with a bounded request rate and runtime"}
             update_scan_progress(scan_id, 48, "Checking web-server exposures with Nikto", tool_status)
@@ -2122,9 +2282,9 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             for tool_id, runner, name in (("sqlmap", perform_sqlmap_check, "SQL injection (sqlmap)"), ("dalfox", perform_dalfox_check, "XSS (dalfox)")):
                 tool_status[name] = {"status": "running", "detail": "Active tests approved; testing same-origin URLs that have query parameters"}
                 update_scan_progress(scan_id, 94, f"Running approved {TOOL_CATALOG[tool_id]['label']} tests", tool_status)
-                tool_findings, result = runner(target, injection_urls)
+                tool_findings, result = runner(target, injection_urls, **({"session": session} if session_ok else {}))
                 findings.extend(tool_findings)
-                tool_status[name] = {"status": result.get("status", "error"), "detail": f"{result.get('finding_count', len(tool_findings))} finding(s); {result.get('reason', 'check finished')}"}
+                tool_status[name] = {"status": result.get("status", "error"), "detail": f"{result.get('finding_count', len(tool_findings))} finding(s); {result.get('reason', 'check finished')}" + (" (logged in)" if result.get("authenticated") else "")}
                 if tool_id == "sqlmap":
                     sqlmap_status = result
                 else:
@@ -2146,10 +2306,27 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
             technologies=set(platform_hits), login_form=bool(signal_facts.get("login_form")), upload_form=bool(signal_facts.get("upload_form")),
             is_spa=bool(signal_facts.get("is_spa")), graphql=bool(signal_facts.get("graphql")),
             api_requires_auth=bool(signal_facts.get("api_requires_auth")), api_endpoints=int(signal_facts.get("api_endpoints") or 0),
+            authenticated=bool(session_ok), auth_attempted=auth_info is not None,
             has_parameters=planner.has_query_parameters(discovery_status.get("urls", [])),
             url_count=len(discovery_status.get("urls", [])))
-        coverage = planner.plan_coverage(facts, set(ENGINE_STAGES) | {"builtin-forms-api"})
+        coverage = planner.plan_coverage(facts, set(ENGINE_STAGES) | {"builtin-forms-api", "builtin-authenticated"})
         coverage["platform_detection"] = platform_hits
+        if auth_info is not None and session_ok:
+            ran = ("completed", "completed_with_warnings", "partial_timeout", "timeout", "error")
+            stages = [("Nuclei", nuclei_status), ("Content discovery (ffuf)", ffuf_status), ("SQL injection (sqlmap)", sqlmap_status), ("XSS (dalfox)", dalfox_status),
+                      ("Nikto", nikto_status), ("WhatWeb", whatweb_status), ("TLS (testssl.sh)", tls_status), ("OWASP ZAP passive", zap_status),
+                      ("Wapiti active checks", wapiti_status), ("WordPress (wpscan)", wpscan_status), ("CMS checks (droopescan)", droopescan_status)]
+            auth_info["tools_with_login"] = [name for name, st in stages if st.get("status") in ran and st.get("authenticated")]
+            auth_info["tools_without_login"] = [name for name, st in stages if st.get("status") in ran and not st.get("authenticated")]
+            if auth_info["tools_without_login"]:
+                coverage["not_covered"].append({"rule": "tools_without_login", "capability": "Logged-in coverage by external tools", "tool": "n/a",
+                                                "reason": "Credentials were provided",
+                                                "message": "These tools ran without your login, because they cannot use a session: " + ", ".join(auth_info["tools_without_login"])
+                                                           + ". Their results cover only what is reachable without logging in."})
+        if auth_info is not None and not session_ok:
+            coverage["not_covered"].append({"rule": "login_failed", "capability": "Testing behind the login", "tool": "credentials",
+                                            "reason": "Credentials were provided but could not be used",
+                                            "message": "Credentials were provided, but " + (auth_info.get("reason") or "the login did not work") + " Everything behind the login was not tested."})
         available_templates = (nuclei_status.get("template_selection") or {}).get("platform_templates_available", {})
         for platform_id in sorted(platform_hits):
             platform = platforms.BY_ID[platform_id]
@@ -2177,6 +2354,12 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
         findings = deduped
 
         gaps = assessment_gaps(tool_status)
+        # Nothing secret is ever stored: scrub the password, tokens and session cookie values from everything written below.
+        secrets_list = session.secret_values() if session else []
+        clean = (lambda value: scrub_secrets(value, secrets_list)) if secrets_list else (lambda value: value)
+        findings = [tuple(clean(part) if isinstance(part, str) else part for part in item) for item in findings]
+        if auth_info is not None:
+            auth_info["authenticated_pages"] = len(auth_pages)
         with connect() as conn:
             for item in findings:
                 add_finding(conn, scan_id, target, *item)
@@ -2184,24 +2367,26 @@ def perform_scan(scan_id: int, target: str, profile: str) -> None:
                 "UPDATE scans SET status=?,finished_at=?,summary=?,progress=100,current_stage=?,tool_status=? WHERE id=?",
                 (
                     "completed_with_gaps" if gaps else "completed", now(),
-                    json.dumps({
+                    clean(json.dumps({
                         "http_status": status_code, "final_url": final_url,
                         "checks": "passive HTTP/header checks, bounded same-origin discovery, curated Nuclei checks, WhatWeb fingerprinting, optional TLS assessment, Deep/Active Nikto checks, optional ZAP passive alerts, and explicitly approved Active-profile Wapiti tests",
                         "tls_check": tls_status, "whatweb_check": whatweb_status,
                         "nuclei_check": nuclei_status, "nikto_check": nikto_status, "wapiti_check": wapiti_status, "zap_check": zap_status,
                         "endpoint_discovery": discovery_status, "ffuf_check": {k: v for k, v in ffuf_status.items() if k != "found_urls"},
                         "sqlmap_check": sqlmap_status, "dalfox_check": dalfox_status, "wpscan_check": wpscan_status, "droopescan_check": droopescan_status, "forms_api": forms_api_status, "coverage": coverage,
-                        "platform_detection": platform_hits,
+                        "platform_detection": platform_hits, "authentication": auth_info,
                         "finding_count": len(findings), "assessment_gaps": gaps,
-                    }),
-                    "Assessment complete with gaps" if gaps else "Assessment complete", json.dumps(tool_status), scan_id,
+                    })),
+                    "Assessment complete with gaps" if gaps else "Assessment complete", clean(json.dumps(tool_status)), scan_id,
                 ),
             )
     except Exception as exc:
         with connect() as conn:
+            known = locals().get("session")
+            hide = (lambda value: scrub_secrets(value, known.secret_values())) if known else (lambda value: value)
             conn.execute(
                 "UPDATE scans SET status=?,finished_at=?,summary=?,current_stage=?,tool_status=? WHERE id=?",
-                ("failed", now(), json.dumps({"error": str(exc)}), "Assessment failed", json.dumps(tool_status), scan_id),
+                ("failed", now(), hide(json.dumps({"error": str(exc)})), "Assessment failed", hide(json.dumps(tool_status)), scan_id),
             )
 
 
@@ -2218,7 +2403,7 @@ def running_scan_count(conn) -> int:
     return int(conn.execute("SELECT COUNT(*) FROM scans WHERE status='running'").fetchone()[0])
 
 
-def start_scan(target: str, profile: str) -> int:
+def start_scan(target: str, profile: str, auth_settings=None) -> int:
     with connect() as conn:
         # Serialize the capacity check and insert so simultaneous requests cannot
         # all observe the same free slot and exceed the configured worker limit.
@@ -2232,8 +2417,32 @@ def start_scan(target: str, profile: str) -> int:
             (target, profile, "running", now(), 1, "Queued", json.dumps({})),
         )
         scan_id = cursor.lastrowid
-    threading.Thread(target=perform_scan, args=(scan_id, target, profile), daemon=True).start()
+    # auth_settings (if any) travels only in this thread's arguments: it is never written to the database.
+    threading.Thread(target=perform_scan, args=(scan_id, target, profile) + ((auth_settings,) if auth_settings else ()), daemon=True).start()
     return scan_id
+
+
+def auth_settings_from_request(config: "AuthConfig", target: str) -> "auth.AuthSettings":
+    """Validate a login configuration and turn it into in-memory settings. Messages never contain a secret."""
+    secret = lambda v: v.get_secret_value()
+    settings = auth.AuthSettings(
+        kind=config.kind, login_url=config.login_url.strip(), username=config.username, password=secret(config.password),
+        username_field=config.username_field, password_field=config.password_field, token=secret(config.token), cookie=secret(config.cookie),
+        header_name=config.header_name, header_value=secret(config.header_value), verify_url=config.verify_url.strip(),
+        success_text=config.success_text, logged_out_text=config.logged_out_text)
+    needs = {"form": settings.username and settings.password, "json": settings.login_url and settings.username and settings.password,
+             "bearer": settings.token, "cookie": settings.cookie, "header": settings.header_name and settings.header_value,
+             "basic": settings.username and settings.password}
+    labels = {"form": "a username and password", "json": "the login endpoint address, a username and a password", "bearer": "a token",
+              "cookie": "a cookie value", "header": "a header name and value", "basic": "a username and password"}
+    if not needs[settings.kind]:
+        raise HTTPException(400, f"This login type needs {labels[settings.kind]}.")
+    for label, url in (("login page", settings.login_url), ("verification page", settings.verify_url)):
+        if url and (not url.lower().startswith(("http://", "https://")) or not auth.same_origin(url, target)):
+            raise HTTPException(400, f"The {label} must be on the same site as the target. Credentials are never sent to another site.")
+    if "\r" in settings.header_name or "\n" in settings.header_name or any(ch in settings.header_value + settings.cookie + settings.token for ch in "\r\n"):
+        raise HTTPException(400, "Header values cannot contain line breaks.")
+    return settings
 
 
 def scheduler_loop() -> None:
@@ -2456,13 +2665,18 @@ def create_scan(request: ScanRequest):
     if request.profile == "active" and not request.active_testing_approved:
         raise HTTPException(400, "Active profile requires the separate active-testing approval confirmation.")
     target = validate_target(request.target)
+    auth_settings = None
+    if request.auth:
+        if not request.authenticated_testing_approved:
+            raise HTTPException(400, "An authenticated scan needs the separate confirmation that the scanner may act as this user.")
+        auth_settings = auth_settings_from_request(request.auth, target)
     # Simple one-URL workflow: the explicit authorization confirmation is enough for any entered target.
     with connect() as conn:
         active_scans = running_scan_count(conn)
     limit = max_concurrent_scans()
     if active_scans >= limit:
         raise HTTPException(429, f"Scanner capacity reached ({active_scans}/{limit} assessments running). Wait for a scan to finish before starting another.")
-    scan_id = start_scan(target, request.profile)
+    scan_id = start_scan(target, request.profile, auth_settings) if auth_settings else start_scan(target, request.profile)
     return {
         "id": scan_id, "status": "running", "profile": request.profile,
         "message": "Assessment started with the selected profile. Standard adds bounded discovery and safe Nuclei checks; Deep adds bounded Nikto checks; Active additionally runs explicitly approved Wapiti payload tests. Optional ZAP passive alerts require a healthy local API.",
@@ -2702,6 +2916,8 @@ def create_schedule(request: ScheduleRequest):
         raise HTTPException(400, "Confirm you are authorized to test this target.")
     if request.profile == "active":
         raise HTTPException(400, "Active payload testing cannot be scheduled; start it manually with explicit approval.")
+    if request.auth:
+        raise HTTPException(400, "Authenticated scans cannot be scheduled: credentials are never stored.")
     target = validate_target(request.target)
     delta = timedelta(days=1 if request.frequency == "daily" else 7)
     if request.run_at:

@@ -26,6 +26,8 @@ class Rule:
     needs_parameters: bool = False  # applies only when URLs with query parameters were found
     gap_note: str = ""       # what to tell the assessor when the engine is not available
     needs_flags: tuple = ()  # applies only when these facts are true (for example "login_form")
+    unless_flags: tuple = () # does not apply when any of these facts is true (for example "authenticated")
+    fixed_message: str = ""  # the exact coverage note to show when the rule applies but cannot be satisfied
     tool_label: str = ""     # plain-language name of the missing capability, used in coverage notes
 
 
@@ -50,15 +52,23 @@ RULES = (
          gap_note="Moodle version and plugins were not checked beyond general template checks."),
     Rule("forms_and_apis", "Form, API and script-endpoint analysis", "builtin-forms-api", ("standard", "deep", "active"),
          "Standard and deeper profiles analyse forms, scripts and API descriptions"),
-    Rule("login_testing", "Login and authenticated-area testing", "credentialed-scanning", ("standard", "deep", "active"),
-         "A login form was found", needs_flags=("login_form",), tool_label="credentialed scanning",
-         gap_note="Login protection (lockout, brute-force resistance) and every page behind the login were not tested."),
+    Rule("authenticated_scan", "Authenticated crawl and analysis", "builtin-authenticated", ("quick", "standard", "deep", "active"),
+         "Credentials were provided and the login worked", needs_flags=("authenticated",)),
+    Rule("login_testing", "Testing behind the login", "login-credentials", ("standard", "deep", "active"),
+         "A login form was found", needs_flags=("login_form",), unless_flags=("authenticated", "auth_attempted"), tool_label="login credentials",
+         fixed_message="A login form was found, but no credentials were provided, so everything behind the login was not tested. "
+                       "Add credentials under 'Authenticated scan' to test it."),
+    Rule("login_hardening", "Login hardening tests", "login-hardening", ("standard", "deep", "active"),
+         "A login form was found", needs_flags=("login_form",), tool_label="login-hardening tests",
+         fixed_message="A login form was found. Brute-force resistance, account lockout and multi-factor behaviour were not tested: "
+                       "the scanner never guesses passwords."),
     Rule("upload_testing", "File-upload restriction testing", "upload-testing", ("standard", "deep", "active"),
          "A file-upload form was found", needs_flags=("upload_form",), tool_label="an upload-testing engine",
          gap_note="Allowed file types, size limits and content checks were not tested."),
-    Rule("authenticated_api", "Authenticated API testing", "credentialed-scanning", ("standard", "deep", "active"),
-         "API endpoints that require authentication were found", needs_flags=("api_requires_auth",), tool_label="credentialed scanning",
-         gap_note="Those endpoints answered 401 or 403 and were not tested behind a login."),
+    Rule("authenticated_api", "Authenticated API testing", "login-credentials", ("standard", "deep", "active"),
+         "API endpoints that require authentication were found", needs_flags=("api_requires_auth",), unless_flags=("authenticated",),
+         tool_label="login credentials",
+         fixed_message="API endpoints answered 401 or 403 and were not tested behind a login. Add credentials under 'Authenticated scan' to test them."),
     Rule("graphql_testing", "Dedicated GraphQL testing", "graphql-testing", ("standard", "deep", "active"),
          "A GraphQL endpoint was found", needs_flags=("graphql",), tool_label="a GraphQL testing engine",
          gap_note="Only introspection was checked; query depth limits, batching and field-level authorization were not tested."),
@@ -87,6 +97,8 @@ class Facts:
     graphql: bool = False           # a GraphQL endpoint answered
     api_requires_auth: bool = False  # API endpoints answered 401/403
     api_endpoints: int = 0
+    authenticated: bool = False     # credentials were provided and the login worked
+    auth_attempted: bool = False    # credentials were provided (whether or not the login worked)
 
 
 def detect_technologies(headers: dict | None, body: str | None, fingerprint_titles=(), cookie_names=(), urls=()) -> set:
@@ -108,6 +120,8 @@ def rule_applies(rule: Rule, facts: Facts) -> bool:
         return False
     if any(not getattr(facts, flag, False) for flag in rule.needs_flags):
         return False
+    if any(getattr(facts, flag, False) for flag in rule.unless_flags):
+        return False
     return True
 
 
@@ -121,7 +135,9 @@ def plan_coverage(facts: Facts, available_tools: set) -> dict:
         if rule.tool in available_tools:
             planned.append(entry)
         else:
-            if rule.tool_label:
+            if rule.fixed_message:
+                entry["message"] = rule.fixed_message
+            elif rule.tool_label:
                 entry["message"] = f"{rule.reason}. {rule.capability} needs {rule.tool_label}, which is not available in this version. {rule.gap_note}".strip()
             else:
                 entry["message"] = (f"{rule.reason}. {rule.capability} ({rule.tool}) would normally run here, "
@@ -143,4 +159,4 @@ def plan_coverage(facts: Facts, available_tools: set) -> dict:
             "facts": {"technologies": sorted(facts.technologies), "has_parameters": facts.has_parameters,
                       "urls_mapped": facts.url_count, "login_form": facts.login_form, "upload_form": facts.upload_form,
                       "is_spa": facts.is_spa, "graphql": facts.graphql, "api_requires_auth": facts.api_requires_auth,
-                      "api_endpoints": facts.api_endpoints}}
+                      "api_endpoints": facts.api_endpoints, "authenticated": facts.authenticated, "auth_attempted": facts.auth_attempted}}

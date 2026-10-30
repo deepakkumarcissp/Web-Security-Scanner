@@ -2184,7 +2184,7 @@ def test_forms_are_parsed_and_classified_without_submitting_anything():
     kinds = [(f["action"], f["method"], f["kind"], f["has_csrf_token"], f["cross_origin"], f["has_file"]) for f in forms]
     assert kinds[0] == ("https://t.example/login", "post", "login", True, False, False)      # the page-level csrf meta tag counts
     assert kinds[1][0] == "http://evil.example/steal" and kinds[1][4] is True
-    assert kinds[2][1] == "get" and kinds[2][2] == "login"
+    assert kinds[2][1] == "get" and kinds[2][2] == "password"       # a password field alone is a password form, not a login form
     assert kinds[3][2] == "register" and kinds[3][3] is True
     assert kinds[4][5] is True and kinds[5][3] is True
     assert signals.parse_forms("<form><input", "https://t.example/") is not None and signals.parse_forms(None, "https://t.example/") == []
@@ -2267,7 +2267,7 @@ def api_fixture_server():
         def do_GET(self):
             path, _, query = self.path.partition("?")
             if path == "/":
-                self.reply(200, '<html><script src="/static/main.js"></script><form action="/login" method="post"><input type="password" name="pw"></form>'
+                self.reply(200, '<html><script src="/static/main.js"></script><form action="/login" method="post"><input name="user"><input type="password" name="pw"></form>'
                                 '<form action="/up" method="post" enctype="multipart/form-data"><input type="file" name="f"></form></html>', "text/html")
             elif path == "/static/main.js":
                 self.reply(200, 'a="/rest/products/search?q=";b="/api/Users/";c="/rest/admin/secret";d="/api/missing";', "application/javascript")
@@ -2308,7 +2308,7 @@ def test_forms_and_api_analysis_against_a_real_local_server(api_fixture_server):
 
 def test_forms_and_api_analysis_is_bounded_and_survives_unreachable_hosts(monkeypatch):
     findings, status, extras = app.analyze_forms_and_apis("http://127.0.0.1:9", {"urls": ["http://127.0.0.1:9/"]},
-                                                           '<script src="/a.js"></script><form><input type="password" name="p"></form>', [], "http://127.0.0.1:9/")
+                                                           '<script src="/a.js"></script><form><input name="user"><input type="password" name="p"></form>', [], "http://127.0.0.1:9/")
     assert status["status"] == "completed_with_warnings" and "none of the requests" in status["reason"]
     assert any(f[1].startswith("Login form") for f in findings)                       # the form analysis needs no network
     monkeypatch.setattr(app, "FORMS_API_BUDGET_SECONDS", -1)
@@ -2330,8 +2330,10 @@ def test_scan_feeds_api_findings_to_later_stages_and_records_what_cannot_be_test
     assert "http://api-run.example/rest/products/search?q=" in seen["nuclei_targets"]            # endpoints found in scripts get scanned too
     assert tools["Forms & APIs (built-in)"]["status"] == "completed" and summary["forms_api"]["js_endpoints"] == 3
     notes = {n["rule"]: n["message"] for n in summary["coverage"]["not_covered"]}
-    assert set(notes) == {"login_testing", "upload_testing", "authenticated_api", "graphql_testing", "spa_crawling"}
-    assert "were not tested" in notes["login_testing"] and "401 or 403" in notes["authenticated_api"] and "single-page app" in notes["spa_crawling"]
+    assert set(notes) == {"login_testing", "login_hardening", "upload_testing", "authenticated_api", "graphql_testing", "spa_crawling"}
+    assert notes["login_testing"].startswith("A login form was found, but no credentials were provided") and "Authenticated scan" in notes["login_testing"]
+    assert "never guesses passwords" in notes["login_hardening"]
+    assert "401 or 403" in notes["authenticated_api"] and "single-page app" in notes["spa_crawling"]
     assert "forms_and_apis" in [p["rule"] for p in summary["coverage"]["planned"]]
     assert summary["coverage"]["facts"]["login_form"] is True and row["status"] == "completed"   # notes are information, not failures
 
@@ -2387,8 +2389,413 @@ def test_nuclei_gets_a_small_useful_url_list_not_every_discovered_file():
 
 def test_coverage_notes_read_naturally():
     import planner
-    plan = planner.plan_coverage(planner.Facts(profile="standard", login_form=True, graphql=True), available_tools=set())
+    plan = planner.plan_coverage(planner.Facts(profile="standard", login_form=True, graphql=True), available_tools={"builtin-authenticated"})
     notes = {n["rule"]: n["message"] for n in plan["not_covered"]}
-    assert notes["login_testing"] == ("A login form was found. Login and authenticated-area testing needs credentialed scanning, which is not available in this version. "
-                                      "Login protection (lockout, brute-force resistance) and every page behind the login were not tested.")
+    assert notes["login_testing"] == ("A login form was found, but no credentials were provided, so everything behind the login was not tested. "
+                                      "Add credentials under 'Authenticated scan' to test it.")
+    assert notes["login_hardening"].startswith("A login form was found. Brute-force resistance, account lockout")
     assert notes["graphql_testing"].startswith("A GraphQL endpoint was found. Dedicated GraphQL testing needs a GraphQL testing engine, which")
+    # With credentials the "no credentials" note disappears and the authenticated scan is planned; hardening stays uncovered.
+    authed = planner.plan_coverage(planner.Facts(profile="standard", login_form=True, authenticated=True, auth_attempted=True), available_tools={"builtin-authenticated"})
+    assert "login_testing" not in {n["rule"] for n in authed["not_covered"]} and "login_hardening" in {n["rule"] for n in authed["not_covered"]}
+    assert "authenticated_scan" in [p["rule"] for p in authed["planned"]]
+    failed = planner.plan_coverage(planner.Facts(profile="standard", login_form=True, auth_attempted=True), available_tools={"builtin-authenticated"})
+    assert "login_testing" not in {n["rule"] for n in failed["not_covered"]}   # the app adds a specific "login failed" note instead
+
+
+# ---- credentialed (authenticated) scanning -------------------------------------------------------------------
+
+import json
+import sys as _sys
+_sys.path.insert(0, str(app.ROOT / "scripts"))
+import testsite  # noqa: E402  (the same website the self-test uses)
+
+
+@__import__("pytest").fixture
+def site_factory(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda seconds: None)        # skip the politeness delays; the logic is what is tested
+    servers = []
+    def make(**config):
+        server, base, site = testsite.start_site(**config)
+        servers.append(server)
+        return base, site
+    yield make
+    for server in servers:
+        server.shutdown()
+
+
+def _session(base, **settings):
+    import auth
+    return auth.AuthSession(base + "/", auth.AuthSettings(**settings), lambda jar: app.same_origin_opener(base, jar))
+
+
+def test_form_login_works_once_keeps_the_session_and_finds_nothing_wrong_on_a_good_site(site_factory):
+    base, site = site_factory()
+    session = _session(base, kind="form", username="alice", password="alicepw")
+    assert session.login() is True and session.status == "logged_in"
+    assert "no login form" in session.verified_by and session.landing_url.endswith("/dashboard")
+    assert site.login_posts == 1 and "sid" in session.cookies()
+    status, _, body, _ = session.request(base + "/dashboard")
+    assert status == 200 and "Welcome alice" in body
+    assert session.findings == []                      # HttpOnly + SameSite set, session ID renewed, loopback HTTP is fine
+
+
+def test_a_wrong_password_is_tried_exactly_once_and_reported_without_the_password(site_factory):
+    base, site = site_factory()
+    session = _session(base, kind="form", username="alice", password="definitely-wrong-pw")
+    assert session.login() is False and session.status == "failed"
+    assert "login was not accepted" in session.reason and "definitely-wrong-pw" not in session.reason
+    assert site.login_posts == 1                       # no retry, so no lockout risk
+    assert session.login() is False and site.login_posts == 2   # only an explicit new call tries again
+    assert "definitely-wrong-pw" not in json.dumps(session.describe()) and "definitely-wrong-pw" not in repr(session.settings)
+
+
+def test_mfa_and_sso_are_refused_not_worked_around(site_factory):
+    import auth
+    base, site = site_factory(require_mfa=True)
+    session = _session(base, kind="form", username="alice", password="alicepw")
+    assert session.login() is False and session.unsupported == "mfa" and "second factor" in session.reason
+    assert site.login_posts == 0                       # the credentials were never even submitted
+    other_base, _ = site_factory()
+    with __import__("pytest").raises(auth.AuthError):
+        _session(base, kind="form", username="a", password="b").request(other_base + "/dashboard")   # never off the scanned origin
+
+
+def test_login_findings_report_fixation_and_unprotected_session_cookies(site_factory):
+    base, site = site_factory(rotate_session=False, cookie_flags="")
+    session = _session(base, kind="form", username="alice", password="alicepw")
+    assert session.login() is True
+    titles = {f[1]: f for f in session.findings}
+    assert titles["Session cookie 'sid' is missing: HttpOnly, SameSite"][0] == "Medium"
+    fixation = titles["Session ID 'sid' was not renewed at login (session fixation risk)"]
+    assert fixation[0] == "Medium" and site.fixed_sid not in fixation[3]       # the cookie value is never in a finding
+
+
+def test_credentials_over_plain_http_to_a_real_host_are_flagged():
+    import auth
+    session = auth.AuthSession("http://203.0.113.9/", auth.AuthSettings(kind="form", username="a", password="b"), lambda jar: app.same_origin_opener("http://203.0.113.9", jar))
+    session._login_checks({}, "http://203.0.113.9/login")
+    assert session.findings[0][:2] == ("High", "Credentials were sent over unencrypted HTTP")
+
+
+def test_json_login_bearer_cookie_header_and_basic(site_factory):
+    base, site = site_factory()
+    json_login = _session(base, kind="json", login_url=base + "/api/login", username="alice", password="alicepw", verify_url=base + "/api/me")
+    assert json_login.login() is True and json_login.headers["Authorization"].startswith("Bearer ")
+    assert json.loads(json_login.request(base + "/api/me")[2])["user"] == "alice"
+    assert [f[1] for f in json_login.findings] == ["Session token is a JWT signed with HS256"]
+    assert _session(base, kind="json", login_url=base + "/api/login", username="alice", password="nope", verify_url=base + "/api/me").login() is False
+    token = site.make_token("bob")
+    assert _session(base, kind="bearer", token=token, verify_url=base + "/api/me").login() is True
+    assert _session(base, kind="bearer", token="not-a-valid-token", verify_url=base + "/api/me").login() is False
+    site.sessions["cookie-session-1234"] = "alice"
+    assert _session(base, kind="cookie", cookie="sid=cookie-session-1234", verify_url=base + "/api/me").login() is True
+    assert _session(base, kind="cookie", cookie="sid=bogus-session-9999", verify_url=base + "/api/me").login() is False
+    assert _session(base, kind="header", header_name="X-Api-Key", header_value="key-for-alice", verify_url=base + "/api/me").login() is True
+    assert _session(base, kind="basic", username="alice", password="alicepw", verify_url=base + "/api/me").login() is True
+    assert _session(base, kind="basic", username="alice", password="wrongpw1", verify_url=base + "/api/me").login() is False
+
+
+def test_jwt_weaknesses_are_read_from_the_token_without_quoting_it(site_factory):
+    import auth
+    base, site = site_factory(jwt_alg="none", jwt_exp=False)
+    session = _session(base, kind="json", login_url=base + "/api/login", username="alice", password="alicepw", verify_url=base + "/api/me")
+    assert session.login() is True
+    titles = {f[1]: f for f in session.findings}
+    assert titles["Session token is an unsigned JWT (alg none)"][0] == "High" and titles["Session token has no expiry claim"][0] == "Low"
+    assert all(session.token_value not in " ".join(str(part) for part in f) for f in session.findings)
+    assert auth.jwt_findings("not.a.jwt", "x") == [] and auth.decode_jwt("only-one-part") is None
+
+
+def test_logged_out_detection_ignores_change_password_forms(site_factory):
+    base, site = site_factory()
+    session = _session(base, kind="form", username="alice", password="alicepw")
+    assert session.login()
+    status, _, body, final = session.request(base + "/settings")
+    assert "new_password" in body and session.looks_logged_out(status, body, final, base + "/settings") is False
+    assert session.looks_logged_out(403, "", base + "/admin", base + "/admin") is True
+    assert session.looks_logged_out(200, '<form action="/login"><input name="username"><input type="password" name="password"></form>', base + "/x", base + "/x") is True
+    assert session.still_logged_in() is True
+
+
+def test_dangerous_links_are_never_followed():
+    import auth
+    for url in ["http://t/logout", "http://t/users/sign_out", "http://t/delete-account", "http://t/dashboard?action=remove-card", "http://t/cart/checkout",
+                "http://t/account/reset", "http://t/orders/7/cancel", "http://t/api/pay", "http://t/unsubscribe?u=1", "http://t/transfer"]:
+        assert auth.is_unsafe_url(url), url
+    for url in ["http://t/dashboard", "http://t/account/1", "http://t/orders/7", "http://t/settings", "http://t/api/me", "http://t/products?page=2"]:
+        assert not auth.is_unsafe_url(url), url
+    assert auth.is_unsafe_url("http://t/payments-overview-pdf")     # over-cautious on purpose: skipping a page costs coverage, following a risky link could cost data
+
+
+def test_secrets_are_redacted_everywhere_they_could_leak(site_factory):
+    import auth
+    from pydantic import SecretStr
+    config = app.AuthConfig(kind="form", username="alice", password=SecretStr("sup3r-secret-pw"))
+    assert "sup3r-secret-pw" not in repr(config) and "sup3r-secret-pw" not in str(config.model_dump()) and "**********" in repr(config)
+    assert app.redact_cookie_values("sid=abc123; Path=/; HttpOnly; Expires=Wed, 21 Oct 2026 07:28:00 GMT; theme=dark, other=zzz") == \
+        "sid=[redacted]; Path=/; HttpOnly; Expires=Wed, 21 Oct 2026 07:28:00 GMT; theme=[redacted], other=[redacted]"
+    assert app.redact_cookie_values(None) == "" and app.redact_cookie_values("no cookies here") == "no cookies here"
+    assert app.scrub_secrets("token=abc123456 and \\\"abc\\\\def123\\\"", ["abc123456", 'abc"def123', "tiny"]) == "token=[redacted] and \\\"abc\\\\def123\\\""
+    assert app.scrub_secrets("keep tiny", ["tiny"]) == "keep tiny"          # values under 6 characters are never scrubbed (they would mangle text)
+    base, site = site_factory()
+    session = _session(base, kind="form", username="alice", password="alicepw")
+    session.login()
+    secrets = session.secret_values()
+    assert "alicepw" in secrets and session.cookies()["sid"] in secrets
+    header, cookie = dict(session.tool_headers()).get("Cookie", ""), session.cookie_string()
+    assert f"sid={session.cookies()['sid']}" in cookie and header == cookie
+    assert "alicepw" not in repr(session.settings) and "alicepw" not in json.dumps(session.describe())
+
+
+def test_scan_api_requires_consent_valid_login_details_and_never_schedules_credentials(monkeypatch):
+    started = []
+    monkeypatch.setattr(app, "start_scan", lambda *args: started.append(args) or 77)
+    base_body = {"target": "http://127.0.0.1:1003", "profile": "standard", "authorized": True}
+    auth_cfg = {"kind": "form", "username": "alice", "password": "pw-for-test-1"}
+    r = client.post("/api/scans", json={**base_body, "auth": auth_cfg})
+    assert r.status_code == 400 and "separate confirmation" in r.json()["detail"] and "pw-for-test-1" not in r.text
+    r = client.post("/api/scans", json={**base_body, "auth": {"kind": "form", "username": "alice"}, "authenticated_testing_approved": True})
+    assert r.status_code == 400 and "username and password" in r.json()["detail"]
+    r = client.post("/api/scans", json={**base_body, "auth": {**auth_cfg, "login_url": "https://evil.example/login"}, "authenticated_testing_approved": True})
+    assert r.status_code == 400 and "same site" in r.json()["detail"] and "pw-for-test-1" not in r.text
+    r = client.post("/api/scans", json={**base_body, "auth": {"kind": "cookie", "cookie": "a=b\r\nX: y"}, "authenticated_testing_approved": True})
+    assert r.status_code == 400
+    assert client.post("/api/scans", json={**base_body, "auth": {"kind": "magic"}, "authenticated_testing_approved": True}).status_code == 422
+    assert started == []                                 # nothing started for any invalid request
+    ok = client.post("/api/scans", json={**base_body, "auth": auth_cfg, "authenticated_testing_approved": True})
+    assert ok.status_code == 200 and len(started) == 1 and started[0][2].username == "alice" and started[0][2].password == "pw-for-test-1"
+    assert "pw-for-test-1" not in ok.text
+    schedule = client.post("/api/schedules", json={"name": "x", "target": "https://s.example", "profile": "quick", "frequency": "daily", "authorized": True, "auth": auth_cfg})
+    assert schedule.status_code == 400 and "never stored" in schedule.json()["detail"]
+
+
+def _auth_scan(monkeypatch, base, site, settings=None, profile="standard", nuclei=None):
+    """A real scan (real login, crawl and analysis) of the test site; only the external tools are stubbed."""
+    import auth
+    monkeypatch.setattr("time.sleep", lambda seconds: None)         # the politeness delays are not what these tests are about
+    monkeypatch.setattr(app, "perform_zap_passive_check", lambda *a, **k: ([], {"status": "completed"}))
+    for name in ("perform_whatweb_check", "perform_nikto_check", "perform_testssl_check", "perform_ffuf_check", "perform_wpscan_check", "perform_droopescan_check"):
+        monkeypatch.setattr(app, name, lambda *a, **k: ([], {"status": "completed"}))
+    monkeypatch.setattr(app, "perform_nuclei_check", nuclei or (lambda *a, **k: ([], {"status": "completed"})))
+    monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/" + str(binary))
+    with app.connect() as conn:
+        scan_id = conn.execute("INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)", (base, profile, "running", app.now())).lastrowid
+    app.perform_scan(scan_id, base, profile, *([auth.AuthSettings(**settings)] if settings else []))
+    row, tools, summary = _scan_row(scan_id)
+    findings = client.get(f"/api/scans/{scan_id}").json()["findings"]
+    return scan_id, row, tools, summary, findings
+
+
+def _database_bytes() -> bytes:
+    blob = b""
+    for suffix in ("", "-wal", "-journal"):
+        path = app.Path(str(app.DB_PATH) + suffix)
+        if path.exists():
+            blob += path.read_bytes()
+    return blob
+
+
+def test_authenticated_scan_finds_pages_behind_the_login_and_never_touches_logout_or_delete(site_factory, monkeypatch):
+    base, site = site_factory()
+    scan_id, row, tools, summary, findings = _auth_scan(monkeypatch, base, site, dict(kind="form", username="alice", password="alicepw"))
+    assert tools["Authentication"]["status"] == "completed" and "Logged in (form)" in tools["Authentication"]["detail"]
+    auth_info = summary["authentication"]
+    assert auth_info["status"] == "logged_in" and auth_info["username"] == "alice" and auth_info["authenticated_pages"] >= 3
+    assert "password" not in json.dumps(auth_info).lower().replace("passwordfield", "")
+    paths = {entry["path"] for entry in site.log}
+    assert "/dashboard" in paths and any(p.startswith("/account/") for p in paths) and "/settings" in paths and "/orders" in paths
+    # The safety guarantees: nothing that ends the session or changes data was ever requested, and only one login was submitted.
+    assert "/logout" not in paths and "/delete-account" not in paths and "/dashboard?action=remove-card" not in paths
+    assert [e["path"] for e in site.log if e["method"] == "POST"] == ["/login"] and site.login_posts == 1
+    titles = [f["title"] for f in findings]
+    assert "API endpoint answers to the logged-in user: /api/me" in titles           # reachable only with the login
+    assert any(f["title"] == "Content-Security-Policy header missing" and f["affected_url"].endswith("/dashboard") for f in findings)   # checks ran on logged-in pages
+    notes = {n["rule"] for n in summary["coverage"]["not_covered"]}
+    assert "login_testing" not in notes and "login_failed" not in notes and "login_hardening" in notes
+    assert "authenticated_scan" in [p["rule"] for p in summary["coverage"]["planned"]]
+    assert summary["coverage"]["facts"]["authenticated"] is True
+
+
+def test_authenticated_scan_never_stores_the_password_or_the_session_cookie(site_factory, monkeypatch):
+    base, site = site_factory()
+    def leaky_nuclei(target, timeout_seconds=60, targets=None, max_templates=30, platform_tags=None, platform_max=0, session=None):
+        sid = next(iter(site.sessions))   # a tool that carelessly quotes the live session cookie in its evidence
+        return [("Medium", "Leaky tool finding", target, f"request carried Cookie: sid={sid} and password alicepw", "fix", "Low")], {"status": "completed", "finding_count": 1}
+    scan_id, row, tools, summary, findings = _auth_scan(monkeypatch, base, site, dict(kind="form", username="alice", password="alicepw"), nuclei=leaky_nuclei)
+    sid = next(iter(site.sessions))
+    leaky = next(f for f in findings if f["title"] == "Leaky tool finding")
+    assert sid not in leaky["evidence"] and "alicepw" not in leaky["evidence"] and leaky["evidence"].count("[redacted]") == 2
+    blob = _database_bytes()
+    assert sid.encode() not in blob and b"alicepw" not in blob          # not in the database file at all
+    assert sid not in json.dumps(summary) and sid not in json.dumps(tools)
+
+
+def test_scan_without_credentials_notes_the_login_and_redacts_cookie_evidence(site_factory, monkeypatch):
+    base, site = site_factory()
+    scan_id, row, tools, summary, findings = _auth_scan(monkeypatch, base, site)
+    assert tools["Authentication"]["status"] == "skipped" and summary["authentication"] is None
+    notes = {n["rule"]: n["message"] for n in summary["coverage"]["not_covered"]}
+    assert notes["login_testing"].startswith("A login form was found, but no credentials were provided") and "login_hardening" in notes
+    assert not any(e["auth"] for e in site.log) and site.login_posts == 0
+    cookie_finding = next(f for f in findings if f["title"] == "Cookie may lack HttpOnly attribute")
+    assert "pre=[redacted]" in cookie_finding["evidence"] and not any(ch in cookie_finding["evidence"] for ch in ("pre=0", "pre=1", "pre=a", "pre=b"))
+
+
+def test_a_failed_login_is_a_gap_with_a_reason_and_the_scan_still_completes(site_factory, monkeypatch):
+    base, site = site_factory()
+    scan_id, row, tools, summary, findings = _auth_scan(monkeypatch, base, site, dict(kind="form", username="alice", password="wrong-password-1"))
+    assert tools["Authentication"]["status"] == "login_failed" and "The scan continued without a login." in tools["Authentication"]["detail"]
+    assert row["status"] == "completed_with_gaps" and "Authentication" in [g["tool"] for g in summary["assessment_gaps"]]
+    notes = {n["rule"]: n["message"] for n in summary["coverage"]["not_covered"]}
+    assert "login_failed" in notes and "login was not accepted" in notes["login_failed"] and "wrong-password-1" not in json.dumps(summary)
+    assert "login_testing" not in notes and site.login_posts == 1
+    assert b"wrong-password-1" not in _database_bytes()
+    assert summary["coverage"]["facts"]["authenticated"] is False and summary["authentication"]["status"] == "failed"
+
+
+def test_a_session_that_ends_mid_scan_is_restored_once_not_guessed(site_factory, monkeypatch):
+    base, site = site_factory()
+    real_forms_api = app.analyze_forms_and_apis
+    calls = {"n": 0}
+    def expiring(*a, **k):
+        calls["n"] += 1
+        if k.get("authenticated"):          # the server forgets every session right after the logged-in analysis
+            site.sessions.clear()
+        return real_forms_api(*a, **k)
+    monkeypatch.setattr(app, "analyze_forms_and_apis", expiring)
+    scan_id, row, tools, summary, findings = _auth_scan(monkeypatch, base, site, dict(kind="form", username="alice", password="alicepw"))
+    assert site.login_posts == 2 and "restored by logging in again" in summary["authentication"]["session_note"]
+    assert tools["Authentication"]["status"] == "completed"
+
+
+def test_bearer_token_scan_uses_the_header_and_scrubs_the_token(site_factory, monkeypatch):
+    base, site = site_factory()
+    token = site.make_token("alice")
+    scan_id, row, tools, summary, findings = _auth_scan(monkeypatch, base, site, dict(kind="bearer", token=token, verify_url=base + "/api/me"))
+    assert tools["Authentication"]["status"] == "completed" and summary["authentication"]["type"] == "bearer" and summary["authentication"]["username"] == ""
+    assert token.encode() not in _database_bytes()
+    assert any(e["auth"] and e["path"] == "/api/me" for e in site.log)
+
+
+def test_form_kinds_separate_login_password_change_and_registration():
+    import signals
+    def kind(html):
+        return signals.parse_forms(html, "https://t.example/")[0]["kind"]
+    assert kind('<form><input name="email"><input type="password" name="p"></form>') == "login"
+    assert kind('<form><input type="text" name="q"><input type="password" name="p"></form>') == "login"
+    assert kind('<form><input type="password" name="new_password"></form>') == "password"
+    assert kind('<form><input type="password" name="a"><input type="password" name="b"></form>') == "register"
+    assert kind('<form><input name="q"></form>') == "other"
+    change = signals.form_findings(signals.parse_forms('<form action="http://t.example/pw" method="post"><input type="password" name="pw"></form>', "http://t.example/"), "http://t.example/")
+    assert {f[1] for f in change} == {"Password-change form sends the password over unencrypted HTTP", "Password-change form has no visible anti-CSRF token (heuristic)"}
+    hidden = signals.parse_forms('<form action="/l" method="post"><input type="hidden" name="csrf_token" value="abc123"><input name="u"><input type="password" name="p" value="never-kept"></form>', "https://t.example/")[0]
+    values = {i["name"]: i["value"] for i in hidden["inputs"]}
+    assert values["csrf_token"] == "abc123" and values["p"] == ""          # hidden values are kept (a login needs them); passwords never
+
+
+class _FakeRun:
+    """Captures what an external tool would be given, and what the private credential files contain at that moment."""
+    def __init__(self, monkeypatch, report=None, report_flag="-o"):
+        self.calls = []
+        monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/" + str(binary))
+        class Done: returncode = 0; stdout = ""; stderr = ""
+        def fake_run(command, **kwargs):
+            files = {}
+            for arg in command:
+                if isinstance(arg, str) and arg.startswith("/") and os.path.isfile(arg) and "dkcissp-" in arg:
+                    mode = os.stat(arg).st_mode & 0o777
+                    files[arg] = (mode, open(arg, errors="replace", newline="").read())
+            self.calls.append({"command": list(command), "kwargs": kwargs, "files": files})
+            if report is not None and report_flag in command:
+                app.Path(command[command.index(report_flag) + 1]).write_text(report)
+            return Done()
+        monkeypatch.setattr(app.subprocess, "run", fake_run)
+
+
+import os  # noqa: E402
+
+
+def _no_secret_in(command, session):
+    joined = " ".join(str(part) for part in command)
+    return not any(secret in joined for secret in session.secret_values())
+
+
+def test_nuclei_gets_the_session_through_a_private_file_never_the_command_line(site_factory, monkeypatch):
+    base, site = site_factory()
+    session = _session(base, kind="form", username="alice", password="alicepw"); session.login()
+    monkeypatch.setattr(app, "select_nuclei_templates", lambda **kw: (["/tmp/t.yaml"], {"status": "ready"}))
+    fake = _FakeRun(monkeypatch)
+    findings, status = app.perform_nuclei_check(base, targets=[base], max_templates=1, session=session)
+    call = fake.calls[0]
+    assert status["authenticated"] is True and "-H" in call["command"] and _no_secret_in(call["command"], session)
+    header_file = call["command"][call["command"].index("-H") + 1]
+    mode, text = call["files"][header_file]
+    assert mode == 0o600 and f"sid={session.cookies()['sid']}" in text and text.startswith("Cookie: ")
+    fake2 = _FakeRun(monkeypatch)
+    assert app.perform_nuclei_check(base, targets=[base], max_templates=1)[1]["authenticated"] is False and "-H" not in fake2.calls[0]["command"]
+
+
+def test_ffuf_uses_a_private_request_file_and_never_requests_risky_paths_while_logged_in(site_factory, monkeypatch):
+    base, site = site_factory()
+    session = _session(base, kind="form", username="alice", password="alicepw"); session.login()
+    fake = _FakeRun(monkeypatch, report=json.dumps({"results": []}))
+    findings, status = app.perform_ffuf_check(base, extra_paths=["dashboard", "users/delete", "admin/reset-password"], session=session)
+    command = fake.calls[0]["command"]
+    assert "-u" not in command and "-request" in command and command[command.index("-request-proto") + 1] == "http" and _no_secret_in(command, session)
+    request_file = command[command.index("-request") + 1]
+    mode, text = fake.calls[0]["files"][request_file]
+    assert mode == 0o600 and text.startswith("GET /FUZZ HTTP/1.1\r\n") and f"sid={session.cookies()['sid']}" in text
+    wordlist = [l for l in fake.calls[0]["files"][command[command.index("-w") + 1]][1].splitlines()]
+    assert "dashboard" in wordlist and "admin" in wordlist
+    assert not any(app.auth.is_unsafe_url("/" + w) for w in wordlist) and "logout" not in wordlist and "users/delete" not in wordlist
+    assert status["authenticated"] is True and status["paths_skipped_for_safety"] >= 3
+    anon = _FakeRun(monkeypatch, report=json.dumps({"results": []}))
+    app.perform_ffuf_check(base)
+    assert "-u" in anon.calls[0]["command"] and "-request" not in anon.calls[0]["command"]       # without a login the tool is run exactly as before
+    assert anon.calls[0]["command"][anon.calls[0]["command"].index("-w") + 1].endswith("wordlists/common-paths.txt")
+
+
+def test_sqlmap_reads_the_session_from_a_private_request_file_on_a_pseudo_terminal(site_factory, monkeypatch):
+    base, site = site_factory()
+    session = _session(base, kind="form", username="alice", password="alicepw"); session.login()
+    fake = _FakeRun(monkeypatch)
+    findings, status = app.perform_sqlmap_check(base, [base + "/api/items?limit=1"], session=session)
+    call = fake.calls[0]
+    command = call["command"]
+    assert "-u" not in command and "-r" in command and _no_secret_in(command, session) and status["authenticated"] is True
+    mode, text = call["files"][command[command.index("-r") + 1]]
+    assert mode == 0o600 and text.startswith("GET /api/items?limit=1 HTTP/1.1\r\n") and "Cookie: " in text
+    assert isinstance(call["kwargs"]["stdin"], int)                      # a pseudo-terminal, which sqlmap needs to honour -r
+    assert not any(a in command for a in ("--cookie", "--headers", "-H", "--auth-cred"))
+    plain = _FakeRun(monkeypatch)
+    app.perform_sqlmap_check(base, [base + "/api/items?limit=1"])
+    assert "-u" in plain.calls[0]["command"] and plain.calls[0]["kwargs"]["stdin"] is None
+
+
+def test_dalfox_uses_cookie_sessions_only_and_says_so_for_tokens(site_factory, monkeypatch):
+    base, site = site_factory()
+    cookie_session = _session(base, kind="form", username="alice", password="alicepw"); cookie_session.login()
+    fake = _FakeRun(monkeypatch)
+    findings, status = app.perform_dalfox_check(base, [base + "/api/items?limit=1"], session=cookie_session)
+    command = fake.calls[0]["command"]
+    assert status["authenticated"] is True and "--cookie-from-raw" in command and _no_secret_in(command, cookie_session) and "-H" not in command and "-C" not in command
+    assert fake.calls[0]["files"][command[command.index("--cookie-from-raw") + 1]][0] == 0o600
+    token_session = _session(base, kind="bearer", token=site.make_token("alice"), verify_url=base + "/api/me"); token_session.login()
+    assert token_session.cookie_only is False and cookie_session.cookie_only is True
+    fake2 = _FakeRun(monkeypatch)
+    findings, status = app.perform_dalfox_check(base, [base + "/api/items?limit=1"], session=token_session)
+    assert status["authenticated"] is False and "can only use cookie sessions, so it ran without your login" in status["reason"]
+    assert "--cookie-from-raw" not in fake2.calls[0]["command"] and _no_secret_in(fake2.calls[0]["command"], token_session)
+
+
+def test_scan_reports_which_tools_used_the_login_and_which_could_not(site_factory, monkeypatch):
+    base, site = site_factory()
+    def nuclei(target, timeout_seconds=60, targets=None, max_templates=30, platform_tags=None, platform_max=0, session=None):
+        return [], {"status": "completed", "authenticated": session is not None}
+    scan_id, row, tools, summary, findings = _auth_scan(monkeypatch, base, site, dict(kind="form", username="alice", password="alicepw"), nuclei=nuclei)
+    info = summary["authentication"]
+    assert info["tools_with_login"] == ["Nuclei"] and "WhatWeb" in info["tools_without_login"] and "OWASP ZAP passive" in info["tools_without_login"]
+    assert tools["Nuclei"]["detail"].endswith("(logged in)")
+    note = next(n for n in summary["coverage"]["not_covered"] if n["rule"] == "tools_without_login")
+    assert "cannot use a session" in note["message"] and "WhatWeb" in note["message"]

@@ -18,10 +18,14 @@ import re
 import sys
 import threading
 import time
+from pathlib import Path
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import testsite  # noqa: E402  (a small site with logins, shared with the test suite)
 
 PASS, FAIL, WARN, INFO = "PASS", "FAIL", "WARN", "INFO"
 
@@ -208,6 +212,41 @@ def run(args) -> int:
         report.add(PASS if status == 200 else FAIL, "retest comparison endpoint works", f"HTTP {status}")
         status, dash = get_json(base, "/api/dashboard")
         report.add(PASS if status == 200 and dash.get("total_scans", 0) >= 1 else FAIL, "dashboard totals include the scan")
+
+        # 6. Authenticated scan against a site with a login (credentials are fake and belong to the test site)
+        login_server, login_target, login_site = testsite.start_site()
+        try:
+            auth = {"kind": "form", "login_url": login_target + "/login", "username": "alice", "password": "alicepw"}
+            status, refused = get_json(base, "/api/scans", method="POST", body={"target": login_target, "profile": "standard", "authorized": True, "auth": auth})
+            report.add(PASS if status == 400 else FAIL, "a login without the separate 'act as this user' approval is refused", f"HTTP {status}")
+            status, created = get_json(base, "/api/scans", method="POST", body={"target": login_target, "profile": "standard", "authorized": True,
+                                                                               "auth": auth, "authenticated_testing_approved": True})
+            report.add(PASS if status == 200 and "id" in created else FAIL, "an authenticated scan starts", f"HTTP {status}")
+            if status == 200 and "id" in created:
+                auth_id = created["id"]
+                deadline = time.time() + args.scan_timeout
+                while time.time() < deadline:
+                    status, adetail = get_json(base, f"/api/scans/{auth_id}")
+                    if status == 200 and adetail["scan"]["status"] != "running":
+                        break
+                    time.sleep(3)
+                ascan = adetail["scan"]
+                report.add(PASS if ascan.get("status") in ("completed", "completed_with_gaps") else FAIL, "the authenticated scan finishes", f"status {ascan.get('status')}")
+                asummary = json.loads(ascan.get("summary") or "{}")
+                report.add(PASS if asummary.get("authentication", {}).get("status") == "logged_in" else FAIL, "the login worked and the report says so",
+                           str(asummary.get("authentication", {}).get("status")))
+                requested = {entry["path"].split("?")[0] for entry in login_site.log}
+                report.add(PASS if {"/dashboard", "/orders", "/settings"} <= requested else FAIL, "pages behind the login were visited")
+                report.add(PASS if not requested & {"/logout", "/delete-account"} and not any("action=remove" in e["path"] for e in login_site.log) else FAIL,
+                           "the scanner never requested logout, delete or other state-changing links")
+                report.add(PASS if login_site.login_posts == 1 else FAIL, "the password was tried exactly once", f"{login_site.login_posts} login submission(s)")
+                blob = json.dumps(adetail) + json.dumps(get_json(base, "/api/scans")[1]) + call(base, "/api/export/findings.csv")[2].decode("utf-8", "replace")
+                leaked = [secret for secret in ("alicepw", *[v for site_sid in login_site.sessions for v in (site_sid,)]) if secret in blob]
+                report.add(PASS if not leaked else FAIL, "neither the password nor the session id appears in stored results or exports")
+                status, _ = get_json(base, "/api/schedules", method="POST", body={"target": login_target, "authorized": True, "auth": auth, "name": "x"})
+                report.add(PASS if status == 400 else FAIL, "scheduling a scan with credentials is refused (credentials are never stored)", f"HTTP {status}")
+        finally:
+            login_server.shutdown()
     finally:
         server.shutdown()
     return finish(report, args, started)

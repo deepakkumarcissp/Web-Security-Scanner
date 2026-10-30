@@ -37,7 +37,9 @@ class _FormParser(HTMLParser):
                           "enctype": values.get("enctype", "").lower(), "inputs": []}
         elif tag in ("input", "textarea", "select") and self._form is not None:
             kind = values.get("type", "text" if tag == "input" else tag).lower()
-            self._form["inputs"].append((values.get("name", "")[:80], kind))
+            # Values are kept for hidden and button fields (a login needs its hidden CSRF token); never for password fields.
+            value = values.get("value", "")[:300] if kind in ("hidden", "submit", "checkbox", "radio") else ""
+            self._form["inputs"].append((values.get("name", "")[:80], kind, value))
         elif tag == "script" and values.get("src"):
             self.scripts.append(values["src"].strip())
         elif tag == "link" and values.get("href") and ("modulepreload" in values.get("rel", "") or values.get("as") == "script"):
@@ -51,6 +53,17 @@ class _FormParser(HTMLParser):
             self._form = None
 
 
+def _form_kind(inputs, passwords: int) -> str:
+    """login (a password field plus somewhere to type a user name), password (a password field alone: a password-change form),
+    register (two or more password fields), or other."""
+    if passwords >= 2:
+        return "register"
+    if passwords == 1:
+        has_user = any(kind in ("text", "email", "tel") or re.search(r"user|login|email", name or "", re.I) for name, kind, _v in inputs if kind != "password")
+        return "login" if has_user else "password"
+    return "other"
+
+
 def parse_forms(html: str, page_url: str) -> list[dict]:
     """Forms on a page, described for security review. Nothing is ever submitted."""
     parser = _FormParser()
@@ -62,13 +75,13 @@ def parse_forms(html: str, page_url: str) -> list[dict]:
     for raw in parser.forms[:20]:
         action = urldefrag(urljoin(page_url, raw["action"] or ""))[0]
         inputs = raw["inputs"]
-        passwords = sum(1 for _, kind in inputs if kind == "password")
-        has_token = any(CSRF_NAME.search(name) for name, kind in inputs if name) or parser.csrf_meta
+        passwords = sum(1 for _, kind, _v in inputs if kind == "password")
+        has_token = any(CSRF_NAME.search(name) for name, kind, _v in inputs if name) or parser.csrf_meta
         forms.append({
             "page": page_url[:2048], "action": action[:2048], "method": "post" if raw["method"] == "post" else "get",
-            "inputs": [{"name": n, "type": k} for n, k in inputs][:40],
-            "has_password": passwords > 0, "kind": "register" if passwords >= 2 else "login" if passwords == 1 else "other",
-            "has_file": any(kind == "file" for _, kind in inputs) or "multipart" in raw["enctype"],
+            "inputs": [{"name": n, "type": k, "value": v} for n, k, v in inputs][:40],
+            "has_password": passwords > 0, "kind": _form_kind(inputs, passwords),
+            "has_file": any(kind == "file" for _, kind, _v in inputs) or "multipart" in raw["enctype"],
             "has_csrf_token": bool(has_token),
             "cross_origin": _origin(action) != _origin(page_url) if urlparse(action).scheme in ("http", "https") else False,
         })
@@ -104,8 +117,9 @@ def form_findings(forms: list[dict], target: str) -> list[tuple]:
     for form in forms:
         action, page = form["action"], form["page"]
         https = urlparse(action).scheme == "https"
+        label = {"login": "Login form", "password": "Password-change form", "register": "Registration form"}.get(form["kind"], "Password form")
         if form["has_password"] and not https:
-            add("Low" if loopback else "High", "Login form sends the password over unencrypted HTTP", page,
+            add("Low" if loopback else "High", f"{label} sends the password over unencrypted HTTP", page,
                 f"The {form['kind']} form on {page} submits to {action}, which is not HTTPS. Anyone on the network path can read the credentials."
                 + (" (The host is local, so this is rated Low.)" if loopback else ""),
                 "Serve the page and the form action over HTTPS only, redirect HTTP to HTTPS and send HSTS.", "High")
@@ -117,9 +131,9 @@ def form_findings(forms: list[dict], target: str) -> list[tuple]:
             add("High", "Credentials are posted to a different origin", page,
                 f"The {form['kind']} form on {page} submits to {action}, which is another site.",
                 "Post credentials only to your own origin unless a trusted single-sign-on provider is intended.", "High")
-        if form["kind"] == "login" and form["method"] == "post" and not form["has_csrf_token"]:
-            add("Low", "Login form has no visible anti-CSRF token (heuristic)", page,
-                f"No hidden input or meta tag with a CSRF-style name was found on the login form at {page}. Frameworks can protect forms in other ways (SameSite cookies, custom headers), so verify manually.",
+        if form["kind"] in ("login", "password") and form["method"] == "post" and not form["has_csrf_token"]:
+            add("Low", f"{label} has no visible anti-CSRF token (heuristic)", page,
+                f"No hidden input or meta tag with a CSRF-style name was found on the {label.lower()} at {page}. Frameworks can protect forms in other ways (SameSite cookies, custom headers), so verify manually.",
                 "Add per-session anti-CSRF tokens to state-changing forms, or confirm another CSRF defence is in place.", "Low")
         if form["has_file"]:
             add("Info", "File upload form found", page,

@@ -7,7 +7,7 @@ A free, community-built vulnerability scanner that runs on your own Kali Linux m
 
 > **Project principle:** show what actually ran, show the evidence, explain the risk, and never call an assessment complete when a check did not finish. A tool is never reported as working just because it is listed in the UI.
 
-**Status:** the **web-application engine** is working and tested. Network scanning, credentialed scanning and compliance checks are on the [roadmap](#roadmap) and are not built yet. Findings are signals for investigation, not proof. Only scan systems you own or are explicitly authorized to assess.
+**Status:** the **web-application engine** is working and tested. Authenticated (logged-in) scanning works for common logins. Network scanning and compliance checks are on the [roadmap](#roadmap) and are not built yet. Findings are signals for investigation, not proof. Only scan systems you own or are explicitly authorized to assess.
 
 ## Contents
 
@@ -21,6 +21,7 @@ A free, community-built vulnerability scanner that runs on your own Kali Linux m
 [Scan results and status](#scan-results-and-status) ·
 [Tool approvals](#tool-approvals) ·
 [Planner and coverage notes](#planner-and-coverage-notes) ·
+[Authenticated scanning](#authenticated-scanning) ·
 [Configuration](#configuration) ·
 [Local practice lab](#local-practice-lab) ·
 [Scheduling, comparison, reports](#scheduling-retest-comparison-and-reports) ·
@@ -233,14 +234,30 @@ Every decision is stored with who and when (see **Decision history**). Decisions
 
 `planner.py` decides which specialist checks apply to a target from the profile, the detected platforms, and what the forms and API analysis found (a login form, a file-upload form, a single-page app, a GraphQL endpoint, API endpoints that want authentication, URLs with query parameters). After each scan, `summary.coverage` lists what was planned, which platforms were recognised and how each is covered, and what applied but **cannot be done by any engine in this version**. For example:
 
-- a login form was found, but credentialed scanning is not available, so login protection and the pages behind the login were not tested;
-- API endpoints answered 401/403 and were not tested behind a login;
+- a login form was found but no credentials were given, so the pages behind the login were not tested (give an [authenticated scan](#authenticated-scanning) credentials to test them);
+- API endpoints answered 401/403 and were not tested behind a login (same remedy);
 - a file-upload form was found, but upload restrictions were not tested;
 - a GraphQL endpoint was found, but only introspection was checked;
 - the site is a JavaScript single-page app, so screens that exist only in the browser were not crawled (endpoints named in its scripts were still read and checked);
 - a platform was detected but has no safe Nuclei templates, or is a hosted service.
 
 These appear as "Coverage note" cards in the dashboard. Notes do not change the scan status, but they are never hidden. Adding an engine means adding its rule in `planner.py`, its stage in `app.py`, tests and documentation. Platform signatures live in `platforms.py`; form, script, API and GraphQL reading lives in `signals.py`.
+
+## Authenticated scanning
+
+Most of a real application sits behind a login. Open **Assess Website → Authenticated scan (optional)**, choose how the site signs in, and tick the separate confirmation that the scanner may act as that user. **Use a dedicated test account**, never an administrator's.
+
+Supported: a login form (the scanner reads the form, keeps hidden fields such as CSRF tokens, and finds the username/password fields itself), a JSON login API, a Bearer token, a session cookie, an API key or other header, and HTTP Basic. Optionally give a page or a piece of text that proves you are logged in.
+
+What happens:
+
+- The scanner signs in **once**. A wrong password is not retried and passwords are never guessed. If the site wants MFA, a CAPTCHA or a single-sign-on redirect, the scan says so and continues as a visitor; it does not try to get around them.
+- It crawls the logged-in site with **GET requests only**, on the same origin, and never follows links that look like logout, delete, remove, reset, pay, checkout or similar. Forms other than the login are never submitted by the logged-in pass (Active scans keep their own separate approval).
+- It checks the login itself (cookie flags, session fixation, credentials over plain HTTP, weak JWTs), re-checks the logged-in pages with the same header, form and API analysis, and watches the session; if it expires mid-scan it signs in again once.
+- Nuclei, ffuf, sqlmap and dalfox receive the session through private (mode 0600) temporary files that are deleted afterwards, never on a command line. A tool that cannot use a session (ZAP passive, Nikto, WhatWeb, Wapiti and others) runs as a visitor, and the report says which tools were logged in and which were not.
+- Credentials live in memory for the scan only. They are not stored in the database, logs, findings or exports; cookie values and tokens are scrubbed from evidence. Because of that, authenticated scans cannot be scheduled, and a tool you approve later runs without the login.
+
+Not supported yet: MFA, CAPTCHA, SSO/OAuth browser flows, JavaScript-only logins, and comparing what two different users can see (access-control testing).
 
 ## Configuration
 
@@ -311,7 +328,7 @@ The dashboard uses a JSON API on the same port.
 |---|---|
 | `GET /api/health` | service health |
 | `GET /api/dashboard` | totals and recent activity |
-| `POST /api/scans` | start a scan (`target`, `profile`, `authorized`, `active_testing_approved`) |
+| `POST /api/scans` | start a scan (`target`, `profile`, `authorized`, `active_testing_approved`, optional `auth` + `authenticated_testing_approved`) |
 | `GET /api/scans`, `GET /api/scans/{id}` | history; one scan with findings, stage status and tool requests |
 | `GET /api/scans/{id}/comparison` | retest comparison |
 | `GET /api/findings`, `PATCH /api/findings/{id}/lifecycle` | findings; update a lifecycle status and notes |
@@ -330,7 +347,7 @@ An older asset-inventory API (`/api/assets…`, including passive certificate-tr
 - External tools run from fixed argument lists with timeouts and request limits, never through a shell, and only against the origin you entered. Findings from tools are filtered back to that origin.
 - Nuclei only runs templates that pass the scanner's own safety filter: HTTP only, GET only, no state-changing methods, no raw requests, payloads, fuzzing or brute-force, and no more than five requests each. Templates written for a detected platform go through the same filter.
 - Software is never installed silently. Installs are limited to a built-in allow-list, need your approval each time, and are recorded.
-- Secrets (the ZAP key and the wpscan token) are never printed, stored in scan data or placed on command lines.
+- Secrets (the ZAP key, the wpscan token and any scan login) are never printed, stored in scan data or placed on command lines. Authenticated scans need their own approval, read pages only and never log out or delete.
 - Tool status is verified (executable, version, service readiness), not assumed. A timeout or error is a gap, never a clean result.
 - Findings are signals for investigation. Validate context and business impact before acting.
 
@@ -341,18 +358,19 @@ python -m pip install pytest httpx
 pytest -q
 ```
 
-The suite (over 140 tests) uses a throwaway database, so it never touches your real `data.sqlite3`. GitHub Actions runs compilation and the suite on Ubuntu with Python 3.11. CI does not prove a clean Kali install, browser behaviour, or live tool integrations; before a release, follow the [Public-Release Verification Checklist](RELEASE_CHECKLIST.md).
+The suite (over 165 tests) uses a throwaway database, so it never touches your real `data.sqlite3`. GitHub Actions runs compilation and the suite on Ubuntu with Python 3.11. CI does not prove a clean Kali install, browser behaviour, or live tool integrations; before a release, follow the [Public-Release Verification Checklist](RELEASE_CHECKLIST.md).
 
 ## Repository layout
 
 ```text
 app.py                 FastAPI application: scan engine, engine adapters, approval flow, API
+auth.py                login handling, session, safety rules and token checks for authenticated scans
 planner.py             which specialist checks apply to a target; coverage notes
 platforms.py           the platform catalogue and detection (60+ platforms)
 signals.py             forms, script endpoints, API descriptions, GraphQL, framework paths
 static/index.html      the dashboard (single page, no external assets)
 wordlists/             built-in content-discovery list used by ffuf
-scripts/               selftest.py (the end-to-end checks) and the Juice Shop smoke test
+scripts/               selftest.py (the end-to-end checks), testsite.py (a small site with logins) and the Juice Shop smoke test
 tests/                 test suite and throwaway-database configuration
 install.sh             one-command installer
 verify.sh              automated end-to-end install check (also run by GitHub Actions)
@@ -371,7 +389,7 @@ The goal is a free, community-maintained alternative to commercial vulnerability
 | Web-application engine: discovery, passive and active checks, approvals, honest status | **working** |
 | Platform detection (60+ platforms) and platform-targeted checks (Nuclei templates, wpscan, droopescan, framework paths) | **working** |
 | Forms, script-endpoint, API-documentation and GraphQL analysis | **working** |
-| Credentialed (authenticated) scanning: login handling, authenticated crawl and API testing | next |
+| Credentialed (authenticated) scanning: login handling, authenticated crawl, API checks | **working** (MFA/SSO and per-user access-control comparison next) |
 | Browser-based crawler for single-page apps | next |
 | Dedicated GraphQL, upload and API-authorization testing | planned |
 | Network engine: host discovery, ports, service and version detection | planned |
@@ -380,7 +398,7 @@ The goal is a free, community-maintained alternative to commercial vulnerability
 
 ## Known limitations
 
-- Web engine only. There is no network, host or credentialed scanning yet, so anything behind a login is not tested.
+- Web engine only; there is no network or host scanning yet. Authenticated scanning covers common logins but not MFA, CAPTCHA or SSO, and tools that cannot carry a session run as a visitor.
 - Detection quality has been verified on local fixtures, not benchmarked against real-world applications; expect false negatives and false positives like any scanner. Platform detection is signature-based and conservative; a heavily customised site may not be recognised.
 - Discovery is a bounded link crawler: it does not run JavaScript. For single-page apps the scanner reads script files for API paths, but screens that only exist in the browser are missed.
 - Platform-targeted checks are only as good as the local Nuclei template library; a platform with no safe templates gets general checks only (shown as a coverage note). Keep the library updated.
