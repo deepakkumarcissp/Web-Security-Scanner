@@ -22,6 +22,7 @@ from urllib.parse import urlparse, urlencode, urljoin, urldefrag
 from html.parser import HTMLParser
 from urllib.request import Request, urlopen, build_opener, HTTPCookieProcessor, HTTPRedirectHandler, HTTPSHandler
 
+import access
 import auth
 import planner
 import platforms
@@ -147,6 +148,7 @@ class AuthConfig(BaseModel):
     verify_url: str = Field(default="", max_length=2048)
     success_text: str = Field(default="", max_length=200)
     logged_out_text: str = Field(default="", max_length=200)
+    identity_text: str = Field(default="", max_length=200)
 
 
 class ScanRequest(BaseModel):
@@ -156,6 +158,8 @@ class ScanRequest(BaseModel):
     active_testing_approved: bool = False
     auth: AuthConfig | None = None
     authenticated_testing_approved: bool = False
+    auth_second: AuthConfig | None = None
+    second_account_role: str = Field(default="peer", pattern="^(peer|more_privileged)$")
 
 
 class ScheduleRequest(ScanRequest):
@@ -1904,7 +1908,7 @@ def response_set_cookies(headers) -> list[str]:
     return list(values or [])
 
 
-def perform_scan(scan_id: int, target: str, profile: str, auth_settings=None) -> None:
+def perform_scan(scan_id: int, target: str, profile: str, auth_settings=None, second_account=None) -> None:
     findings = []
     tool_status = {
         "Built-in HTTP & headers": {"status": "running", "detail": "Requesting the supplied URL and inspecting response headers"},
@@ -2050,7 +2054,22 @@ def perform_scan(scan_id: int, target: str, profile: str, auth_settings=None) ->
                 tool_status["Authentication"] = {"status": "completed", "detail": f"Logged in ({auth_settings.kind}); {session.verified_by}"}
             else:
                 tool_status["Authentication"] = {"status": "login_failed", "detail": session.reason + " The scan continued without a login."}
+            identity_first = (auth_settings.identity_text or auth_settings.username)
             auth_settings = None  # the session keeps what it needs; this reference is dropped now
+        second_session, second_ok, identity_second, second_role = None, False, "", "peer"
+        if second_account and session_ok:
+            settings2, second_role = second_account
+            identity_second = settings2.identity_text or settings2.username
+            tool_status["Second account"] = {"status": "running", "detail": "Logging in once as the second account, to compare what each user can open"}
+            second_session = auth.AuthSession(final_url, settings2, lambda jar: same_origin_opener(final_url, jar))
+            try:
+                second_ok = second_session.login()
+            except Exception as exc:
+                second_session.status, second_session.reason = "failed", f"The login could not be completed ({type(exc).__name__})."
+            auth_info["second_account"] = second_session.describe()
+            tool_status["Second account"] = ({"status": "completed", "detail": f"Logged in ({settings2.kind}); {second_session.verified_by}"} if second_ok else
+                                             {"status": "login_failed", "detail": second_session.reason + " Users could not be compared."})
+            second_account = None
         discovery_status = {"status": "skipped", "reason": "Endpoint discovery is enabled for Standard/Deep/Active scans only", "urls": [final_url]}
         tool_status["Endpoint discovery"] = {"status": "skipped", "detail": "Not selected for this profile"}
         if profile in ("standard", "deep", "active"):
@@ -2140,7 +2159,7 @@ def perform_scan(scan_id: int, target: str, profile: str, auth_settings=None) ->
         else:
             tool_status["Content discovery (ffuf)"] = {"status": "skipped", "detail": "Runs in Deep and Active profiles"}
         # Forms, scripts and API descriptions: read-only analysis that also feeds the endpoints it finds to the stages below.
-        api_urls, signal_facts = [], {}
+        api_urls, signal_facts, public_api_urls = [], {}, []
         if profile in ("standard", "deep", "active"):
             tool_status["Forms & APIs (built-in)"] = {"status": "running", "detail": "Reading forms and scripts, and checking API documentation and GraphQL paths (GET requests only)"}
             update_scan_progress(scan_id, 33, "Analysing forms, scripts and APIs", tool_status)
@@ -2156,6 +2175,7 @@ def perform_scan(scan_id: int, target: str, profile: str, auth_settings=None) ->
                     merged.append(extra_url)
             discovery_status["urls"] = merged
             api_urls, signal_facts = fa_extras.get("api_urls", []), fa_extras.get("facts", {})
+            public_api_urls = list(api_urls)
             tool_status["Forms & APIs (built-in)"] = {"status": forms_api_status.get("status", "error"), "detail": f"{forms_api_status.get('finding_count', len(fa_findings))} finding(s); {forms_api_status.get('forms', 0)} form(s), {forms_api_status.get('js_endpoints', 0)} script endpoint(s), {forms_api_status.get('api_docs', 0)} API description(s); {forms_api_status.get('reason', 'check finished')}"}
             if session_ok and auth_discovery is not None:
                 try:  # the same analysis as the logged-in user: forms, scripts and API paths that only exist behind the login
@@ -2188,6 +2208,35 @@ def perform_scan(scan_id: int, target: str, profile: str, auth_settings=None) ->
                         tool_status["Authentication"] = {"status": "completed_with_warnings", "detail": "The session ended during the scan and could not be restored; later stages ran without it."}
             except Exception:
                 pass
+        access_status = None
+        if session_ok and profile in ("standard", "deep", "active"):
+            tool_status["Access control"] = {"status": "running", "detail": "Requesting the same pages as a visitor and as each account (GET only)"}
+            update_scan_progress(scan_id, 33, "Comparing access between users", tool_status)
+            try:
+                crawl_first = list((auth_discovery or {}).get("urls", [])) + [u for u in api_urls if isinstance(u, str) and u.startswith(("http://", "https://"))]
+                first = access.Account("account 1" if second_ok else "the logged-in account", session, crawl_first, identity_first)
+                second = None
+                if second_ok:
+                    _, _, html2, final2 = second_session.request(second_session.landing_url)
+                    crawl2 = discover_same_origin_pages(final2, html2, opener=second_session.opener, url_filter=auth.is_unsafe_url)
+                    second = access.Account("account 2", second_session, list(crawl2.get("urls", [])), identity_second)
+                visitor_opener = same_origin_opener(final_url)
+                def visitor_fetch(url):
+                    try:
+                        with visitor_opener.open(Request(url, headers={"User-Agent": "DKCISSP-WebSecurityScanner/0.1 (+authorized access-control comparison)"}), timeout=8) as response:
+                            return access.Page(response.status, response.read(400_000).decode("utf-8", "replace"), response.geturl())
+                    except HTTPError as exc:
+                        return access.Page(exc.code, "", exc.geturl())
+                    finally:
+                        time.sleep(0.15)
+                access_findings, access_status = access.run(final_url, first, second, second_role, list(discovered_urls) + list(public_api_urls), visitor_fetch, session)
+                findings.extend(access_findings)
+                tool_status["Access control"] = {"status": "completed", "detail": f"{access_status['reason']} (logged in)"}
+            except Exception as exc:
+                access_status = {"status": "error", "reason": f"The comparison failed ({type(exc).__name__})."}
+                tool_status["Access control"] = {"status": "error", "detail": access_status["reason"]}
+            if auth_info is not None and access_status:
+                auth_info["access_control"] = {k: v for k, v in access_status.items() if k != "authenticated"}
         platform_tags = platforms.nuclei_tags_for(sorted(platform_hits))
         if profile in ("standard", "deep", "active"):
             nuclei_targets = nuclei_target_urls(target, discovery_status.get("urls", [target]), 5 if profile in ("deep", "active") else 6)
@@ -2306,10 +2355,10 @@ def perform_scan(scan_id: int, target: str, profile: str, auth_settings=None) ->
             technologies=set(platform_hits), login_form=bool(signal_facts.get("login_form")), upload_form=bool(signal_facts.get("upload_form")),
             is_spa=bool(signal_facts.get("is_spa")), graphql=bool(signal_facts.get("graphql")),
             api_requires_auth=bool(signal_facts.get("api_requires_auth")), api_endpoints=int(signal_facts.get("api_endpoints") or 0),
-            authenticated=bool(session_ok), auth_attempted=auth_info is not None,
+            authenticated=bool(session_ok), auth_attempted=auth_info is not None, second_account=bool(access_status and access_status.get("second_account")),
             has_parameters=planner.has_query_parameters(discovery_status.get("urls", [])),
             url_count=len(discovery_status.get("urls", [])))
-        coverage = planner.plan_coverage(facts, set(ENGINE_STAGES) | {"builtin-forms-api", "builtin-authenticated"})
+        coverage = planner.plan_coverage(facts, set(ENGINE_STAGES) | {"builtin-forms-api", "builtin-authenticated", "builtin-access-control"})
         coverage["platform_detection"] = platform_hits
         if auth_info is not None and session_ok:
             ran = ("completed", "completed_with_warnings", "partial_timeout", "timeout", "error")
@@ -2355,7 +2404,7 @@ def perform_scan(scan_id: int, target: str, profile: str, auth_settings=None) ->
 
         gaps = assessment_gaps(tool_status)
         # Nothing secret is ever stored: scrub the password, tokens and session cookie values from everything written below.
-        secrets_list = session.secret_values() if session else []
+        secrets_list = (session.secret_values() if session else []) + (second_session.secret_values() if second_session else [])
         clean = (lambda value: scrub_secrets(value, secrets_list)) if secrets_list else (lambda value: value)
         findings = [tuple(clean(part) if isinstance(part, str) else part for part in item) for item in findings]
         if auth_info is not None:
@@ -2403,7 +2452,7 @@ def running_scan_count(conn) -> int:
     return int(conn.execute("SELECT COUNT(*) FROM scans WHERE status='running'").fetchone()[0])
 
 
-def start_scan(target: str, profile: str, auth_settings=None) -> int:
+def start_scan(target: str, profile: str, auth_settings=None, second_account=None) -> int:
     with connect() as conn:
         # Serialize the capacity check and insert so simultaneous requests cannot
         # all observe the same free slot and exceed the configured worker limit.
@@ -2418,7 +2467,7 @@ def start_scan(target: str, profile: str, auth_settings=None) -> int:
         )
         scan_id = cursor.lastrowid
     # auth_settings (if any) travels only in this thread's arguments: it is never written to the database.
-    threading.Thread(target=perform_scan, args=(scan_id, target, profile) + ((auth_settings,) if auth_settings else ()), daemon=True).start()
+    threading.Thread(target=perform_scan, args=(scan_id, target, profile) + ((auth_settings,) + ((second_account,) if second_account else ()) if auth_settings else ()), daemon=True).start()
     return scan_id
 
 
@@ -2429,7 +2478,7 @@ def auth_settings_from_request(config: "AuthConfig", target: str) -> "auth.AuthS
         kind=config.kind, login_url=config.login_url.strip(), username=config.username, password=secret(config.password),
         username_field=config.username_field, password_field=config.password_field, token=secret(config.token), cookie=secret(config.cookie),
         header_name=config.header_name, header_value=secret(config.header_value), verify_url=config.verify_url.strip(),
-        success_text=config.success_text, logged_out_text=config.logged_out_text)
+        success_text=config.success_text, logged_out_text=config.logged_out_text, identity_text=config.identity_text.strip())
     needs = {"form": settings.username and settings.password, "json": settings.login_url and settings.username and settings.password,
              "bearer": settings.token, "cookie": settings.cookie, "header": settings.header_name and settings.header_value,
              "basic": settings.username and settings.password}
@@ -2670,13 +2719,19 @@ def create_scan(request: ScanRequest):
         if not request.authenticated_testing_approved:
             raise HTTPException(400, "An authenticated scan needs the separate confirmation that the scanner may act as this user.")
         auth_settings = auth_settings_from_request(request.auth, target)
+    elif request.auth_second:
+        raise HTTPException(400, "A second account needs the first account's login as well.")
+    second_account = (auth_settings_from_request(request.auth_second, target), request.second_account_role) if request.auth_second and auth_settings else None
     # Simple one-URL workflow: the explicit authorization confirmation is enough for any entered target.
     with connect() as conn:
         active_scans = running_scan_count(conn)
     limit = max_concurrent_scans()
     if active_scans >= limit:
         raise HTTPException(429, f"Scanner capacity reached ({active_scans}/{limit} assessments running). Wait for a scan to finish before starting another.")
-    scan_id = start_scan(target, request.profile, auth_settings) if auth_settings else start_scan(target, request.profile)
+    if second_account:
+        scan_id = start_scan(target, request.profile, auth_settings, second_account)
+    else:
+        scan_id = start_scan(target, request.profile, auth_settings) if auth_settings else start_scan(target, request.profile)
     return {
         "id": scan_id, "status": "running", "profile": request.profile,
         "message": "Assessment started with the selected profile. Standard adds bounded discovery and safe Nuclei checks; Deep adds bounded Nikto checks; Active additionally runs explicitly approved Wapiti payload tests. Optional ZAP passive alerts require a healthy local API.",
@@ -2916,7 +2971,7 @@ def create_schedule(request: ScheduleRequest):
         raise HTTPException(400, "Confirm you are authorized to test this target.")
     if request.profile == "active":
         raise HTTPException(400, "Active payload testing cannot be scheduled; start it manually with explicit approval.")
-    if request.auth:
+    if request.auth or request.auth_second:
         raise HTTPException(400, "Authenticated scans cannot be scheduled: credentials are never stored.")
     target = validate_target(request.target)
     delta = timedelta(days=1 if request.frequency == "daily" else 7)

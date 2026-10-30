@@ -54,6 +54,16 @@ RULES = (
          "Standard and deeper profiles analyse forms, scripts and API descriptions"),
     Rule("authenticated_scan", "Authenticated crawl and analysis", "builtin-authenticated", ("quick", "standard", "deep", "active"),
          "Credentials were provided and the login worked", needs_flags=("authenticated",)),
+    Rule("access_control", "Access-control comparison between users", "builtin-access-control", ("standard", "deep", "active"),
+         "Two accounts logged in", needs_flags=("second_account",)),
+    Rule("access_control_one_account", "Access-control comparison between users", "second-account", ("standard", "deep", "active"),
+         "Credentials were provided", needs_flags=("authenticated",), unless_flags=("second_account",), tool_label="a second account",
+         fixed_message="Only one account was provided, so the scanner could only compare that user with a visitor. Whether one user can open another user's "
+                       "pages was not tested. Add a second account under 'Authenticated scan' to test it."),
+    Rule("access_control_limits", "Access-control testing beyond linked pages", "access-control-deep", ("standard", "deep", "active"),
+         "Credentials were provided", needs_flags=("authenticated",), tool_label="object-level access testing",
+         fixed_message="Access control was compared only for pages and API endpoints the crawl found. Actions that change data (they are never sent), "
+                       "object IDs that no page links to, and role-specific buttons or fields were not tested."),
     Rule("login_testing", "Testing behind the login", "login-credentials", ("standard", "deep", "active"),
          "A login form was found", needs_flags=("login_form",), unless_flags=("authenticated", "auth_attempted"), tool_label="login credentials",
          fixed_message="A login form was found, but no credentials were provided, so everything behind the login was not tested. "
@@ -99,6 +109,7 @@ class Facts:
     api_endpoints: int = 0
     authenticated: bool = False     # credentials were provided and the login worked
     auth_attempted: bool = False    # credentials were provided (whether or not the login worked)
+    second_account: bool = False    # a second account logged in, so users can be compared
 
 
 def detect_technologies(headers: dict | None, body: str | None, fingerprint_titles=(), cookie_names=(), urls=()) -> set:

@@ -60,6 +60,7 @@ class AuthSettings:
     verify_url: str = ""
     success_text: str = ""
     logged_out_text: str = ""
+    identity_text: str = ""     # text that appears in this user's own pages (access-control tests); not a secret
 
     def __repr__(self) -> str:  # never show a secret, even by accident in a traceback
         return f"AuthSettings(kind={self.kind!r}, login_url={self.login_url!r}, username={self.username!r}, secrets=hidden)"

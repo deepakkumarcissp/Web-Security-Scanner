@@ -257,7 +257,17 @@ What happens:
 - Nuclei, ffuf, sqlmap and dalfox receive the session through private (mode 0600) temporary files that are deleted afterwards, never on a command line. A tool that cannot use a session (ZAP passive, Nikto, WhatWeb, Wapiti and others) runs as a visitor, and the report says which tools were logged in and which were not.
 - Credentials live in memory for the scan only. They are not stored in the database, logs, findings or exports; cookie values and tokens are scrubbed from evidence. Because of that, authenticated scans cannot be scheduled, and a tool you approve later runs without the login.
 
-Not supported yet: MFA, CAPTCHA, SSO/OAuth browser flows, JavaScript-only logins, and comparing what two different users can see (access-control testing).
+### Access-control testing (compare users)
+
+Add an optional **second account** and the scanner compares who can open what, using only pages and API endpoints the crawl found (GET only, at most 30 pages, nothing guessed):
+
+- **Visitor vs logged in:** a page found while logged in that a visitor can also open with the same content is reported (higher severity when it contains that user's own identifying text).
+- **User vs user (broken access control / IDOR):** a page only account 1 was shown, opened directly as account 2 (and the reverse), is reported when it returns the same content. If the owner's identifying text appears in the other user's copy the finding is High; otherwise it is Low confidence and says to verify. Pages that show each user their own data at one URL (for example `/api/me`) are not reported.
+- **Vertical (more privileged second account):** choose "more privileged" and pages only that account was shown, opened as the ordinary user, are reported.
+
+Give each account a text that identifies its pages (an e-mail or username) for stronger results; the username is used if you leave it empty. Findings never contain page text, only status, size and similarity. The scan always notes what this cannot test: actions that change data, object IDs that no page links to, and role-specific buttons or fields. A shared page that was meant to be shared can look like a finding, so treat results as leads to verify.
+
+Not supported yet: MFA, CAPTCHA, SSO/OAuth browser flows and JavaScript-only logins.
 
 ## Configuration
 
@@ -328,7 +338,7 @@ The dashboard uses a JSON API on the same port.
 |---|---|
 | `GET /api/health` | service health |
 | `GET /api/dashboard` | totals and recent activity |
-| `POST /api/scans` | start a scan (`target`, `profile`, `authorized`, `active_testing_approved`, optional `auth` + `authenticated_testing_approved`) |
+| `POST /api/scans` | start a scan (`target`, `profile`, `authorized`, `active_testing_approved`, optional `auth`, `auth_second`, `second_account_role` (`peer`/`more_privileged`) + `authenticated_testing_approved`) |
 | `GET /api/scans`, `GET /api/scans/{id}` | history; one scan with findings, stage status and tool requests |
 | `GET /api/scans/{id}/comparison` | retest comparison |
 | `GET /api/findings`, `PATCH /api/findings/{id}/lifecycle` | findings; update a lifecycle status and notes |
@@ -358,13 +368,14 @@ python -m pip install pytest httpx
 pytest -q
 ```
 
-The suite (over 165 tests) uses a throwaway database, so it never touches your real `data.sqlite3`. GitHub Actions runs compilation and the suite on Ubuntu with Python 3.11. CI does not prove a clean Kali install, browser behaviour, or live tool integrations; before a release, follow the [Public-Release Verification Checklist](RELEASE_CHECKLIST.md).
+The suite (over 170 tests) uses a throwaway database, so it never touches your real `data.sqlite3`. GitHub Actions runs compilation and the suite on Ubuntu with Python 3.11. CI does not prove a clean Kali install, browser behaviour, or live tool integrations; before a release, follow the [Public-Release Verification Checklist](RELEASE_CHECKLIST.md).
 
 ## Repository layout
 
 ```text
 app.py                 FastAPI application: scan engine, engine adapters, approval flow, API
 auth.py                login handling, session, safety rules and token checks for authenticated scans
+access.py              access-control comparison between a visitor and one or two accounts
 planner.py             which specialist checks apply to a target; coverage notes
 platforms.py           the platform catalogue and detection (60+ platforms)
 signals.py             forms, script endpoints, API descriptions, GraphQL, framework paths
@@ -389,7 +400,8 @@ The goal is a free, community-maintained alternative to commercial vulnerability
 | Web-application engine: discovery, passive and active checks, approvals, honest status | **working** |
 | Platform detection (60+ platforms) and platform-targeted checks (Nuclei templates, wpscan, droopescan, framework paths) | **working** |
 | Forms, script-endpoint, API-documentation and GraphQL analysis | **working** |
-| Credentialed (authenticated) scanning: login handling, authenticated crawl, API checks | **working** (MFA/SSO and per-user access-control comparison next) |
+| Credentialed (authenticated) scanning: login handling, authenticated crawl, API checks | **working** (MFA/SSO next) |
+| Access-control comparison: visitor vs user vs second user (IDOR, vertical access) on crawled pages | **working** (ID enumeration and POST actions not covered) |
 | Browser-based crawler for single-page apps | next |
 | Dedicated GraphQL, upload and API-authorization testing | planned |
 | Network engine: host discovery, ports, service and version detection | planned |

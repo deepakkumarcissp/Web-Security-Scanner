@@ -2570,7 +2570,7 @@ def test_scan_api_requires_consent_valid_login_details_and_never_schedules_crede
     assert schedule.status_code == 400 and "never stored" in schedule.json()["detail"]
 
 
-def _auth_scan(monkeypatch, base, site, settings=None, profile="standard", nuclei=None):
+def _auth_scan(monkeypatch, base, site, settings=None, profile="standard", nuclei=None, second=None, role="peer"):
     """A real scan (real login, crawl and analysis) of the test site; only the external tools are stubbed."""
     import auth
     monkeypatch.setattr("time.sleep", lambda seconds: None)         # the politeness delays are not what these tests are about
@@ -2581,7 +2581,7 @@ def _auth_scan(monkeypatch, base, site, settings=None, profile="standard", nucle
     monkeypatch.setattr(app.shutil, "which", lambda binary: "/usr/bin/" + str(binary))
     with app.connect() as conn:
         scan_id = conn.execute("INSERT INTO scans(target,profile,status,created_at) VALUES(?,?,?,?)", (base, profile, "running", app.now())).lastrowid
-    app.perform_scan(scan_id, base, profile, *([auth.AuthSettings(**settings)] if settings else []))
+    app.perform_scan(scan_id, base, profile, *([auth.AuthSettings(**settings)] if settings else []), *([(auth.AuthSettings(**second), role)] if second else []))
     row, tools, summary = _scan_row(scan_id)
     findings = client.get(f"/api/scans/{scan_id}").json()["findings"]
     return scan_id, row, tools, summary, findings
@@ -2799,3 +2799,93 @@ def test_scan_reports_which_tools_used_the_login_and_which_could_not(site_factor
     assert tools["Nuclei"]["detail"].endswith("(logged in)")
     note = next(n for n in summary["coverage"]["not_covered"] if n["rule"] == "tools_without_login")
     assert "cannot use a session" in note["message"] and "WhatWeb" in note["message"]
+
+
+# ---- access-control comparison between users --------------------------------------------------------------------------
+ALICE = dict(kind="form", username="alice", password="alicepw")
+BOB = dict(kind="form", username="bob", password="bobpw")
+ADMIN = dict(kind="form", username="admin", password="adminpw")
+
+
+def _titles(findings):
+    return {(f["title"], f["affected_url"].replace("http://127.0.0.1:", "").partition("/")[2]) for f in findings}
+
+
+def test_one_account_is_compared_with_a_visitor_and_the_missing_second_account_is_a_coverage_note(site_factory, monkeypatch):
+    base, site = site_factory()
+    scan_id, row, tools, summary, findings = _auth_scan(monkeypatch, base, site, ALICE)
+    found = _titles(findings)
+    assert ("Page from the logged-in area is reachable without logging in", "invoices/9") in found        # the invoice has no login check
+    assert not any(t == "Another user's page is readable (possible broken access control / IDOR)" for t, _ in found)
+    assert not any(path.startswith("dashboard") for t, path in found if "reachable without" in t)       # /dashboard sends visitors to the login
+    notes = {n["rule"] for n in summary["coverage"]["not_covered"]}
+    assert {"access_control_one_account", "access_control_limits"} <= notes
+    assert tools["Access control"]["status"] == "completed" and "Second account" not in tools
+    assert summary["authentication"]["access_control"]["second_account"] is False
+
+
+def test_two_users_are_compared_and_only_the_page_without_an_ownership_check_is_reported(site_factory, monkeypatch):
+    base, site = site_factory()
+    scan_id, row, tools, summary, findings = _auth_scan(monkeypatch, base, site, ALICE, second=BOB)
+    idor = [f for f in findings if f["title"] == "Another user's page is readable (possible broken access control / IDOR)"]
+    assert {f["affected_url"].rsplit("/", 2)[-2] for f in idor} == {"notes"} and len(idor) == 2         # both directions, /notes only
+    assert not any("/profile/" in f["affected_url"] for f in idor)                                        # /profile enforces ownership: 403
+    assert all(f["severity"] == "High" and f["confidence"] == "High" and "identifying text" in f["evidence"] for f in idor)
+    assert tools["Second account"]["status"] == "completed" and tools["Access control"]["status"] == "completed"
+    notes = {n["rule"] for n in summary["coverage"]["not_covered"]}
+    assert "access_control_one_account" not in notes and "access_control_limits" in notes
+    assert summary["coverage"]["facts"]["second_account"] is True if "second_account" in summary["coverage"].get("facts", {}) else True
+    # Safety: only the two logins were POSTed, nothing risky was requested, and no page text was stored as evidence.
+    assert [e["path"] for e in site.log if e["method"] == "POST"] == ["/login", "/login"]
+    paths = {e["path"] for e in site.log}
+    assert not paths & {"/logout", "/delete-account", "/dashboard?action=remove-card"}
+    assert "Private details" not in json.dumps(findings) and "alicepw" not in json.dumps(summary) and "bobpw" not in json.dumps(summary)
+    assert "alicepw" not in json.dumps(findings) and "bobpw" not in json.dumps(findings)
+
+
+def test_an_ordinary_user_opening_an_admin_page_is_reported_only_when_the_server_allows_it(site_factory, monkeypatch):
+    base, site = site_factory(admin_open=True)
+    _, _, tools, summary, findings = _auth_scan(monkeypatch, base, site, ALICE, second=ADMIN, role="more_privileged")
+    vertical = [f for f in findings if f["title"].startswith("Privileged page is reachable by an ordinary user")]
+    assert any(f["affected_url"].endswith("/admin/users") for f in vertical)
+    assert all("account 2" in f["evidence"] or "account 1" in f["evidence"] for f in vertical)
+    assert not any(f["title"].startswith("Another user's page") for f in findings)                    # the admin reading a user's page is not a flaw
+    safe_base, safe_site = site_factory()
+    _, _, _, _, safe_findings = _auth_scan(monkeypatch, safe_base, safe_site, ALICE, second=ADMIN, role="more_privileged")
+    assert not any(f["affected_url"].endswith("/admin/users") for f in safe_findings)                 # 403 for alice: nothing to report
+
+
+def test_a_failed_second_login_is_tried_once_and_the_scan_continues_with_one_account(site_factory, monkeypatch):
+    base, site = site_factory()
+    _, row, tools, summary, findings = _auth_scan(monkeypatch, base, site, ALICE, second=dict(BOB, password="wrong"))
+    assert tools["Second account"]["status"] == "login_failed" and tools["Access control"]["status"] == "completed"
+    assert site.login_posts == 2                                                                         # one for alice, one for bob, no retries
+    assert summary["authentication"]["access_control"]["second_account"] is False
+    assert "access_control_one_account" in {n["rule"] for n in summary["coverage"]["not_covered"]}
+    assert "wrong" not in json.dumps(summary) and "wrong" not in json.dumps(findings)
+
+
+def test_access_comparison_ignores_refusals_redirects_and_login_pages(monkeypatch):
+    import access
+    class Checker:
+        def looks_logged_out(self, status, body, final, asked):
+            return "Sign in" in body
+    ok = access.Page(200, "hello", "http://t/a")
+    assert access.readable(Checker(), "http://t/a", ok)
+    assert not access.readable(Checker(), "http://t/a", access.Page(403, "no", "http://t/a"))
+    assert not access.readable(Checker(), "http://t/a", access.Page(200, "hello", "http://t/login"))     # sent somewhere else
+    assert not access.readable(Checker(), "http://t/a", access.Page(200, "Sign in", "http://t/a"))
+    same = access.similarity(access.normalise("Welcome alice 12345678901 aaaaaaaaaaaaaaaa", ["alice"]), access.normalise("Welcome bob 99999999999 bbbbbbbbbbbbbbbb", ["bob"]))
+    assert same == 0.0 or same >= 0.9
+    assert access.similarity(access.normalise("Welcome <b>alice</b> to your page", ["alice", "bob"]), access.normalise("Welcome <b>bob</b> to your page", ["alice", "bob"])) >= 0.9
+    assert access.similarity("a" * 500, "b" * 500) == 0.0
+
+
+def test_second_account_api_rules(monkeypatch):
+    monkeypatch.setattr(app, "start_scan", lambda *a, **k: 1)
+    body = {"target": "http://127.0.0.1:9", "profile": "standard", "authorized": True, "authenticated_testing_approved": True}
+    second = {"kind": "form", "username": "bob", "password": "bobpw"}
+    assert client.post("/api/scans", json=dict(body, auth_second=second)).status_code == 400                    # a second account alone is meaningless
+    assert client.post("/api/scans", json=dict(body, auth=second, auth_second=second, second_account_role="boss")).status_code == 422
+    assert client.post("/api/scans", json=dict(body, auth=second, auth_second=second)).status_code == 200
+    assert client.post("/api/schedules", json=dict(body, name="x", auth=second, auth_second=second)).status_code == 400

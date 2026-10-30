@@ -27,9 +27,9 @@ def _b64(data: dict) -> str:
 
 
 class Site:
-    def __init__(self, rotate_session=True, cookie_flags="HttpOnly; SameSite=Lax", require_mfa=False, jwt_alg="HS256", jwt_exp=True):
+    def __init__(self, rotate_session=True, cookie_flags="HttpOnly; SameSite=Lax", require_mfa=False, jwt_alg="HS256", jwt_exp=True, admin_open=False):
         self.rotate_session, self.cookie_flags, self.require_mfa = rotate_session, cookie_flags, require_mfa
-        self.jwt_alg, self.jwt_exp = jwt_alg, jwt_exp
+        self.jwt_alg, self.jwt_exp, self.admin_open = jwt_alg, jwt_exp, admin_open
         self.sessions, self.tokens, self.csrf, self.log = {}, {}, set(), []
         self.fixed_sid = "fixed-session-id-0001"
         self.login_posts = 0
@@ -124,7 +124,9 @@ def make_handler(site: Site):
                 self.reply(200, f"<html><body><h1>Welcome {html.escape(user)}</h1><a href='/account/{USERS[user]['id']}'>my account</a> "
                                 "<a href='/account/1'>acct 1</a> <a href='/account/2'>acct 2</a> <a href='/orders'>orders</a> <a href='/settings'>settings</a> "
                                 "<a href='/admin'>admin</a> <a href='/logout'>Log out</a> <a href='/delete-account'>Delete my account</a> "
-                                "<a href='/dashboard?action=remove-card'>remove card</a></body></html>")
+                                "<a href='/dashboard?action=remove-card'>remove card</a> "
+                                f"<a href='/notes/{USERS[user]['id']}'>my notes</a> <a href='/profile/{USERS[user]['id']}'>my profile</a> "
+                                "<a href='/invoices/9'>invoice</a>" + ("<a href='/admin/users'>users</a>" if USERS[user]["role"] == "admin" else "") + "</body></html>")
             elif path.startswith("/account/"):
                 if not user:
                     return self.redirect("/login")
@@ -133,6 +135,25 @@ def make_handler(site: Site):
                 except (ValueError, StopIteration):
                     return self.reply(404, "no such account")
                 self.reply(200, f"<html><body><h1>Account {path.rsplit('/', 1)[1]}</h1><p>Owner: {owner}</p><p>Balance: 1000</p></body></html>")
+            elif path.startswith(("/notes/", "/profile/")):
+                # /notes has no ownership check (an IDOR); /profile does.
+                if not user:
+                    return self.redirect("/login")
+                try:
+                    owner = next(n for n, u in USERS.items() if u["id"] == int(path.rsplit("/", 1)[1]))
+                except (ValueError, StopIteration):
+                    return self.reply(404, "no such user")
+                if path.startswith("/profile/") and owner != user:
+                    return self.reply(403, "forbidden")
+                self.reply(200, f"<html><body><h1>{path.split('/')[1].title()} of {owner}</h1><p>Private details for {owner}.</p></body></html>")
+            elif path == "/invoices/9":
+                self.reply(200, "<html><body><h1>Invoice 9</h1><p>Amount due: 120.00</p></body></html>")   # no login check: reachable by anyone
+            elif path == "/admin/users":
+                if not user:
+                    return self.redirect("/login")
+                if USERS[user]["role"] != "admin" and not site.admin_open:
+                    return self.reply(403, "forbidden")
+                self.reply(200, "<html><body><h1>All users</h1><p>alice, bob, admin</p></body></html>")
             elif path == "/orders":
                 if not user:
                     return self.redirect("/login")

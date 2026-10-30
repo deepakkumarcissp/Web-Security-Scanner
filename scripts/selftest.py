@@ -245,6 +245,27 @@ def run(args) -> int:
                 report.add(PASS if not leaked else FAIL, "neither the password nor the session id appears in stored results or exports")
                 status, _ = get_json(base, "/api/schedules", method="POST", body={"target": login_target, "authorized": True, "auth": auth, "name": "x"})
                 report.add(PASS if status == 400 else FAIL, "scheduling a scan with credentials is refused (credentials are never stored)", f"HTTP {status}")
+            # 7. Access control: two users compared. /notes/<id> has no ownership check (a planted flaw); /profile/<id> does.
+            second = {"kind": "form", "login_url": login_target + "/login", "username": "bob", "password": "bobpw"}
+            status, created = get_json(base, "/api/scans", method="POST", body={"target": login_target, "profile": "standard", "authorized": True, "auth": auth, "auth_second": second,
+                                                                               "second_account_role": "peer", "authenticated_testing_approved": True})
+            report.add(PASS if status == 200 and "id" in created else FAIL, "a two-account scan starts", f"HTTP {status}")
+            if status == 200 and "id" in created:
+                deadline = time.time() + args.scan_timeout
+                while time.time() < deadline:
+                    status, bdetail = get_json(base, f"/api/scans/{created['id']}")
+                    if status == 200 and bdetail["scan"]["status"] != "running":
+                        break
+                    time.sleep(3)
+                bfind = bdetail.get("findings", [])
+                idor = [f["affected_url"] for f in bfind if f["title"].startswith("Another user's page is readable")]
+                report.add(PASS if any("/notes/" in u for u in idor) else FAIL, "a page one user can open that belongs to another user is found (planted flaw)")
+                report.add(PASS if not any("/profile/" in u for u in idor) else FAIL, "a page that correctly refuses other users is not reported")
+                report.add(PASS if any(f["title"].startswith("Page from the logged-in area is reachable without logging in") and "/invoices/" in f["affected_url"] for f in bfind) else FAIL,
+                           "a logged-in page that a visitor can open is found (planted flaw)")
+                report.add(PASS if login_site.login_posts == 3 else FAIL, "each account's password was tried once per scan", f"{login_site.login_posts} login submission(s) in total")
+                report.add(PASS if not {e["path"].split("?")[0] for e in login_site.log} & {"/logout", "/delete-account"} else FAIL, "no logout or delete link was ever requested, even with two accounts")
+                report.add(PASS if "bobpw" not in json.dumps(bdetail) else FAIL, "the second account's password does not appear in stored results")
         finally:
             login_server.shutdown()
     finally:
