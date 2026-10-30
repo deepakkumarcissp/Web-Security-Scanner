@@ -13,6 +13,7 @@ A free, community-built vulnerability scanner that runs on your own Kali Linux m
 
 [Install in one command](#install-in-one-command) ·
 [Your first scan](#your-first-scan) ·
+[Verify an install](#verify-an-install-automatically) ·
 [How it works](#how-it-works) ·
 [Assessment profiles](#assessment-profiles) ·
 [Engines](#engines) ·
@@ -88,6 +89,22 @@ cd Web-Security-Scanner
 `run.sh` creates the virtual environment, installs the packages and starts the scanner on `127.0.0.1`. It refuses to start if the port is already in use and tells you how to pick another (`DKCISSP_PORT=1015 ./run.sh`). To update a manual install, run `./update.sh`.
 
 **Uninstall:** delete the install folder and `~/.local/bin/dkcissp-scanner`. Your scan history is the file `data.sqlite3` inside the install folder; copy it first if you want to keep it.
+
+## Verify an install automatically
+
+One command checks that what GitHub serves right now installs and works on your machine, with no manual steps:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepakkumarcissp/Web-Security-Scanner/main/verify.sh | bash
+```
+
+It downloads the latest scanner into a **throwaway folder**, installs it with the real installer, starts it on a spare port with its own empty database, runs a real Standard scan against a small built-in test website, and checks about 30 things: the dashboard, the API, the security-header, form, API and GraphQL findings, truthful scan status, the tool-approval flow (it only ever *declines*; nothing is installed), the exports and the retest comparison. It then stops everything, deletes the folder and prints **PASS** or **FAIL** (exit code 0 or 1) and writes a JSON report to `~/dkcissp-verify-reports/`. Your real installation and your `data.sqlite3` are never touched. A scanning tool that is not installed on your machine is shown as a warning, not a failure.
+
+Options: `--branch NAME`, `--port N`, `--scan-timeout SECONDS`, `--report-dir DIR`, `--keep` (keep the throwaway install for inspection). Run it from a checkout (`./verify.sh`) to test the repository you have.
+
+**It also runs on GitHub by itself.** The *Install check* workflow repeats this on every push and pull request, every day, and on demand, on Ubuntu, on a real **Kali Linux** container, and through the exact one-line command above. A red cross on the repository means a new user would hit a problem. Reports are attached to each run.
+
+**Letting an assistant run it for you.** In Claude Desktop with the Desktop Commander connector (or Claude Code on your laptop), ask: *"Run the DKCISSP verify command and tell me the result"*. The command is self-contained, so the assistant only needs to run it and read the report.
 
 ## Your first scan
 
@@ -335,9 +352,10 @@ platforms.py           the platform catalogue and detection (60+ platforms)
 signals.py             forms, script endpoints, API descriptions, GraphQL, framework paths
 static/index.html      the dashboard (single page, no external assets)
 wordlists/             built-in content-discovery list used by ffuf
-scripts/               local validation scripts (Juice Shop smoke test)
+scripts/               selftest.py (the end-to-end checks) and the Juice Shop smoke test
 tests/                 test suite and throwaway-database configuration
 install.sh             one-command installer
+verify.sh              automated end-to-end install check (also run by GitHub Actions)
 run.sh / update.sh     start / update an existing install
 requirements.txt       Python dependencies (FastAPI, uvicorn)
 RELEASE_CHECKLIST.md   checks before publishing a release

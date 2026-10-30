@@ -1,0 +1,75 @@
+name: Install check
+
+# Proves, automatically, that what a new user downloads from GitHub installs, starts and works.
+# Each job installs into a throwaway folder with the real install.sh, starts the scanner with an empty
+# database, runs a real scan against a built-in test website, and fails if any required check fails.
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: "17 5 * * *"        # every day, so a broken dependency or a changed Kali package is noticed
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu:
+    name: Fresh install on Ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install this commit like a new user and run the end-to-end checks
+        run: |
+          git config --global --add safe.directory '*'
+          git checkout -q -B ci-under-test
+          bash verify.sh --repo-url "file://$GITHUB_WORKSPACE" --branch ci-under-test --report-dir "$RUNNER_TEMP/verify"
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-report-ubuntu
+          path: ${{ runner.temp }}/verify
+          if-no-files-found: ignore
+
+  kali:
+    name: Fresh install on Kali Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: kalilinux/kali-rolling
+    steps:
+      - name: Prerequisites (a fresh Kali image has almost nothing installed)
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git curl ca-certificates python3 python3-venv sudo procps
+      - uses: actions/checkout@v4
+      - name: Install this commit like a new user and run the end-to-end checks
+        run: |
+          git config --global --add safe.directory '*'
+          git checkout -q -B ci-under-test
+          bash verify.sh --repo-url "file://$GITHUB_WORKSPACE" --branch ci-under-test --report-dir "$RUNNER_TEMP/verify"
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-report-kali
+          path: ${{ runner.temp }}/verify
+          if-no-files-found: ignore
+
+  public-download:
+    name: The exact one-line command from the README
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download verify.sh from GitHub and run it, as a user would
+        env:
+          RAW_BASE: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}
+        run: |
+          curl -fsSL "$RAW_BASE/verify.sh" -o /tmp/verify-from-github.sh
+          cat /tmp/verify-from-github.sh | DKCISSP_RAW_URL="$RAW_BASE" DKCISSP_REPO_URL="https://github.com/${{ github.repository }}.git" DKCISSP_BRANCH=main DKCISSP_VERIFY_REPORTS="$RUNNER_TEMP/verify" bash

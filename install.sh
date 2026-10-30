@@ -9,7 +9,7 @@
 # on its Approvals page, the first time a scan needs one.
 #
 # Options (put them after `bash -s --`):  --dir PATH  --branch NAME  --port N  --no-start  --no-browser
-# Environment: DKCISSP_HOME, DKCISSP_BRANCH, DKCISSP_PORT, DKCISSP_REPO_URL
+# Environment: DKCISSP_HOME, DKCISSP_BRANCH, DKCISSP_PORT, DKCISSP_REPO_URL, DKCISSP_BIN_DIR (where the dkcissp-scanner command goes)
 set -euo pipefail
 
 REPO_URL="${DKCISSP_REPO_URL:-https://github.com/deepakkumarcissp/Web-Security-Scanner.git}"
@@ -96,7 +96,7 @@ ok "Packages installed and the scanner loads"
 
 # 4. A short command to start and update it.
 step "Creating the dkcissp-scanner command"
-BIN="$HOME/.local/bin"; mkdir -p "$BIN"
+BIN="${DKCISSP_BIN_DIR:-$HOME/.local/bin}"; mkdir -p "$BIN"
 cat > "$BIN/dkcissp-scanner" <<LAUNCHER
 #!/usr/bin/env bash
 # DKCISSP Web Security Scanner launcher.   dkcissp-scanner [start|update]
